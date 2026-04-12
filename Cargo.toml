@@ -1,0 +1,19 @@
+[package]
+name = "frostify-gfx"
+version = "0.0.0"
+edition = "2024"
+description = "Reactive GPU UI rendering library"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+wgpu = "29.0.1"
+winit = "0.30.13"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+pollster = "0.4"
+log = "0.4"
+env_logger = "0.11.10"
+png = "0.18.1"
+
+[[example]]
+name = "hello_window"
+path = "examples/hello_window.rs"
