@@ -350,13 +350,57 @@ pub struct NodeText {
 pub struct ScrollState {
     pub current: [f32; 2],
     pub target: [f32; 2],
-    /// Exponential ease rate. Higher = snappier. Default 12 ≈ 100 ms
-    /// time-to-converge.
+    /// Exponential ease rate for the **forward** chase (in-range
+    /// scroll toward target). Higher = snappier. Default 24 ≈ 190 ms
+    /// time-to-rest. Bounce-back from past-edge uses the
+    /// `bounce_stiffness` + `bounce_damping` damped-harmonic spring
+    /// instead, since exponential ease has no overshoot.
     pub stiffness: f32,
-    /// When true, `target` is allowed past the content edge; the spring
-    /// pulls it back. When false (default), `target` is clamped on every
-    /// write.
+    /// Damped-harmonic spring stiffness (`k`) for bounce-back from
+    /// overscroll. Combined with `bounce_damping`, controls how the
+    /// view snaps back into range after the rubber-band releases.
+    /// Default 800 → ω₀ ≈ 28.3 rad/s, period ≈ 310 ms when `zeta < 1`.
+    pub bounce_stiffness: f32,
+    /// Damped-harmonic spring damping (`c`) for bounce-back. Default
+    /// 42 with `bounce_stiffness=800` gives ζ ≈ 0.74 — minimal
+    /// overshoot (~3 %) and a graceful settle. Lower values
+    /// (toward 0.5·`2√k`) make the bounce more elastic; higher values
+    /// (toward `2√k` = critical damping) give a smoother no-overshoot
+    /// landing.
+    pub bounce_damping: f32,
+    /// When true, `target` is allowed past the content edge with
+    /// rubber-band damping (each delta past the edge contributes less);
+    /// once the spring quiesces past the edge it retargets back into
+    /// `[0, max_off]` so the spring pulls the view to a rest position.
+    /// When false (default), `target` is hard-clamped on every write.
     pub overscroll: bool,
+    /// Per-axis snap step in **logical** px. When `> 0`, the target is
+    /// retargeted to the nearest multiple of `snap_step` once the spring
+    /// quiesces, and the spring then chases the snapped value. `0` =
+    /// no snap (continuous scroll). Indexed by `ScrollAxis::index`.
+    pub snap_step: [f32; 2],
+    /// Seconds since the last user-driven input on this scroll
+    /// (`add_scroll_delta`, `set_scroll_target`, or `set_scroll_immediate`).
+    /// Used to gate the on-quiesce settle path: while input is still
+    /// arriving (held arrow key, fast wheel burst, in-progress drag),
+    /// settle must NOT clamp a saturated past-edge target back into
+    /// range — otherwise the next repeat event would re-saturate it
+    /// and the resulting target oscillation reads as a jerk. Initialized
+    /// to a large value so a freshly-built scrollable settles
+    /// immediately if invariants demand it.
+    pub time_since_input: f32,
+    /// Per-axis bounce-spring elapsed time in seconds. `< 0` means the
+    /// axis is not bouncing. While bouncing, `tick_scrolls` advances
+    /// this and samples the closed-form spring response to drive
+    /// `current[axis]` from `bounce_from[axis]` toward `target[axis]`.
+    pub bounce_elapsed: [f32; 2],
+    /// Position at the moment the bounce on this axis started.
+    pub bounce_from: [f32; 2],
+    /// Target snapshot at the moment the bounce on this axis started.
+    /// If `target[axis]` changes while bouncing (e.g. user wheels mid-
+    /// bounce), the bounce restarts from the current position so the
+    /// spring tracks the new target without an apparent jump.
+    pub bounce_target: [f32; 2],
     /// Scrollbar fade alpha in `[0, 1]`. Pinned to 1 while the spring is
     /// chasing, while pointer is over the bar, or while a thumb is being
     /// dragged; decays over `style.fade_seconds` once idle. flatten emits
@@ -376,13 +420,52 @@ pub struct ScrollState {
     pub bar_active: [bool; 2],
 }
 
+/// Seconds of input quiescence required before `settle_target` will
+/// clamp a saturated past-edge target back into range and start the
+/// bounce. Anything below the OS auto-repeat period (~33 ms on Windows)
+/// would let settle fire between repeat events and produce target
+/// oscillation. 100 ms is comfortably above that and still feels
+/// instant on release.
+pub const SCROLL_INPUT_QUIESCE_SECONDS: f32 = 0.1;
+
+/// Maximum logical-px the rubber-band model lets `target` travel past
+/// either edge before saturating. The asymptote in `rubber_band_target`
+/// caps cooked over at exactly this value, so a long burst of wheel
+/// events can't push `target` to infinity — the further the user pushes,
+/// the less effect each delta has. Smaller values shorten the bounce-
+/// back animation; 60 logical px feels firm without disabling the
+/// effect.
+pub const OVERSCROLL_LIMIT_LOGICAL: f32 = 60.0;
+
+
 impl Default for ScrollState {
     fn default() -> Self {
         Self {
             current: [0.0; 2],
             target: [0.0; 2],
-            stiffness: 12.0,
+            // 24 ≈ 190 ms to-rest. Lower values (the original 12)
+            // perceptibly lag a fast wheel input — the list keeps
+            // drifting after the user has stopped, which reads as
+            // sluggish. iOS lists run closer to ~30; 24 hits a balance
+            // of "snappy but still cushioned".
+            stiffness: 24.0,
+            // Bounce-back spring tuned for elegance over speed:
+            //   ω₀ = √800 ≈ 28.3 rad/s → period ~310 ms
+            //   ζ  = 42 / (2·28.3) ≈ 0.74 → ~3 % overshoot
+            // Settles cleanly in ~280 ms with a single soft dip.
+            // Earlier values (k=3500, c=50) were stiff enough to read
+            // as a "snap" — the spring's restoring force was so strong
+            // the recovery felt aggressive. Halving frequency and
+            // pulling damping closer to critical (ζ→1) gives a
+            // graceful pull rather than a slam.
+            bounce_stiffness: 800.0,
+            bounce_damping: 42.0,
             overscroll: false,
+            snap_step: [0.0; 2],
+            time_since_input: 1.0,
+            bounce_elapsed: [-1.0; 2],
+            bounce_from: [0.0; 2],
+            bounce_target: [0.0; 2],
             bar_alpha: 0.0,
             style: ScrollbarStyle::default(),
             bar_hover: [false; 2],
@@ -566,6 +649,45 @@ impl NodeBuilder {
         self
     }
 
+    /// Configure the bounce-back spring used when releasing overscroll.
+    /// `stiffness` (`k`) controls oscillation frequency
+    /// (ω₀ = √k rad/s); `damping` (`c`) controls overshoot —
+    /// `c < 2√k` is underdamped (visible bounce), `c = 2√k` is
+    /// critically damped (no overshoot, smoothest landing), and
+    /// `c > 2√k` is overdamped (slower, no overshoot). Defaults
+    /// `(800, 42)` give ζ ≈ 0.74 — small overshoot, graceful settle
+    /// in ~280 ms.
+    pub fn bounce_spring(mut self, stiffness: f32, damping: f32) -> Self {
+        let s = self.node.scroll.get_or_insert_with(ScrollState::default);
+        s.bounce_stiffness = stiffness.max(0.0);
+        s.bounce_damping = damping.max(0.0);
+        self
+    }
+
+    /// Per-axis scroll snap step in **logical** px. Spring quiesce
+    /// retargets to the nearest multiple. `0` on an axis disables snap
+    /// there. Allocates `ScrollState` so the value sticks even if the
+    /// node isn't yet scrollable; insert reconciles.
+    pub fn snap_step(mut self, x: f32, y: f32) -> Self {
+        let s = self.node.scroll.get_or_insert_with(ScrollState::default);
+        s.snap_step = [x.max(0.0), y.max(0.0)];
+        self
+    }
+
+    /// Y-axis snap step, leaves X unchanged. See [`Self::snap_step`].
+    pub fn snap_step_y(mut self, px: f32) -> Self {
+        let s = self.node.scroll.get_or_insert_with(ScrollState::default);
+        s.snap_step[1] = px.max(0.0);
+        self
+    }
+
+    /// X-axis snap step, leaves Y unchanged. See [`Self::snap_step`].
+    pub fn snap_step_x(mut self, px: f32) -> Self {
+        let s = self.node.scroll.get_or_insert_with(ScrollState::default);
+        s.snap_step[0] = px.max(0.0);
+        self
+    }
+
     /// Replace the entire scrollbar style on this node. Allocates a
     /// `ScrollState` so the style sticks even if the node isn't yet
     /// scrollable; insert reconciles the `scrollable_ids` index.
@@ -678,7 +800,6 @@ struct Slot {
     payload: Option<Node>,
 }
 
-#[derive(Default)]
 pub struct NodeTree {
     slots: Vec<Slot>,
     free: Vec<u32>,
@@ -694,11 +815,67 @@ pub struct NodeTree {
     /// frame loop doesn't have to re-walk the tree every tick.
     /// Maintained by `set_layout_overflow` / `remove`.
     scrollable_ids: Vec<NodeId>,
+    /// Current display scale factor. Mirror of `App.scale_factor` —
+    /// kept on the tree so scroll setters can convert logical-px
+    /// configuration (`snap_step`, overscroll limit) to physical at
+    /// the point of use without threading the scale through every
+    /// public method. Updated by the app at init + on
+    /// `ScaleFactorChanged`. Defaults to `1.0` for headless tests.
+    current_scale: f32,
+}
+
+impl Default for NodeTree {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            roots: Vec::new(),
+            dirty: 0,
+            glass_count: 0,
+            scrollable_ids: Vec::new(),
+            current_scale: 1.0,
+        }
+    }
 }
 
 impl NodeTree {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reset `time_since_input` on every scrollable to 0, so the
+    /// on-quiesce settle path stays gated. Called from the app shell
+    /// each tick while a scroll key is physically held — the OS
+    /// auto-repeat initial delay (Windows default ~250 ms) is longer
+    /// than `SCROLL_INPUT_QUIESCE_SECONDS` (100 ms), so without this
+    /// poke the gate would lapse during the no-event window between
+    /// the initial keypress and the first auto-repeat. Settle would
+    /// fire, start a bounce, and the next repeat would re-stretch the
+    /// rubber-band — visible as a stretch / bounce / stretch flicker.
+    pub fn poke_scroll_input_recency(&mut self) {
+        for &id in self.scrollable_ids.clone().iter() {
+            if let Some(slot) = self.slots.get_mut(id.index as usize)
+                && slot.generation == id.generation
+                && let Some(n) = slot.payload.as_mut()
+                && let Some(s) = n.scroll.as_mut()
+            {
+                s.time_since_input = 0.0;
+            }
+        }
+    }
+
+    /// Update the cached display scale used by scroll math. Call from
+    /// the app shell on init and after `WindowEvent::ScaleFactorChanged`.
+    /// No-op below `f32::EPSILON`.
+    pub fn set_scale(&mut self, scale: f32) {
+        if scale > f32::EPSILON {
+            self.current_scale = scale;
+        }
+    }
+
+    /// Read the cached display scale. Mainly for tests.
+    pub fn scale(&self) -> f32 {
+        self.current_scale
     }
 
     fn insert(&mut self, mut node: Node) -> NodeId {
@@ -932,6 +1109,7 @@ impl NodeTree {
         }
         let mut moved = false;
         let mut bar_changed = false;
+        let scale = self.current_scale;
         for i in 0..self.scrollable_ids.len() {
             let id = self.scrollable_ids[i];
             let Some(slot) = self.slots.get_mut(id.index as usize) else {
@@ -943,28 +1121,104 @@ impl NodeTree {
             let Some(n) = slot.payload.as_mut() else {
                 continue;
             };
+            let rect = n.rect;
+            let content = n.content_size;
             let Some(s) = n.scroll.as_mut() else {
                 continue;
             };
-            // Spring step.
-            if s.current != s.target {
-                let alpha = 1.0 - (-s.stiffness * dt).exp();
-                let mut new = [
-                    s.current[0] + (s.target[0] - s.current[0]) * alpha,
-                    s.current[1] + (s.target[1] - s.current[1]) * alpha,
-                ];
-                if (s.target[0] - new[0]).abs() < 0.5 {
-                    new[0] = s.target[0];
+            let max_off = [
+                (content[0] - rect[2]).max(0.0),
+                (content[1] - rect[3]).max(0.0),
+            ];
+            s.time_since_input += dt;
+            // Per-axis chase. Two paths:
+            //   (a) Bounce-back via underdamped spring (closed-form,
+            //       overshoots target slightly then settles) — engages
+            //       when `current` is past edge AND `target` is in
+            //       range. Models a real rubber-band release.
+            //   (b) Forward chase via exponential ease — engages
+            //       otherwise. Monotonic, no overshoot, snappy. Right
+            //       feel for ordinary scrolling.
+            for axis in 0..2 {
+                let cur = s.current[axis];
+                let tgt = s.target[axis];
+                let max = max_off[axis];
+                let already_bouncing = s.bounce_elapsed[axis] >= 0.0;
+                let target_in_range = tgt >= 0.0 && tgt <= max;
+                let cur_oor = cur < 0.0 || cur > max;
+                // Trigger: not yet bouncing, current is past edge,
+                // target sits inside range (settle has clamped it).
+                // Continue: already bouncing AND target is still in
+                // range (user hasn't wheeled past edge again, which
+                // would re-engage rubber-band and cancel the bounce).
+                // The continue branch runs even when `current`
+                // momentarily crosses back into range during overshoot
+                // — the spring's natural oscillation is what produces
+                // the "alive" feel; gating on cur_oor would freeze it
+                // mid-cycle.
+                let bouncing =
+                    target_in_range && (already_bouncing || cur_oor);
+                if bouncing {
+                    let target_shifted = already_bouncing
+                        && (s.bounce_target[axis] - tgt).abs() > 0.5;
+                    if !already_bouncing || target_shifted {
+                        s.bounce_from[axis] = cur;
+                        s.bounce_target[axis] = tgt;
+                        s.bounce_elapsed[axis] = 0.0;
+                    }
+                    s.bounce_elapsed[axis] += dt;
+                    let (x, v) = crate::anim::spring_eval(
+                        s.bounce_stiffness,
+                        s.bounce_damping,
+                        s.bounce_elapsed[axis],
+                    );
+                    let new_pos = s.bounce_from[axis] * (1.0 - x) + tgt * x;
+                    let settled = (x - 1.0).abs() < 1e-3 && v.abs() < 1e-3;
+                    let new = if settled { tgt } else { new_pos };
+                    if (new - cur).abs() > f32::EPSILON {
+                        s.current[axis] = new;
+                        moved = true;
+                    }
+                    if settled {
+                        s.bounce_elapsed[axis] = -1.0;
+                    }
+                    s.bar_alpha = 1.0;
+                } else {
+                    // Not bouncing — clear bounce state and run normal
+                    // exponential chase if target hasn't been reached.
+                    s.bounce_elapsed[axis] = -1.0;
+                    if cur != tgt {
+                        let alpha = 1.0 - (-s.stiffness * dt).exp();
+                        let mut new = cur + (tgt - cur) * alpha;
+                        if (tgt - new).abs() < 0.5 {
+                            new = tgt;
+                        }
+                        if new != cur {
+                            s.current[axis] = new;
+                            moved = true;
+                        }
+                        s.bar_alpha = 1.0;
+                    }
                 }
-                if (s.target[1] - new[1]).abs() < 0.5 {
-                    new[1] = s.target[1];
+            }
+            // Spring just quiesced (or was already at rest): apply
+            // overscroll release + snap-to-step. Suppressed while:
+            //   - a thumb drag is in flight (`s.dragging()` — drag
+            //     target tracks the cursor),
+            //   - input is still arriving (`time_since_input` below
+            //     gate — held arrow / wheel burst would otherwise
+            //     thrash target between settle-clamp and the next
+            //     repeat's rubber-band push).
+            // Otherwise idempotent: re-firing on idle ticks is a no-op.
+            if !s.dragging()
+                && s.time_since_input >= SCROLL_INPUT_QUIESCE_SECONDS
+                && s.current == s.target
+                && settle_target(s, rect, content, scale)
+            {
+                moved = true;
+                if !s.style.auto_hide {
+                    s.bar_alpha = 1.0;
                 }
-                if new != s.current {
-                    s.current = new;
-                    moved = true;
-                }
-                // Hold the bar fully visible while chasing.
-                s.bar_alpha = 1.0;
             }
             // Hold visible whenever the user is interacting with the
             // bar or the style demands always-on. Otherwise drain.
@@ -1009,6 +1263,9 @@ impl NodeTree {
                 .and_then(|n| n.scroll.as_ref())
                 .map(|s| {
                     s.current != s.target
+                        || s.bounce_elapsed[0] >= 0.0
+                        || s.bounce_elapsed[1] >= 0.0
+                        || s.time_since_input < SCROLL_INPUT_QUIESCE_SECONDS
                         || s.bar_alpha > 0.0
                         || s.style.always_visible
                         || s.bar_hover[0]
@@ -1036,6 +1293,7 @@ impl NodeTree {
             ),
             None => return,
         };
+        let scale = self.current_scale;
         let mask = self.scroll_mask();
         if let Some(n) = self.get_mut_raw(id)
             && let Some(s) = n.scroll.as_mut()
@@ -1044,11 +1302,21 @@ impl NodeTree {
             let max_off_y = (content[1] - rect[3]).max(0.0);
             let want_x = if sx { target[0] } else { s.target[0] };
             let want_y = if sy { target[1] } else { s.target[1] };
-            let new_target = if s.overscroll {
-                [want_x, want_y]
-            } else {
-                [want_x.clamp(0.0, max_off_x), want_y.clamp(0.0, max_off_y)]
-            };
+            // Absolute set always hard-clamps (rubber-band is a
+            // gestural / wheel-incremental concept) and applies snap so
+            // programmatic targets land on a row boundary just like
+            // wheel input does.
+            let clamped_x = want_x.clamp(0.0, max_off_x);
+            let clamped_y = want_y.clamp(0.0, max_off_y);
+            let new_target = [
+                snap_to_step(clamped_x, s.snap_step[0], scale, max_off_x),
+                snap_to_step(clamped_y, s.snap_step[1], scale, max_off_y),
+            ];
+            // Reset input quiescence so the on-quiesce settle path
+            // waits the full gate before retargeting. Prevents jerk
+            // when continuous input (held arrow, wheel burst) has
+            // pushed target past edge.
+            s.time_since_input = 0.0;
             if s.target != new_target {
                 s.target = new_target;
                 if !s.style.auto_hide {
@@ -1066,7 +1334,21 @@ impl NodeTree {
     /// applied (may be less than requested at edges or zero on a non-
     /// scroll axis) so a wheel dispatcher can bubble the remainder to
     /// a parent scroll ancestor.
+    /// Variant of [`Self::add_scroll_delta`] that **skips snap-on-input**.
+    /// Used by the per-tick hold-to-scroll pump where the per-frame
+    /// delta is small relative to `snap_step` — applying snap each
+    /// tick would round the delta to zero and stall the scroll. Settle
+    /// on quiesce (the post-input snap path) handles row alignment
+    /// when the user releases the key.
+    pub fn add_scroll_delta_continuous(&mut self, id: NodeId, delta: [f32; 2]) -> [f32; 2] {
+        self.add_scroll_delta_inner(id, delta, false)
+    }
+
     pub fn add_scroll_delta(&mut self, id: NodeId, delta: [f32; 2]) -> [f32; 2] {
+        self.add_scroll_delta_inner(id, delta, true)
+    }
+
+    fn add_scroll_delta_inner(&mut self, id: NodeId, delta: [f32; 2], snap: bool) -> [f32; 2] {
         let (rect, content, sx, sy) = match self.get(id) {
             Some(n) => (
                 n.rect,
@@ -1076,21 +1358,77 @@ impl NodeTree {
             ),
             None => return [0.0; 2],
         };
+        let scale = self.current_scale;
         let mask = self.scroll_mask();
         if let Some(n) = self.get_mut_raw(id)
             && let Some(s) = n.scroll.as_mut()
         {
             let max_off_x = (content[0] - rect[2]).max(0.0);
             let max_off_y = (content[1] - rect[3]).max(0.0);
-            let want_x = s.target[0] + if sx { delta[0] } else { 0.0 };
-            let want_y = s.target[1] + if sy { delta[1] } else { 0.0 };
-            let new_target = if s.overscroll {
-                [want_x, want_y]
+            let raw_dx = if sx { delta[0] } else { 0.0 };
+            let raw_dy = if sy { delta[1] } else { 0.0 };
+            let limit = OVERSCROLL_LIMIT_LOGICAL * scale;
+            // Overscroll engages in two stages so wheel input doesn't
+            // feel "forced" past the edge:
+            //   1. First crossing: target lands exactly at the edge
+            //      (clamp). The over-portion is dropped — no rubber-band
+            //      yet. Mirrors iOS scroll: momentum stops at the edge.
+            //   2. Subsequent push while target is *already* at the edge:
+            //      `rubber_band_target` asymptote applies, so each
+            //      additional wheel event stretches the rubber-band
+            //      progressively until limit.
+            // Direction symmetric for the top edge. Non-overscroll: hard
+            // clamp on every input.
+            let mut new_target = if s.overscroll {
+                [
+                    add_with_edge_gate(s.target[0], raw_dx, 0.0, max_off_x, limit),
+                    add_with_edge_gate(s.target[1], raw_dy, 0.0, max_off_y, limit),
+                ]
             } else {
-                [want_x.clamp(0.0, max_off_x), want_y.clamp(0.0, max_off_y)]
+                [
+                    (s.target[0] + raw_dx).clamp(0.0, max_off_x),
+                    (s.target[1] + raw_dy).clamp(0.0, max_off_y),
+                ]
             };
-            let applied = [new_target[0] - s.target[0], new_target[1] - s.target[1]];
-            if applied != [0.0, 0.0] {
+            // Snap-on-input: when the post-clamp target lands inside the
+            // valid range, immediately retarget to the nearest snap
+            // multiple. Spring then eases to a row-aligned position from
+            // the very first tick — no visible "settle then jump" pause.
+            // Past-edge (rubber-band) targets keep their cooked value;
+            // settle-on-quiesce snaps once the spring lands in range.
+            // Skipped in continuous mode — see `add_scroll_delta_continuous`.
+            if snap {
+                if new_target[0] >= 0.0 && new_target[0] <= max_off_x {
+                    new_target[0] = snap_to_step(new_target[0], s.snap_step[0], scale, max_off_x);
+                }
+                if new_target[1] >= 0.0 && new_target[1] <= max_off_y {
+                    new_target[1] = snap_to_step(new_target[1], s.snap_step[1], scale, max_off_y);
+                }
+            }
+            // Overscroll consumes the requested delta on its enabled
+            // axes even when rubber-band shrinks the target movement —
+            // bubbling the remainder up to an outer scroller while
+            // rubber-banding the inner would feel wrong (the user
+            // clearly wants to scroll the inner). Non-overscroll axes
+            // still report the actual clamped movement so wheel routing
+            // can bubble the leftover.
+            let applied_x = if s.overscroll && sx {
+                raw_dx
+            } else {
+                new_target[0] - s.target[0]
+            };
+            let applied_y = if s.overscroll && sy {
+                raw_dy
+            } else {
+                new_target[1] - s.target[1]
+            };
+            let applied = [applied_x, applied_y];
+            // Same input-quiescence reset as set_scroll_target — must
+            // happen on every input even when target doesn't change
+            // (e.g. user holds arrow against the rubber-band cap, raw
+            // delta saturates so target stays the same).
+            s.time_since_input = 0.0;
+            if new_target != s.target {
                 s.target = new_target;
                 if !s.style.auto_hide {
                     s.bar_alpha = 1.0;
@@ -1132,6 +1470,36 @@ impl NodeTree {
             && let Some(s) = n.scroll.as_mut()
         {
             s.overscroll = on;
+        }
+    }
+
+    /// Update the bounce-back spring for a scrollable node. See
+    /// [`NodeBuilder::bounce_spring`] for the param semantics.
+    pub fn set_scroll_bounce_spring(&mut self, id: NodeId, stiffness: f32, damping: f32) {
+        if let Some(n) = self.get_mut_raw(id)
+            && let Some(s) = n.scroll.as_mut()
+        {
+            s.bounce_stiffness = stiffness.max(0.0);
+            s.bounce_damping = damping.max(0.0);
+        }
+    }
+
+    /// Per-axis scroll snap step in **logical** px. `0` on an axis
+    /// disables snap there (continuous scroll). When non-zero, the
+    /// spring quiesce path retargets to the nearest multiple, so
+    /// every settle lands on a row boundary regardless of how the
+    /// user got there (wheel, drag-end, scrollbar click, arrow-key).
+    pub fn set_scroll_snap_step(&mut self, id: NodeId, step: [f32; 2]) {
+        if let Some(n) = self.get_mut_raw(id)
+            && let Some(s) = n.scroll.as_mut()
+        {
+            let step = [step[0].max(0.0), step[1].max(0.0)];
+            if s.snap_step != step {
+                s.snap_step = step;
+                // Snap activation is applied next time the spring
+                // quiesces; flag SCROLL so the loop ticks again.
+                self.dirty |= dirty::SCROLL;
+            }
         }
     }
 
@@ -1225,19 +1593,37 @@ impl NodeTree {
     /// Intended for thumb-drag — the pointer is the authoritative
     /// position so easing toward it would just lag behind. Writes
     /// both `current` and `target` so the spring stays at rest.
-    /// Clamped via the same overscroll rules as `set_scroll_target`.
+    ///
+    /// When `overscroll == true`, drag past the track end is allowed
+    /// but rubber-banded via the same asymptote as wheel input — the
+    /// effective position saturates at `max_off + OVERSCROLL_LIMIT *
+    /// scale`. This produces the visual stretch users expect when they
+    /// pull the thumb past either end. The drag-end handler is
+    /// responsible for retargeting to a clamped position so the spring
+    /// bounces back. Without overscroll, hard-clamps to `[0, max_off]`.
     pub fn set_scroll_immediate(&mut self, id: NodeId, axis: ScrollAxis, pos: f32) {
         let (rect, content) = match self.get(id) {
             Some(n) => (n.rect, n.content_size),
             None => return,
         };
+        let scale = self.current_scale;
         let mask = self.scroll_mask();
         if let Some(n) = self.get_mut_raw(id)
             && let Some(s) = n.scroll.as_mut()
         {
             let i = axis.index();
             let max_off = (content[i] - rect[2 + i]).max(0.0);
-            let new_pos = if s.overscroll { pos } else { pos.clamp(0.0, max_off) };
+            let new_pos = if s.overscroll {
+                let limit = OVERSCROLL_LIMIT_LOGICAL * scale;
+                rubber_band_target(0.0, pos, 0.0, max_off, limit)
+            } else {
+                pos.clamp(0.0, max_off)
+            };
+            // Drag fires every frame from `drag_to` while the user
+            // moves the thumb — keep the settle gate suppressed for
+            // the full drag, then end_drag's set_scroll_target reset
+            // starts the post-release timer.
+            s.time_since_input = 0.0;
             if (s.current[i] - new_pos).abs() > f32::EPSILON
                 || (s.target[i] - new_pos).abs() > f32::EPSILON
             {
@@ -1375,6 +1761,14 @@ impl NodeTree {
 
     pub fn roots(&self) -> &[NodeId] {
         &self.roots
+    }
+
+    /// Every node currently owning a `ScrollState`, in insertion order
+    /// (preserved across removes). Exposed so input routing can fall
+    /// back to a default scroll target when the cursor isn't over any
+    /// scroll container — typical use is `tree.scrollables().first()`.
+    pub fn scrollables(&self) -> &[NodeId] {
+        &self.scrollable_ids
     }
 
     /// DFS preorder flatten into a single ordered event stream,
@@ -1749,6 +2143,166 @@ fn scale_alpha(c: [f32; 4], a: f32) -> [f32; 4] {
     [c[0], c[1], c[2], c[3] * a]
 }
 
+/// Snap `value` to the nearest multiple of `step_logical * scale`,
+/// treating `max_off` as a virtual snap point so the bottom/right edge
+/// at end-of-list is always fully visible. `value` is assumed to be
+/// pre-clamped to `[0, max_off]`. Returns `value` unchanged when
+/// `step_logical <= 0` (snap disabled) or `max_off <= 0`.
+fn snap_to_step(value: f32, step_logical: f32, scale: f32, max_off: f32) -> f32 {
+    if step_logical <= 0.0 || max_off <= 0.0 {
+        return value;
+    }
+    let step = step_logical * scale;
+    if step <= f32::EPSILON {
+        return value;
+    }
+    let mult = ((value / step).round() * step).clamp(0.0, max_off);
+    if (max_off - value).abs() < (mult - value).abs() {
+        max_off
+    } else {
+        mult
+    }
+}
+
+/// Apply overscroll release + snap-to-step to `s.target` once the
+/// spring quiesces. Snap on input handles the in-range case; this
+/// runs after a wheel burst pushed `target` past edge with rubber-
+/// band so the spring lands in-range and on a multiple. Returns true
+/// if the target moved.
+fn settle_target(
+    s: &mut ScrollState,
+    rect: [f32; 4],
+    content: [f32; 2],
+    scale: f32,
+) -> bool {
+    let max_off = [
+        (content[0] - rect[2]).max(0.0),
+        (content[1] - rect[3]).max(0.0),
+    ];
+    let mut new_target = [
+        s.target[0].clamp(0.0, max_off[0]),
+        s.target[1].clamp(0.0, max_off[1]),
+    ];
+    new_target[0] = snap_to_step(new_target[0], s.snap_step[0], scale, max_off[0]);
+    new_target[1] = snap_to_step(new_target[1], s.snap_step[1], scale, max_off[1]);
+    if new_target != s.target {
+        s.target = new_target;
+        true
+    } else {
+        false
+    }
+}
+
+/// Compose `delta` onto `target` for an overscroll-enabled axis, with
+/// the iOS-style "stop-at-edge-first" gate: a wheel push that first
+/// crosses the edge clamps to the edge instead of immediately rubber-
+/// banding. Only when `target` already sits at the edge (or past it
+/// from a prior push) does the asymptote engage. Pull-back from past
+/// the edge applies the raw delta directly. This avoids the "forced"
+/// feel of rubber-band on a single big wheel event.
+fn add_with_edge_gate(target: f32, delta: f32, min: f32, max: f32, limit: f32) -> f32 {
+    if delta == 0.0 {
+        return target;
+    }
+    let raw = target + delta;
+    if raw > max {
+        if delta > 0.0 && target < max {
+            // First crossing: clamp at edge, drop the over-portion.
+            max
+        } else {
+            // Already at-or-past edge with further push, OR pulling
+            // back from past edge. Use the rubber-band asymptote
+            // (which returns raw delta on pull-back).
+            rubber_band_target(target, delta, min, max, limit)
+        }
+    } else if raw < min {
+        if delta < 0.0 && target > min {
+            min
+        } else {
+            rubber_band_target(target, delta, min, max, limit)
+        }
+    } else {
+        raw
+    }
+}
+
+/// Compute the new scroll target after applying `delta`, with iOS-style
+/// rubber-band resistance when the result would land past `[min, max]`.
+/// Returns `target + delta` clamped/cooked to `[min - limit, max + limit]`.
+///
+/// Asymptote: `cooked_over = limit * raw_over / (raw_over + limit)`. As
+/// the user pushes further, additional input contributes diminishing
+/// target movement, capping at exactly `max + limit` (or `min - limit`).
+///
+/// **Inverse-aware**: when `target` is already past the edge (i.e.
+/// already a *cooked* value from a prior call), the function recovers
+/// the underlying raw position via the inverse asymptote
+/// (`raw = limit * cooked / (limit - cooked)`) before composing the
+/// delta. Without this, repeated calls with `target = prev_cooked`
+/// would treat the cooked value as raw — small positive deltas could
+/// make cooked *decrease*, and long runs of small deltas would saturate
+/// the wrong way. Matters most for per-tick continuous pumps where
+/// each delta is small relative to `limit`.
+///
+/// Pull-back toward `[min, max]` is applied via the same composed
+/// raw, so releasing the band converges smoothly back into range.
+///
+/// `limit` is in physical px (caller multiplies a logical constant by
+/// the display scale).
+fn rubber_band_target(target: f32, delta: f32, min: f32, max: f32, limit: f32) -> f32 {
+    if limit <= f32::EPSILON {
+        return (target + delta).clamp(min, max);
+    }
+    let raw = target + delta;
+    // In-range outcome: no asymptote, just composed value.
+    if raw >= min && raw <= max {
+        return raw;
+    }
+    // Past max:
+    //  - delta < 0 → pulling back into range; apply 1:1 so releasing
+    //    the band feels free (the band un-stretches at full speed).
+    //  - delta > 0 → pushing further past max; inverse-aware asymptote
+    //    (`prev_cooked → prev_raw → +delta → new_cooked`) so repeated
+    //    small deltas compose monotonically.
+    // Symmetric for past min.
+    if raw > max {
+        if delta < 0.0 {
+            return raw;
+        }
+        let prev_raw = if target > max {
+            let co = target - max;
+            if co >= limit - f32::EPSILON {
+                f32::MAX / 4.0
+            } else {
+                max + (limit * co / (limit - co))
+            }
+        } else {
+            target
+        };
+        let new_raw = (prev_raw + delta).max(max);
+        let ro = new_raw - max;
+        max + (limit * ro / (ro + limit))
+    } else {
+        // raw < min
+        if delta > 0.0 {
+            return raw;
+        }
+        let prev_raw = if target < min {
+            let co = min - target;
+            if co >= limit - f32::EPSILON {
+                f32::MIN / 4.0
+            } else {
+                min - (limit * co / (limit - co))
+            }
+        } else {
+            target
+        };
+        let new_raw = (prev_raw + delta).min(min);
+        let ro = min - new_raw;
+        min - (limit * ro / (ro + limit))
+    }
+}
+
 fn intersect_clip(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [
         a[0].max(b[0]),
@@ -1979,6 +2533,438 @@ mod tests {
         let s = t.get(id).unwrap().scroll.unwrap();
         assert_eq!(s.bar_alpha, 1.0);
         assert_eq!(s.bar_hover, [false, true]);
+    }
+
+    #[test]
+    fn snap_step_retargets_to_nearest_multiple_after_settle() {
+        let mut t = NodeTree::new();
+        let id = t
+            .add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 1000.0];
+        }
+        // Wheel pushes 38 px; spring settles at 38; settle snaps to 50.
+        let _ = t.add_scroll_delta(id, [0.0, 38.0]);
+        let dt = 1.0 / 60.0;
+        // Run enough ticks for spring to settle, snap, settle again,
+        // and bar fade to drain so has_active_scrolls = false.
+        for _ in 0..240 {
+            t.tick_scrolls(dt);
+        }
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 50.0, "target should snap to 50");
+        assert_eq!(s.current[1], 50.0, "spring should chase to snapped");
+    }
+
+    #[test]
+    fn snap_step_lands_on_max_off_when_near_bottom() {
+        // max_off=130 isn't a clean multiple of step=50. When the user
+        // scrolls past the last clean multiple (100), settle should
+        // land on max_off itself (treats the bottom edge as a virtual
+        // snap point) — the alternative (100) would clip the bottom of
+        // the list with 30 px of empty space below the last "row".
+        let mut t = NodeTree::new();
+        let id = t
+            .add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 230.0];
+        }
+        let _ = t.add_scroll_delta(id, [0.0, 1000.0]);
+        let dt = 1.0 / 60.0;
+        for _ in 0..240 {
+            t.tick_scrolls(dt);
+        }
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 130.0, "expected max_off, got {}", s.target[1]);
+    }
+
+    #[test]
+    fn snap_step_lands_on_multiple_when_far_from_edge() {
+        // Mid-list scroll: nearest multiple is closer than max_off.
+        let mut t = NodeTree::new();
+        let id = t
+            .add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 1000.0]; // max_off = 900
+        }
+        // Push to ~280 — nearest multiple is 300, max_off (900) is far.
+        let _ = t.add_scroll_delta(id, [0.0, 280.0]);
+        let dt = 1.0 / 60.0;
+        for _ in 0..240 {
+            t.tick_scrolls(dt);
+        }
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 300.0);
+    }
+
+    #[test]
+    fn drag_rubber_bands_with_overscroll_capped_at_limit() {
+        // set_scroll_immediate (used by thumb drag) honours overscroll
+        // mode but caps via the rubber-band asymptote at
+        // `max_off + OVERSCROLL_LIMIT`. Slow drag past the track end
+        // produces an asymptotic stretch — never a runaway "scroll out
+        // of view" — so the visual matches native scrollbar behaviour.
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 500.0]; // max_off = 400, limit = 60
+        }
+        t.set_scroll_immediate(id, ScrollAxis::Y, 9999.0);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert!(
+            s.current[1] > 400.0 && s.current[1] < 400.0 + 60.0,
+            "drag should rubber-band into [max, max+limit), got {}",
+            s.current[1]
+        );
+    }
+
+    #[test]
+    fn drag_without_overscroll_hard_clamps() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(Node::rect().scroll_y().build());
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 500.0];
+        }
+        t.set_scroll_immediate(id, ScrollAxis::Y, 9999.0);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.current[1], 400.0);
+    }
+
+    #[test]
+    fn end_drag_retargets_to_snapped_in_range() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .snap_step_y(50.0)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 500.0]; // max_off=400, snap=50
+        }
+        // Simulate drag past edge: current/target ~440 (rubber-banded).
+        t.set_scroll_immediate(id, ScrollAxis::Y, 1000.0);
+        // End drag retargets to clamped + snapped position. Spring
+        // should now chase from past-edge current toward in-range
+        // multiple. Target should land at 400 (max_off, treated as
+        // virtual snap point).
+        crate::input::end_drag(id, ScrollAxis::Y, &mut t);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 400.0, "target should retarget to max_off");
+        assert!(s.current[1] > 400.0, "current still past edge ready to bounce");
+    }
+
+    #[test]
+    fn add_scroll_delta_snaps_immediately_in_range() {
+        // Snap-on-input: target lands on the nearest multiple right
+        // away. No "settle then jump" pause once the spring catches up.
+        let mut t = NodeTree::new();
+        let id = t
+            .add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 1000.0];
+        }
+        let _ = t.add_scroll_delta(id, [0.0, 38.0]);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 50.0, "target should snap on input, not on settle");
+        // current still 0 — spring will chase 50.
+        assert_eq!(s.current[1], 0.0);
+    }
+
+    #[test]
+    fn bounce_spring_settles_within_one_second() {
+        // Closed-form damped harmonic oscillator (k=3500, c=50, ζ≈0.42)
+        // overshoots target slightly then settles. Generous 60-frame
+        // budget covers the full damped oscillation including any
+        // small undershoot — well past the perceptual settle (~250ms).
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 200.0];
+        }
+        if let Some(n) = t.get_mut_raw(id)
+            && let Some(s) = n.scroll.as_mut()
+        {
+            s.current[1] = 180.0;
+            s.target[1] = 100.0;
+        }
+        let dt = 1.0 / 60.0;
+        for _ in 0..60 {
+            t.tick_scrolls(dt);
+        }
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.current[1], 100.0, "bounce should settle within 1s");
+        assert_eq!(s.bounce_elapsed[1], -1.0, "bounce flag must reset on settle");
+    }
+
+    #[test]
+    fn settle_waits_for_input_quiescence() {
+        // Held arrow / wheel burst: while input keeps arriving inside
+        // the quiescence window, settle must NOT clamp a saturated
+        // past-edge target back into range. Otherwise the next input
+        // event would re-saturate it and the resulting target
+        // oscillation reads as a jerk.
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 200.0]; // max_off = 100
+        }
+        // Saturate past edge.
+        for _ in 0..20 {
+            let _ = t.add_scroll_delta(id, [0.0, 40.0]);
+        }
+        // Force spring to quiesce at saturated target.
+        if let Some(n) = t.get_mut_raw(id)
+            && let Some(s) = n.scroll.as_mut()
+        {
+            s.current[1] = s.target[1];
+        }
+        let saturated_target = t.get(id).unwrap().scroll.unwrap().target[1];
+        assert!(saturated_target > 100.0, "setup must be past edge");
+        // Simulate "still receiving input": fire a delta every tick at
+        // a 33 ms cadence (OS auto-repeat). Settle must stay gated and
+        // target must remain past edge across the burst.
+        let dt = 1.0 / 60.0;
+        for _ in 0..15 {
+            t.tick_scrolls(dt);
+            let _ = t.add_scroll_delta(id, [0.0, 40.0]);
+        }
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert!(
+            s.target[1] > 100.0,
+            "settle must not fire while input is still arriving, target={}",
+            s.target[1]
+        );
+        // Now stop sending input. After the gate elapses the next
+        // tick should clamp target and start the bounce.
+        for _ in 0..20 {
+            t.tick_scrolls(dt);
+        }
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert!(
+            s.target[1] <= 100.0,
+            "settle should fire after input quiescence, target={}",
+            s.target[1]
+        );
+    }
+
+    #[test]
+    fn bounce_overshoots_target_slightly() {
+        // Underdamped spring (default ζ ≈ 0.42) must dip past target
+        // at least once — that's what gives the "alive" feel vs the
+        // monotonic exponential ease used for forward chase.
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 200.0]; // max_off = 100
+        }
+        if let Some(n) = t.get_mut_raw(id)
+            && let Some(s) = n.scroll.as_mut()
+        {
+            s.current[1] = 150.0;
+            s.target[1] = 100.0;
+        }
+        let dt = 1.0 / 240.0; // higher rate for finer overshoot capture
+        let mut min_seen = f32::INFINITY;
+        for _ in 0..480 {
+            t.tick_scrolls(dt);
+            let cur = t.get(id).unwrap().scroll.unwrap().current[1];
+            if cur < min_seen {
+                min_seen = cur;
+            }
+        }
+        assert!(
+            min_seen < 100.0 - 0.5,
+            "underdamped bounce should overshoot below target, min={min_seen}"
+        );
+    }
+
+    #[test]
+    fn rubber_band_engages_only_after_first_edge_stop() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 200.0]; // max_off = 100
+        }
+        // First crossing in a single big delta lands at edge; over-
+        // portion dropped (the user hasn't asked for rubber-band yet).
+        let _ = t.add_scroll_delta(id, [0.0, 150.0]);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 100.0, "first crossing should stop at edge");
+        // Now sitting at edge — additional push engages rubber-band.
+        let _ = t.add_scroll_delta(id, [0.0, 50.0]);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert!(
+            s.target[1] > 100.0 && s.target[1] < 150.0,
+            "subsequent push should asymptote past edge, got {}",
+            s.target[1]
+        );
+    }
+
+    #[test]
+    fn first_crossing_clamps_at_edge_then_subsequent_pushes_rubber_band() {
+        // Confirms the two-stage gate: a single big delta that crosses
+        // from in-range to past-edge stops at the edge. Only when the
+        // user pushes again *after* sitting at the edge does the
+        // asymptote engage. Prevents the "forced" feel of rubber-band
+        // on a single fast wheel event.
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 200.0];
+        }
+        let _ = t.add_scroll_delta(id, [0.0, 1000.0]);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 100.0, "first crossing must stop at edge");
+        let _ = t.add_scroll_delta(id, [0.0, 30.0]);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert!(s.target[1] > 100.0, "second push should engage rubber-band");
+    }
+
+    #[test]
+    fn rubber_band_caps_at_max_plus_limit() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 200.0]; // max_off = 100, limit = 100
+        }
+        // Spam huge deltas — target asymptotically approaches 200 but
+        // never exceeds it.
+        for _ in 0..50 {
+            let _ = t.add_scroll_delta(id, [0.0, 1000.0]);
+        }
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert!(s.target[1] < 200.0, "must cap below limit, got {}", s.target[1]);
+    }
+
+    #[test]
+    fn overscroll_target_settles_back_into_range() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 200.0]; // max_off = 100
+        }
+        // Push hard past the edge. With rubber-band on, target lands
+        // somewhere in [100, 100+limit] but spring will pull it back.
+        for _ in 0..10 {
+            let _ = t.add_scroll_delta(id, [0.0, 100.0]);
+        }
+        let dt = 1.0 / 60.0;
+        for _ in 0..240 {
+            t.tick_scrolls(dt);
+        }
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 100.0, "settle should clamp target");
+        assert_eq!(s.current[1], 100.0, "spring should chase clamped");
+    }
+
+    #[test]
+    fn rubber_band_unwinds_freely_toward_range() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(
+            Node::rect()
+                .scroll_y()
+                .overscroll(true)
+                .build(),
+        );
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 200.0];
+        }
+        // Two pushes to engage rubber-band past edge: first lands at
+        // 100 (clamp), second asymptotes.
+        let _ = t.add_scroll_delta(id, [0.0, 200.0]);
+        let _ = t.add_scroll_delta(id, [0.0, 100.0]);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        let past = s.target[1];
+        assert!(past > 100.0, "must be past edge for setup, got {past}");
+        // Pull back 30 px. Pull-back uses the raw delta directly so
+        // target should drop by at least 30.
+        let _ = t.add_scroll_delta(id, [0.0, -30.0]);
+        let s2 = t.get(id).unwrap().scroll.unwrap();
+        let moved = past - s2.target[1];
+        assert!(
+            moved >= 30.0 - 0.01,
+            "back-toward-range should apply at least the requested delta, got {moved}"
+        );
+    }
+
+    #[test]
+    fn set_scroll_snap_step_takes_effect_after_settle() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(Node::rect().scroll_y().build());
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [0.0, 0.0, 100.0, 100.0];
+            n.content_size = [100.0, 1000.0];
+        }
+        let _ = t.add_scroll_delta(id, [0.0, 38.0]);
+        let dt = 1.0 / 60.0;
+        // Settle at 38 first.
+        for _ in 0..30 {
+            t.tick_scrolls(dt);
+        }
+        // Now configure snap; next tick re-settles to 50.
+        t.set_scroll_snap_step(id, [0.0, 50.0]);
+        for _ in 0..240 {
+            t.tick_scrolls(dt);
+        }
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 50.0);
     }
 
     #[test]

@@ -3,11 +3,19 @@
 //! a wide strip of cards; a glass panel pinned half-way down stays
 //! visually correct as content slides under it.
 //!
+//! Demonstrates the M16 follow-ups: snap-to-row (outer + inner both
+//! retarget to the nearest row/card after every settle), elastic
+//! overscroll (push the outer past either edge — the spring tugs back),
+//! and arrow-key smooth-scroll (Up/Down/PgUp/PgDn/Home/End route
+//! through `on_scroll_key` to the scroll under the cursor or the
+//! first scrollable in the tree).
+//!
 //! Run with:
 //!     cargo run --example scroll_list
 //!
 //! Use the mouse wheel to scroll. Hold Shift while scrolling over the
-//! inner row to nudge it horizontally without leaving the row.
+//! inner row to nudge it horizontally without leaving the row. Use
+//! arrow keys / PageUp / PageDown / Home / End for keyboard nav.
 
 use frostify_gfx::{App, BarSide, Justify, Len, Scene};
 
@@ -46,6 +54,12 @@ fn build(s: &mut Scene) {
                 .pad(12.0)
                 .gap(8.0)
                 .scroll_y()
+                // Row stride = 36 px row height + 8 px gap = 44 px.
+                // Each settle lands on a row boundary.
+                .snap_step_y(44.0)
+                // Pull past either edge with rubber-band; spring snaps
+                // back into range when the user lets go.
+                .overscroll(true)
                 .scrollbar(|s| {
                     s.thickness(10.0)
                         .min_thumb(40.0)
@@ -59,7 +73,7 @@ fn build(s: &mut Scene) {
                         .thumb_active_color([0.85, 0.95, 1.00, 1.00])
                 })
                 .child(|list| {
-                    for i in 0..50u32 {
+                    for i in 0..500u32 {
                         if i == 18 {
                             // Halfway-ish: inner horizontal scroller.
                             list.row("strip")
@@ -70,6 +84,8 @@ fn build(s: &mut Scene) {
                                 .rgba(0.10, 0.11, 0.14, 1.0)
                                 .radius(8.0)
                                 .scroll_x()
+                                // Card stride = 120 px width + 8 px gap.
+                                .snap_step_x(128.0)
                                 .scrollbar(|s| {
                                     // Auto-hide: only shows when the
                                     // pointer hovers the bar region or
@@ -104,20 +120,13 @@ fn build(s: &mut Scene) {
                             .child(|r| {
                                 r.text(format!("row{i}_label"), format!("row {i:>02}"), 14.0)
                                     .color([0.0, 0.0, 0.0, 0.85]);
-                            });
+                            }
+                        );
                     }
-                });
-            // Glass panel pinned over the list — content scrolls
-            // visibly behind it.
-            root.glass("panel")
-                .abs(60.0, 220.0)
-                .size_px(W as f32 - 120.0, 100.0)
-                .radius(16.0)
-                .blur(20.0)
-                .refraction(8.0)
-                .roughness(1.0)
-                .rgba(1.0, 1.0, 1.0, 0.08);
-        });
+                }
+            );
+        }
+    );
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

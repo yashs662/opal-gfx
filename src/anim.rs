@@ -140,8 +140,10 @@ fn cubic_bezier_y_at_x(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
 
 /// Closed-form unit-step response of a 1-DOF mass-spring-damper with
 /// unit mass, initial position 0, initial velocity 0, target 1.
-/// Returns `(position, velocity)` at elapsed time `t`.
-fn spring_eval(k: f32, c: f32, t: f32) -> (f32, f32) {
+/// Returns `(position, velocity)` at elapsed time `t`. `pub(crate)` so
+/// the scroll path can drive bounce-back through the same spring math
+/// the timeline uses (instead of inventing a separate exponential).
+pub(crate) fn spring_eval(k: f32, c: f32, t: f32) -> (f32, f32) {
     let w0 = k.max(1e-6).sqrt();
     let zeta = c / (2.0 * w0);
     if (zeta - 1.0).abs() < 1e-4 {

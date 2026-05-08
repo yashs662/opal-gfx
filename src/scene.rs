@@ -407,10 +407,56 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
-    /// Allow the scroll target to push past the content edge. The
-    /// spring still pulls it back. Default false.
+    /// Allow the scroll target to push past the content edge with
+    /// rubber-band damping; the spring snaps back into range when the
+    /// user lets go. Default false.
     pub fn overscroll(&mut self, on: bool) -> &mut Self {
         self.ctx.tree.set_scroll_overscroll(self.id, on);
+        self
+    }
+
+    /// Tune the bounce-back spring for overscroll release. See
+    /// [`crate::node::NodeBuilder::bounce_spring`] for param semantics.
+    /// Defaults `(800, 42)` give a graceful pull-back in ~280 ms with
+    /// minimal overshoot.
+    pub fn bounce_spring(&mut self, stiffness: f32, damping: f32) -> &mut Self {
+        self.ctx
+            .tree
+            .set_scroll_bounce_spring(self.id, stiffness, damping);
+        self
+    }
+
+    /// Per-axis snap step in **logical** px. After every scroll input
+    /// the spring eases to the nearest multiple — useful for row-based
+    /// lists, paged carousels, etc. `0` on an axis disables snap.
+    pub fn snap_step(&mut self, x: f32, y: f32) -> &mut Self {
+        self.ctx.tree.set_scroll_snap_step(self.id, [x, y]);
+        self
+    }
+
+    /// Y-only snap step. See [`Self::snap_step`].
+    pub fn snap_step_y(&mut self, px: f32) -> &mut Self {
+        let cur = self
+            .ctx
+            .tree
+            .get(self.id)
+            .and_then(|n| n.scroll.as_ref())
+            .map(|s| s.snap_step[0])
+            .unwrap_or(0.0);
+        self.ctx.tree.set_scroll_snap_step(self.id, [cur, px]);
+        self
+    }
+
+    /// X-only snap step. See [`Self::snap_step`].
+    pub fn snap_step_x(&mut self, px: f32) -> &mut Self {
+        let cur = self
+            .ctx
+            .tree
+            .get(self.id)
+            .and_then(|n| n.scroll.as_ref())
+            .map(|s| s.snap_step[1])
+            .unwrap_or(0.0);
+        self.ctx.tree.set_scroll_snap_step(self.id, [px, cur]);
         self
     }
 

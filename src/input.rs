@@ -11,6 +11,7 @@
 //! first) and rebuilt whenever `TRANSFORM` or `TREE` dirty bits fire.
 
 use crate::node::{HitEntry, NodeId, NodeTree, ScrollAxis, ScrollHit, ScrollbarHit};
+use winit::keyboard::KeyCode;
 
 /// Transient result returned by each event method so the caller can
 /// decide whether to re-flush the tree + request a redraw.
@@ -270,7 +271,12 @@ pub fn drag_to(
     (after - prev).abs() > f32::EPSILON
 }
 
-/// Clear the active-axis flag at the end of a drag.
+/// Clear the active-axis flag at the end of a drag and retarget so the
+/// spring lands on a snap multiple (and bounces back from any rubber-
+/// band overscroll). The retarget reads `current` and writes `target`
+/// via `set_scroll_target`, which hard-clamps + snaps internally —
+/// `current` is left alone so the bounce-back stiffness in
+/// `tick_scrolls` engages when current is past the edge.
 pub fn end_drag(node_id: NodeId, axis: ScrollAxis, tree: &mut NodeTree) {
     let mut active = tree
         .get(node_id)
@@ -279,6 +285,12 @@ pub fn end_drag(node_id: NodeId, axis: ScrollAxis, tree: &mut NodeTree) {
         .unwrap_or([false; 2]);
     active[axis.index()] = false;
     tree.set_bar_active(node_id, active);
+    let current = tree
+        .get(node_id)
+        .and_then(|n| n.scroll.as_ref())
+        .map(|s| s.current)
+        .unwrap_or([0.0; 2]);
+    tree.set_scroll_target(node_id, current);
 }
 
 /// AABB containment for a `[min_x, min_y, max_x, max_y]` rect.
@@ -370,6 +382,187 @@ pub fn on_wheel(
     let mut moved = false;
     for &id in &hit.ancestor_chain {
         let applied = tree.add_scroll_delta(id, request);
+        if applied != [0.0; 2] {
+            moved = true;
+        }
+        request = [request[0] - applied[0], request[1] - applied[1]];
+        if request[0].abs() < f32::EPSILON && request[1].abs() < f32::EPSILON {
+            break;
+        }
+    }
+    moved
+}
+
+/// Default arrow-key step size in **logical** px. Caller multiplies by
+/// the current display scale to convert to physical-px deltas.
+pub const ARROW_KEY_STEP_LOGICAL: f32 = 40.0;
+
+/// Hold-to-scroll velocity in **logical** px/sec. Drives the per-tick
+/// continuous pump that runs while a scroll arrow is physically held.
+/// 600 logical px/sec ≈ 13–14 rows/sec on a 44-px-stride list — fast
+/// enough that holding feels purposeful, slow enough that a quick tap
+/// doesn't overshoot. Replaces OS auto-repeat for arrow keys
+/// specifically because OS repeat has a ~250 ms initial-delay gap that
+/// makes the spring visibly settle at one position then jump to the
+/// next when the first repeat arrives.
+pub const HOLD_SCROLL_VELOCITY_LOGICAL: f32 = 600.0;
+
+/// Resolve a keyboard event to a scroll delta + (optionally) an
+/// absolute target, route it through the same wheel-bubble path as
+/// [`on_wheel`]. Returns true if any scroll target moved.
+///
+/// Routing prefers the topmost scroll container under the cursor; falls
+/// back to the first entry in `tree.scrollables()` so keyboard
+/// navigation works even with the pointer parked elsewhere. Handles:
+/// - `ArrowUp/Down/Left/Right`: 1 line (`ARROW_KEY_STEP_LOGICAL` * scale)
+/// - `PageUp/PageDown`: viewport height − 1 line
+/// - `Home/End`: jump to 0 / `max_off` (bypasses incremental delta — uses
+///   `set_scroll_target` so overscroll mode hard-clamps).
+///
+/// Unhandled keys return false unchanged. Caller (e.g. `App::window_event`)
+/// only invokes this for recognised navigation keys; the user's `on_key`
+/// hook still runs afterwards via the regular dispatch chain.
+pub fn on_scroll_key(
+    code: KeyCode,
+    cursor: Option<[f32; 2]>,
+    viewport: [f32; 2],
+    scale: f32,
+    scroll_hits: &[ScrollHit],
+    tree: &mut NodeTree,
+) -> bool {
+    let line = ARROW_KEY_STEP_LOGICAL * scale;
+    let page_y = (viewport[1] - line).max(line);
+    let (delta, jump): (Option<[f32; 2]>, Option<JumpEdge>) = match code {
+        KeyCode::ArrowUp => (Some([0.0, -line]), None),
+        KeyCode::ArrowDown => (Some([0.0, line]), None),
+        KeyCode::ArrowLeft => (Some([-line, 0.0]), None),
+        KeyCode::ArrowRight => (Some([line, 0.0]), None),
+        KeyCode::PageUp => (Some([0.0, -page_y]), None),
+        KeyCode::PageDown => (Some([0.0, page_y]), None),
+        KeyCode::Home => (None, Some(JumpEdge::Start)),
+        KeyCode::End => (None, Some(JumpEdge::End)),
+        _ => return false,
+    };
+    // Resolve the target chain: cursor-over → its ancestor_chain;
+    // else → first scrollable.
+    let chain: Vec<NodeId> = match cursor
+        .and_then(|[x, y]| scroll_hits.iter().rev().find(|h| h.contains(x, y)))
+    {
+        Some(hit) => hit.ancestor_chain.clone(),
+        None => match tree.scrollables().first().copied() {
+            Some(id) => vec![id],
+            None => return false,
+        },
+    };
+    if let Some(d) = delta {
+        let mut request = d;
+        let mut moved = false;
+        for id in &chain {
+            let applied = tree.add_scroll_delta(*id, request);
+            if applied != [0.0; 2] {
+                moved = true;
+            }
+            request = [request[0] - applied[0], request[1] - applied[1]];
+            if request[0].abs() < f32::EPSILON && request[1].abs() < f32::EPSILON {
+                break;
+            }
+        }
+        return moved;
+    }
+    if let Some(edge) = jump {
+        let id = chain[0];
+        let (rect, content, sx, sy) = match tree.get(id) {
+            Some(n) => (
+                n.rect,
+                n.content_size,
+                n.layout.overflow_x.scrolls(),
+                n.layout.overflow_y.scrolls(),
+            ),
+            None => return false,
+        };
+        let max_off = [
+            (content[0] - rect[2]).max(0.0),
+            (content[1] - rect[3]).max(0.0),
+        ];
+        // Convention: Home / End drive the dominant scroll axis. If only
+        // one axis scrolls, target that. If both, prefer Y (lists are
+        // the common case). Caller can wire bespoke navigation in
+        // `on_key` for grid-style scrollers.
+        let (target_x, target_y) = match (sx, sy) {
+            (true, false) => (
+                if matches!(edge, JumpEdge::End) { max_off[0] } else { 0.0 },
+                0.0,
+            ),
+            (_, true) => (
+                0.0,
+                if matches!(edge, JumpEdge::End) { max_off[1] } else { 0.0 },
+            ),
+            (false, false) => return false,
+        };
+        tree.set_scroll_target(id, [target_x, target_y]);
+        return true;
+    }
+    false
+}
+
+#[derive(Copy, Clone)]
+enum JumpEdge {
+    Start,
+    End,
+}
+
+/// Per-tick continuous scroll pump for held arrow keys. Routes a small
+/// `HOLD_SCROLL_VELOCITY_LOGICAL * scale * dt` delta to the scroll
+/// container under the cursor (or the first scrollable on fallback) on
+/// every frame an arrow is in `held`. Bypasses snap-on-input so the
+/// view scrolls smoothly across rows; settle-on-quiesce snaps to a
+/// row boundary once the user releases.
+///
+/// Returns true if any scroll target moved (caller should `react()`).
+/// Replaces OS auto-repeat for the arrow keys — the OS repeat path has
+/// a ~250 ms initial-delay gap that makes the spring visibly settle at
+/// one position then jump to the next.
+pub fn pump_held_scroll(
+    held: &std::collections::HashSet<KeyCode>,
+    cursor: Option<[f32; 2]>,
+    scroll_hits: &[ScrollHit],
+    tree: &mut NodeTree,
+    scale: f32,
+    dt: f32,
+) -> bool {
+    if held.is_empty() || dt <= 0.0 {
+        return false;
+    }
+    let step = HOLD_SCROLL_VELOCITY_LOGICAL * scale * dt;
+    let mut delta = [0.0f32; 2];
+    if held.contains(&KeyCode::ArrowUp) {
+        delta[1] -= step;
+    }
+    if held.contains(&KeyCode::ArrowDown) {
+        delta[1] += step;
+    }
+    if held.contains(&KeyCode::ArrowLeft) {
+        delta[0] -= step;
+    }
+    if held.contains(&KeyCode::ArrowRight) {
+        delta[0] += step;
+    }
+    if delta[0].abs() < f32::EPSILON && delta[1].abs() < f32::EPSILON {
+        return false;
+    }
+    let chain: Vec<NodeId> = match cursor
+        .and_then(|[x, y]| scroll_hits.iter().rev().find(|h| h.contains(x, y)))
+    {
+        Some(hit) => hit.ancestor_chain.clone(),
+        None => match tree.scrollables().first().copied() {
+            Some(id) => vec![id],
+            None => return false,
+        },
+    };
+    let mut request = delta;
+    let mut moved = false;
+    for id in &chain {
+        let applied = tree.add_scroll_delta_continuous(*id, request);
         if applied != [0.0; 2] {
             moved = true;
         }
@@ -564,6 +757,128 @@ mod tests {
         let s = t.get(id).unwrap().scroll.unwrap();
         assert!((s.current[1] - 400.0).abs() < 0.01, "current={:?}", s.current);
         assert_eq!(s.target[1], s.current[1], "drag keeps target glued to current");
+    }
+
+    #[test]
+    fn arrow_down_pushes_target_via_cursor_scroll() {
+        let mut t = NodeTree::new();
+        let id = scrollable(&mut t, 0.0, 0.0, 200.0, 200.0, [200.0, 1000.0], 'y');
+        let scroll_hits = vec![ScrollHit {
+            node_id: id,
+            bounds: [0.0, 0.0, 200.0, 200.0],
+            clip_rect: crate::gpu::NO_CLIP,
+            ancestor_chain: vec![id],
+        }];
+        let moved = on_scroll_key(
+            KeyCode::ArrowDown,
+            Some([100.0, 100.0]),
+            [200.0, 200.0],
+            1.0,
+            &scroll_hits,
+            &mut t,
+        );
+        assert!(moved);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert!((s.target[1] - 40.0).abs() < 0.01, "expected 40, got {}", s.target[1]);
+    }
+
+    #[test]
+    fn arrow_falls_back_to_first_scrollable_without_cursor() {
+        let mut t = NodeTree::new();
+        let id = scrollable(&mut t, 0.0, 0.0, 200.0, 200.0, [200.0, 1000.0], 'y');
+        let moved = on_scroll_key(
+            KeyCode::ArrowDown,
+            None,
+            [200.0, 200.0],
+            1.0,
+            &[],
+            &mut t,
+        );
+        assert!(moved);
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert!(s.target[1] > 0.0);
+    }
+
+    #[test]
+    fn page_down_jumps_by_viewport_minus_line() {
+        let mut t = NodeTree::new();
+        let id = scrollable(&mut t, 0.0, 0.0, 200.0, 200.0, [200.0, 5000.0], 'y');
+        let scroll_hits = vec![ScrollHit {
+            node_id: id,
+            bounds: [0.0, 0.0, 200.0, 200.0],
+            clip_rect: crate::gpu::NO_CLIP,
+            ancestor_chain: vec![id],
+        }];
+        on_scroll_key(
+            KeyCode::PageDown,
+            Some([100.0, 100.0]),
+            [200.0, 200.0],
+            1.0,
+            &scroll_hits,
+            &mut t,
+        );
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 200.0 - 40.0);
+    }
+
+    #[test]
+    fn end_jumps_to_max_offset() {
+        let mut t = NodeTree::new();
+        let id = scrollable(&mut t, 0.0, 0.0, 200.0, 200.0, [200.0, 1500.0], 'y');
+        let scroll_hits = vec![ScrollHit {
+            node_id: id,
+            bounds: [0.0, 0.0, 200.0, 200.0],
+            clip_rect: crate::gpu::NO_CLIP,
+            ancestor_chain: vec![id],
+        }];
+        on_scroll_key(
+            KeyCode::End,
+            Some([100.0, 100.0]),
+            [200.0, 200.0],
+            1.0,
+            &scroll_hits,
+            &mut t,
+        );
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 1300.0); // 1500 - 200
+    }
+
+    #[test]
+    fn home_returns_to_zero() {
+        let mut t = NodeTree::new();
+        let id = scrollable(&mut t, 0.0, 0.0, 200.0, 200.0, [200.0, 1500.0], 'y');
+        let _ = t.add_scroll_delta(id, [0.0, 500.0]);
+        let scroll_hits = vec![ScrollHit {
+            node_id: id,
+            bounds: [0.0, 0.0, 200.0, 200.0],
+            clip_rect: crate::gpu::NO_CLIP,
+            ancestor_chain: vec![id],
+        }];
+        on_scroll_key(
+            KeyCode::Home,
+            Some([100.0, 100.0]),
+            [200.0, 200.0],
+            1.0,
+            &scroll_hits,
+            &mut t,
+        );
+        let s = t.get(id).unwrap().scroll.unwrap();
+        assert_eq!(s.target[1], 0.0);
+    }
+
+    #[test]
+    fn unhandled_key_returns_false() {
+        let mut t = NodeTree::new();
+        let _id = scrollable(&mut t, 0.0, 0.0, 200.0, 200.0, [200.0, 1500.0], 'y');
+        let moved = on_scroll_key(
+            KeyCode::KeyA,
+            None,
+            [200.0, 200.0],
+            1.0,
+            &[],
+            &mut t,
+        );
+        assert!(!moved);
     }
 
     #[test]

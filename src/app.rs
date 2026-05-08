@@ -146,6 +146,16 @@ pub struct App {
     /// Latched modifier state from `WindowEvent::ModifiersChanged`.
     /// Consulted by wheel routing for shift-axis swap.
     modifiers: winit::event::Modifiers,
+    /// Scroll keys currently physically held. Tracked separately from
+    /// OS auto-repeat events because the auto-repeat initial delay
+    /// (Windows default ~250 ms) is longer than the scroll-input
+    /// quiescence gate; without this set the gate would lapse during
+    /// the gap between initial press and first repeat, fire a bounce,
+    /// then have the bounce cancelled by the first repeat — the user
+    /// sees that as a stretch / ease-back / stretch flicker. While
+    /// any element is in this set, `about_to_wait` calls
+    /// `tree.poke_scroll_input_recency()` so settle stays gated.
+    held_scroll_keys: std::collections::HashSet<KeyCode>,
     input: InputState,
     timeline: Timeline,
     on_key: Option<KeyFn>,
@@ -236,6 +246,7 @@ impl App {
             bar_drag: None,
             pending_drag_cursor: None,
             modifiers: winit::event::Modifiers::default(),
+            held_scroll_keys: std::collections::HashSet::new(),
             input: InputState::new(),
             timeline: Timeline::new(),
             on_key: None,
@@ -1069,6 +1080,10 @@ impl ApplicationHandler for App {
             .expect("failed to create window");
         let window_arc: Arc<Window> = Arc::new(window);
         self.scale_factor = window_arc.scale_factor() as f32;
+        // Mirror the scale onto the tree so scroll setters can convert
+        // logical-px configuration (snap_step, overscroll limit) on the
+        // fly without threading the factor through every public method.
+        self.ctx.tree.set_scale(self.scale_factor);
         // Seed logical_size from the actual window — winit may have
         // adjusted to fit the monitor or the minimum chrome size.
         let phys = window_arc.inner_size();
@@ -1245,6 +1260,7 @@ impl ApplicationHandler for App {
                     }
                     self.last_dpi_change = Some(Instant::now());
                     self.scale_factor = new_scale;
+                    self.ctx.tree.set_scale(new_scale);
                     if let Some(g) = self.gpu.as_mut() {
                         g.reset_glyph_atlas();
                     }
@@ -1309,6 +1325,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods;
+            }
+            WindowEvent::Focused(false) => {
+                // Window lost focus — winit doesn't deliver Released
+                // events for keys still down, so the held set would
+                // leak and suppress settle forever. Clear it now.
+                self.held_scroll_keys.clear();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let Some([cx, cy]) = self.input.cursor else {
@@ -1425,55 +1447,123 @@ impl ApplicationHandler for App {
                     KeyEvent {
                         physical_key: PhysicalKey::Code(code),
                         state,
-                        repeat: false,
+                        repeat,
                         ..
                     },
                 ..
             } => {
                 if state == ElementState::Pressed {
-                    match code {
-                        KeyCode::Escape => {
-                            event_loop.exit();
-                            return;
-                        }
-                        KeyCode::F1 => {
-                            self.hud_enabled = !self.hud_enabled;
-                            self.stats_log = self.hud_enabled;
-                            log::info!(
-                                "hud/stats: {} | last frame: {:?}",
-                                if self.hud_enabled { "on" } else { "off" },
-                                self.current_stats()
-                            );
-                            if !self.hud_enabled {
-                                self.clear_hud_overlay();
+                    // Hotkeys fire on initial press only — holding F2
+                    // shouldn't spam screenshots, holding Esc is just
+                    // weird. Auto-repeat events are filtered here.
+                    if !repeat {
+                        match code {
+                            KeyCode::Escape => {
+                                event_loop.exit();
+                                return;
                             }
-                            self.request_redraw();
-                            return;
-                        }
-                        KeyCode::F2 => {
-                            self.save_screenshot();
-                            return;
-                        }
-                        KeyCode::F4 => {
-                            if let Some(g) = self.gpu.as_mut() {
-                                let on = !g.overdraw_mode();
-                                g.set_overdraw(on);
-                                log::info!("overdraw heatmap: {}", if on { "on" } else { "off" });
-                            }
-                            self.request_redraw();
-                            return;
-                        }
-                        KeyCode::F5 => {
-                            self.ctx.tree.mark_all_dirty();
-                            if self.flush_tree() {
+                            KeyCode::F1 => {
+                                self.hud_enabled = !self.hud_enabled;
+                                self.stats_log = self.hud_enabled;
+                                log::info!(
+                                    "hud/stats: {} | last frame: {:?}",
+                                    if self.hud_enabled { "on" } else { "off" },
+                                    self.current_stats()
+                                );
+                                if !self.hud_enabled {
+                                    self.clear_hud_overlay();
+                                }
                                 self.request_redraw();
+                                return;
+                            }
+                            KeyCode::F2 => {
+                                self.save_screenshot();
+                                return;
+                            }
+                            KeyCode::F4 => {
+                                if let Some(g) = self.gpu.as_mut() {
+                                    let on = !g.overdraw_mode();
+                                    g.set_overdraw(on);
+                                    log::info!(
+                                        "overdraw heatmap: {}",
+                                        if on { "on" } else { "off" }
+                                    );
+                                }
+                                self.request_redraw();
+                                return;
+                            }
+                            KeyCode::F5 => {
+                                self.ctx.tree.mark_all_dirty();
+                                if self.flush_tree() {
+                                    self.request_redraw();
+                                }
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    match code {
+                        KeyCode::ArrowUp
+                        | KeyCode::ArrowDown
+                        | KeyCode::ArrowLeft
+                        | KeyCode::ArrowRight => {
+                            // Arrow keys: ignore OS auto-repeat and
+                            // drive continuous scroll from `about_to_wait`
+                            // via `pump_held_scroll`. OS auto-repeat has
+                            // a ~250 ms initial-delay gap; relying on it
+                            // makes the spring visibly settle at the
+                            // first event's target then jump to the next
+                            // when repeat finally fires. Per-tick pump
+                            // gives smooth target progression.
+                            if !repeat {
+                                self.held_scroll_keys.insert(code);
+                                let viewport = self.viewport();
+                                if crate::input::on_scroll_key(
+                                    code,
+                                    self.input.cursor,
+                                    viewport,
+                                    self.scale_factor,
+                                    &self.scroll_hits,
+                                    &mut self.ctx.tree,
+                                ) {
+                                    self.react();
+                                }
                             }
                             return;
+                        }
+                        KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End => {
+                            // Page / Home / End honour OS auto-repeat —
+                            // they're jump keys and `set_scroll_target`
+                            // is idempotent at the clamps, so holding is
+                            // harmless. Track the held set so the input
+                            // quiescence gate stays suppressed.
+                            if !repeat {
+                                self.held_scroll_keys.insert(code);
+                            }
+                            let viewport = self.viewport();
+                            if crate::input::on_scroll_key(
+                                code,
+                                self.input.cursor,
+                                viewport,
+                                self.scale_factor,
+                                &self.scroll_hits,
+                                &mut self.ctx.tree,
+                            ) {
+                                self.react();
+                                return;
+                            }
                         }
                         _ => {}
                     }
+                } else if state == ElementState::Released {
+                    self.held_scroll_keys.remove(&code);
                 }
-                if let Some(handler) = self.on_key.as_mut() {
+                // User on_key hook: fire on initial press only so
+                // application code doesn't have to special-case repeat.
+                if !repeat && let Some(handler) = self.on_key.as_mut() {
                     handler(code, state, &mut self.ctx);
                     self.react();
                 }
@@ -1506,8 +1596,32 @@ impl ApplicationHandler for App {
         } else {
             false
         };
+        // Hold-key poke: while any scroll key is physically held, keep
+        // the input-quiescence gate suppressed so settle doesn't fire
+        // during the OS auto-repeat initial-delay window.
+        if !self.held_scroll_keys.is_empty() {
+            self.ctx.tree.poke_scroll_input_recency();
+        }
         let timeline_active = self.timeline.active();
-        let scroll_active = self.ctx.tree.has_active_scrolls();
+        let mut scroll_active = self.ctx.tree.has_active_scrolls();
+        // Hold-arrow continuous pump: replaces OS auto-repeat for the
+        // arrow keys. Need a non-zero `dt` to compute the per-tick
+        // delta — gate on a meaningful tick interval.
+        let hold_dt = match self.last_scroll_tick {
+            Some(prev) => (now - prev).as_secs_f32().min(0.05),
+            None => 1.0 / 60.0,
+        };
+        let pumped = crate::input::pump_held_scroll(
+            &self.held_scroll_keys,
+            self.input.cursor,
+            &self.scroll_hits,
+            &mut self.ctx.tree,
+            self.scale_factor,
+            hold_dt,
+        );
+        if pumped {
+            scroll_active = true;
+        }
         if !timeline_active && !scroll_active && !drag_moved {
             self.last_scroll_tick = None;
             event_loop.set_control_flow(ControlFlow::Wait);
