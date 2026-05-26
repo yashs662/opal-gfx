@@ -13,7 +13,7 @@ pub use glyph_atlas::{AtlasEntry, GlyphAtlas};
 pub use image_atlas::{ImageAtlas, ImageEntry, ImageHandle};
 pub use instance::{
     FrameUniform, NO_CLIP, ShapeInstance, SHAPE_KIND_GLASS, SHAPE_KIND_GLYPH, SHAPE_KIND_IMAGE,
-    SHAPE_KIND_RECT,
+    SHAPE_KIND_MASK, SHAPE_KIND_RECT,
 };
 pub use overdraw::{OverdrawResources, OVERDRAW_FORMAT};
 pub use pipeline::ShapePipeline;

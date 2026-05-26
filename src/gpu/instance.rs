@@ -1,6 +1,14 @@
 use bytemuck::{Pod, Zeroable};
 
 /// GPU shape kinds. Mirror the constants in `shape.wgsl`.
+///
+/// `ShapeInstance.shape_kind` is a packed u32:
+/// - bits 0-7: shape kind (Rect/Glass/Glyph/Image) — masked via [`SHAPE_KIND_MASK`].
+/// - bits 8-11: border-side mask (TRBL); 0b1111 = all sides (the default,
+///   and what the WGSL falls back to when sides == 0 — see
+///   [`crate::node::BorderSides::ALL`]).
+/// Other bits reserved.
+pub const SHAPE_KIND_MASK: u32 = 0xFF;
 pub const SHAPE_KIND_RECT: u32 = 0;
 pub const SHAPE_KIND_GLASS: u32 = 1;
 /// Glyph blit: samples the `R8Unorm` glyph atlas at
@@ -19,10 +27,12 @@ pub const SHAPE_KIND_IMAGE: u32 = 3;
 pub const NO_CLIP: [f32; 4] = [-1.0e30, -1.0e30, 1.0e30, 1.0e30];
 
 /// GPU shape instance. Layout must match `ShapeInstance` in `shape.wgsl`.
-/// std430-compatible. **144 bytes, 16-aligned.** WGSL `array<ShapeInstance>`
-/// stride = roundUp(16, last_offset + last_size) = 144. The Rust struct
-/// size must match exactly — do not add trailing pad fields (the
-/// alignment-rounded stride bites silently otherwise).
+/// std430-compatible. **160 bytes, 16-aligned.** WGSL
+/// `array<ShapeInstance>` stride = roundUp(16, last_offset + last_size).
+/// With `scale: vec2<f32>` at offset 144 (size 8), stride rounds to 160.
+/// The Rust struct must equal that stride — the trailing `_pad: [f32; 2]`
+/// closes the gap. Without it the stride-vs-size mismatch would corrupt
+/// per-instance reads (M2 landmine).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct ShapeInstance {
@@ -55,9 +65,16 @@ pub struct ShapeInstance {
     pub shadow_blur: f32,
     pub shadow_opacity: f32,
     pub opacity: f32,
+    /// Per-instance visual scale around the rect centre. `[1.0, 1.0]`
+    /// = identity. Vertex shader expands the quad bounds; fragment
+    /// shader rescales SDF coords so border + radius scale together.
+    /// Layout + hit-test are unaffected (style-level transform only).
+    pub scale: [f32; 2],
+    /// Padding to align Rust `size_of` with WGSL array stride (160).
+    pub _pad1: [f32; 2],
 }
 
-const _: () = assert!(std::mem::size_of::<ShapeInstance>() == 144);
+const _: () = assert!(std::mem::size_of::<ShapeInstance>() == 160);
 
 impl Default for ShapeInstance {
     fn default() -> Self {
@@ -77,6 +94,8 @@ impl Default for ShapeInstance {
             shadow_blur: 0.0,
             shadow_opacity: 0.0,
             opacity: 1.0,
+            scale: [1.0, 1.0],
+            _pad1: [0.0, 0.0],
         }
     }
 }

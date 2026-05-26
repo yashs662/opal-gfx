@@ -20,11 +20,25 @@ pub struct InputChange {
     pub hovered_changed: bool,
     pub pressed_changed: bool,
     pub focused_changed: bool,
+    /// Set by [`InputState::on_left_released`] when the release landed on
+    /// the same node that captured the press. App shell uses this to
+    /// fire that node's `on_click` handler (release-inside-captured =
+    /// click; drag-off-and-release = no click). `None` on every other
+    /// event entry point.
+    pub click_target: Option<NodeId>,
+    /// Set by [`InputState::on_right_released`] when the right-button
+    /// release landed on the same node that captured the press. Fires
+    /// that node's `on_right_click` handler.
+    pub right_click_target: Option<NodeId>,
 }
 
 impl InputChange {
     pub fn any(&self) -> bool {
-        self.hovered_changed || self.pressed_changed || self.focused_changed
+        self.hovered_changed
+            || self.pressed_changed
+            || self.focused_changed
+            || self.click_target.is_some()
+            || self.right_click_target.is_some()
     }
 }
 
@@ -38,6 +52,11 @@ pub struct InputState {
     pub hovered: Option<NodeId>,
     /// Node that received a press and owns pointer capture until release.
     pub captured: Option<NodeId>,
+    /// Node that received a right-button press. Tracked separately so a
+    /// right-click in flight does not interfere with a left-button
+    /// drag (and vice versa). No hover-pin: right-click never animates
+    /// `pressed` signals — it is a release-only path.
+    pub captured_right: Option<NodeId>,
     /// Most recently focused node (last clicked one that wanted focus).
     pub focused: Option<NodeId>,
 }
@@ -110,9 +129,10 @@ impl InputState {
     pub fn on_left_pressed(&mut self, hits: &[HitEntry], tree: &NodeTree) -> InputChange {
         let target = self.hovered;
         self.captured = target;
-        let mut change = InputChange::default();
-        change.pressed_changed =
-            sync_bool_signals(hits, tree, target, |n| &n.interact.pressed);
+        let mut change = InputChange {
+            pressed_changed: sync_bool_signals(hits, tree, target, |n| &n.interact.pressed),
+            ..InputChange::default()
+        };
         if self.focused != target {
             self.focused = target;
             change.focused_changed =
@@ -122,10 +142,25 @@ impl InputState {
     }
 
     /// Left-button release: clear pressed state and re-evaluate hover at
-    /// the current cursor position.
+    /// the current cursor position. If the captured node is still under
+    /// the cursor, [`InputChange::click_target`] is set so the app shell
+    /// can fire the click handler (matches OS-button semantics — release
+    /// outside the captured node = no click).
     pub fn on_left_released(&mut self, hits: &[HitEntry], tree: &NodeTree) -> InputChange {
-        self.captured = None;
+        let captured = self.captured.take();
         let mut change = InputChange::default();
+        // Resolve click target *before* signal sync — we need the cursor
+        // to still be inside the captured node's hit AABB.
+        if let (Some(cap), Some([x, y])) = (captured, self.cursor) {
+            let over = hits
+                .iter()
+                .find(|h| h.node_id == cap)
+                .map(|h| h.contains(x, y))
+                .unwrap_or(false);
+            if over {
+                change.click_target = Some(cap);
+            }
+        }
         change.pressed_changed = sync_bool_signals(hits, tree, None, |n| &n.interact.pressed);
         if let Some([x, y]) = self.cursor {
             let new_hover = Self::hit_test(hits, x, y);
@@ -133,6 +168,33 @@ impl InputState {
                 self.hovered = new_hover;
                 change.hovered_changed =
                     sync_bool_signals(hits, tree, self.hovered, |n| &n.interact.hover);
+            }
+        }
+        change
+    }
+
+    /// Right-button press: latches `captured_right` to the currently
+    /// hovered node. No signal mutation — right-click never advances
+    /// `pressed` (Spotify/macOS/Windows menu UX is release-only).
+    pub fn on_right_pressed(&mut self, _hits: &[HitEntry], _tree: &NodeTree) -> InputChange {
+        self.captured_right = self.hovered;
+        InputChange::default()
+    }
+
+    /// Right-button release: if the cursor is still inside the captured
+    /// node's hit AABB, sets [`InputChange::right_click_target`]. App
+    /// shell fires the node's `on_right_click` handler.
+    pub fn on_right_released(&mut self, hits: &[HitEntry], _tree: &NodeTree) -> InputChange {
+        let captured = self.captured_right.take();
+        let mut change = InputChange::default();
+        if let (Some(cap), Some([x, y])) = (captured, self.cursor) {
+            let over = hits
+                .iter()
+                .find(|h| h.node_id == cap)
+                .map(|h| h.contains(x, y))
+                .unwrap_or(false);
+            if over {
+                change.right_click_target = Some(cap);
             }
         }
         change
@@ -574,6 +636,28 @@ pub fn pump_held_scroll(
     moved
 }
 
+/// Iterate the hit cache once and write `target == node_id` into the
+/// signal returned by `select` for each interactive node. Returns true
+/// if any signal flipped. `Signal::set` is a no-op write if unchanged.
+fn sync_bool_signals(
+    hits: &[HitEntry],
+    tree: &NodeTree,
+    target: Option<NodeId>,
+    select: impl Fn(&crate::node::Node) -> &Option<crate::signal::Signal<bool>>,
+) -> bool {
+    let mut changed = false;
+    for entry in hits {
+        if let Some(n) = tree.get(entry.node_id)
+            && let Some(sig) = select(n).as_ref() {
+                let on = Some(entry.node_id) == target;
+                if sig.set(on) {
+                    changed = true;
+                }
+            }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,26 +974,109 @@ mod tests {
         let s = t.get(id).unwrap().scroll.unwrap();
         assert_eq!(s.bar_active, [false, false]);
     }
-}
 
-/// Iterate the hit cache once and write `target == node_id` into the
-/// signal returned by `select` for each interactive node. Returns true
-/// if any signal flipped. `Signal::set` is a no-op write if unchanged.
-fn sync_bool_signals(
-    hits: &[HitEntry],
-    tree: &NodeTree,
-    target: Option<NodeId>,
-    select: impl Fn(&crate::node::Node) -> &Option<crate::signal::Signal<bool>>,
-) -> bool {
-    let mut changed = false;
-    for entry in hits {
-        if let Some(n) = tree.get(entry.node_id)
-            && let Some(sig) = select(n).as_ref() {
-                let on = Some(entry.node_id) == target;
-                if sig.set(on) {
-                    changed = true;
-                }
-            }
+    // --- click / on_click ---
+
+    fn clickable(t: &mut NodeTree, x: f32, y: f32, w: f32, h: f32) -> NodeId {
+        let id = t.add_root(Node::rect().build());
+        if let Some(n) = t.get_mut_raw(id) {
+            n.rect = [x, y, w, h];
+            // Mark interactive so flatten would emit a HitEntry — tests
+            // here construct hits manually but the node still needs to
+            // have `on_click` set for the App-side fire path.
+        }
+        id
     }
-    changed
+
+    fn hit_entry(t: &NodeTree, id: NodeId) -> HitEntry {
+        let r = t.get(id).unwrap().rect;
+        HitEntry {
+            node_id: id,
+            bounds: [r[0], r[1], r[0] + r[2], r[1] + r[3]],
+            clip_rect: crate::gpu::NO_CLIP,
+        }
+    }
+
+    #[test]
+    fn release_inside_captured_sets_click_target() {
+        let mut t = NodeTree::new();
+        let id = clickable(&mut t, 0.0, 0.0, 100.0, 100.0);
+        let hits = vec![hit_entry(&t, id)];
+        let mut input = InputState::new();
+        let _ = input.on_cursor_moved(50.0, 50.0, &hits, &t);
+        let _ = input.on_left_pressed(&hits, &t);
+        // Cursor still inside on release.
+        let change = input.on_left_released(&hits, &t);
+        assert_eq!(change.click_target, Some(id));
+    }
+
+    #[test]
+    fn release_outside_captured_does_not_click() {
+        let mut t = NodeTree::new();
+        let id = clickable(&mut t, 0.0, 0.0, 100.0, 100.0);
+        let hits = vec![hit_entry(&t, id)];
+        let mut input = InputState::new();
+        let _ = input.on_cursor_moved(50.0, 50.0, &hits, &t);
+        let _ = input.on_left_pressed(&hits, &t);
+        // Drag well outside the rect before release.
+        let _ = input.on_cursor_moved(500.0, 500.0, &hits, &t);
+        let change = input.on_left_released(&hits, &t);
+        assert_eq!(change.click_target, None);
+    }
+
+    #[test]
+    fn right_release_inside_captured_sets_right_click_target() {
+        let mut t = NodeTree::new();
+        let id = clickable(&mut t, 0.0, 0.0, 100.0, 100.0);
+        let hits = vec![hit_entry(&t, id)];
+        let mut input = InputState::new();
+        let _ = input.on_cursor_moved(50.0, 50.0, &hits, &t);
+        let _ = input.on_right_pressed(&hits, &t);
+        assert_eq!(input.captured_right, Some(id));
+        let change = input.on_right_released(&hits, &t);
+        assert_eq!(change.right_click_target, Some(id));
+        assert_eq!(input.captured_right, None);
+    }
+
+    #[test]
+    fn right_release_outside_captured_does_not_right_click() {
+        let mut t = NodeTree::new();
+        let id = clickable(&mut t, 0.0, 0.0, 100.0, 100.0);
+        let hits = vec![hit_entry(&t, id)];
+        let mut input = InputState::new();
+        let _ = input.on_cursor_moved(50.0, 50.0, &hits, &t);
+        let _ = input.on_right_pressed(&hits, &t);
+        let _ = input.on_cursor_moved(500.0, 500.0, &hits, &t);
+        let change = input.on_right_released(&hits, &t);
+        assert_eq!(change.right_click_target, None);
+    }
+
+    #[test]
+    fn right_capture_independent_of_left_capture() {
+        let mut t = NodeTree::new();
+        let id = clickable(&mut t, 0.0, 0.0, 100.0, 100.0);
+        let hits = vec![hit_entry(&t, id)];
+        let mut input = InputState::new();
+        let _ = input.on_cursor_moved(50.0, 50.0, &hits, &t);
+        let _ = input.on_left_pressed(&hits, &t);
+        let _ = input.on_right_pressed(&hits, &t);
+        assert_eq!(input.captured, Some(id));
+        assert_eq!(input.captured_right, Some(id));
+        // Releasing right does not clear left capture.
+        let _ = input.on_right_released(&hits, &t);
+        assert_eq!(input.captured, Some(id));
+        assert_eq!(input.captured_right, None);
+    }
+
+    #[test]
+    fn release_without_press_does_not_click() {
+        let mut t = NodeTree::new();
+        let id = clickable(&mut t, 0.0, 0.0, 100.0, 100.0);
+        let hits = vec![hit_entry(&t, id)];
+        let mut input = InputState::new();
+        let _ = input.on_cursor_moved(50.0, 50.0, &hits, &t);
+        // Skip on_left_pressed entirely; captured stays None.
+        let change = input.on_left_released(&hits, &t);
+        assert_eq!(change.click_target, None);
+    }
 }

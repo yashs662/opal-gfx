@@ -15,8 +15,14 @@
 //!   - an animated cyan blob that crosses every layer; arrow keys
 //!     prove its z-order stays put while moving.
 //!
+//! Reusable components live in `common::components`. This file owns
+//! state (`Sigs`), wires the top-level layout + canvas (the canvas is
+//! one-off demo art, intentionally not componentized), and runs the
+//! event loop.
+//!
 //! Controls:
-//!   Mouse            Hover / click the hero rect to recolor it.
+//!   Mouse            Hover the hero rect to brighten it; click to
+//!                    toggle the "lit" base color (same as Space).
 //!                    Drag the title bar to move the window. Click
 //!                    red/yellow/green dots = close/minimize/maximize.
 //!                    Drag any window edge / corner to resize.
@@ -29,15 +35,19 @@
 //!   F5               Force full rebuild + redraw.
 //!   Esc              Exit.
 
+mod common;
+
 use std::env;
 use std::time::{Duration, Instant};
 
-use frostify_gfx::{
-    animated, Align, App, Axis, Computed, Curve, HeadlessHelper, ImageHandle, Len,
-    Scene, Signal, WindowAction,
-};
+use frostify_gfx::{App, HeadlessHelper, ImageHandle, Len, Scene, Signal, WindowAction};
 use winit::event::ElementState;
 use winit::keyboard::KeyCode;
+
+use common::components::{
+    blob, hero, sidebar, title_bar, BlobProps, DotProps, HeroProps, SidebarProps, TitleBarProps,
+};
+use common::image::make_demo_image;
 
 const W: u32 = 1280;
 const H: u32 = 820;
@@ -76,53 +86,7 @@ impl Sigs {
     }
 }
 
-/// 64×64 RGBA8 gradient with a soft checker overlay. Demonstrates
-/// `ShapeKind::Image` end-to-end without depending on a binary asset.
-fn make_demo_image() -> (u32, u32, Vec<u8>) {
-    const W: u32 = 64;
-    const H: u32 = 64;
-    let mut bytes = Vec::with_capacity((W * H * 4) as usize);
-    for y in 0..H {
-        for x in 0..W {
-            let fx = x as f32 / (W - 1) as f32;
-            let fy = y as f32 / (H - 1) as f32;
-            let cell = ((x / 8) + (y / 8)) % 2 == 0;
-            let r = (fx * 255.0) as u8;
-            let g = ((1.0 - fy) * 255.0) as u8;
-            let b = if cell { 220 } else { 90 };
-            bytes.extend_from_slice(&[r, g, b, 255]);
-        }
-    }
-    (W, H, bytes)
-}
-
-fn hero_color(sigs: &Sigs) -> Computed<[f32; 4]> {
-    Computed::new(
-        (sigs.lit.clone(), sigs.hover.clone(), sigs.pressed.clone()),
-        |(l, h, p)| {
-            let base = if l {
-                [0.20, 0.95, 0.55, 1.0]
-            } else {
-                [0.95, 0.25, 0.55, 1.0]
-            };
-            let lerped = if h {
-                [
-                    (base[0] + 0.18_f32).min(1.0),
-                    (base[1] + 0.18_f32).min(1.0),
-                    (base[2] + 0.18_f32).min(1.0),
-                    base[3],
-                ]
-            } else {
-                base
-            };
-            let pf = if p { 0.55_f32 } else { 1.0 };
-            [lerped[0] * pf, lerped[1] * pf, lerped[2] * pf, lerped[3]]
-        },
-    )
-}
-
 fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
-    let hero = hero_color(sigs);
     s.col("root")
         .fill()
         .pad(24.0)
@@ -132,60 +96,43 @@ fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
         .border(1.5, [1.0, 1.0, 1.0, 0.10])
         .shadow([0.0, 16.0], 40.0, [0.0, 0.0, 0.0, 1.0], 0.55)
         .child(|p| {
-            p.row("title")
-                .w(Len::Fill)
-                .h_px(56.0)
-                .pad(16.0)
-                .gap(10.0)
-                .align(Align::Center)
-                .rgba(0.13, 0.14, 0.18, 1.0)
-                .radius(16.0)
-                .border(1.0, [1.0, 1.0, 1.0, 0.06])
-                .window_action(WindowAction::DragMove)
-                .child(|t| {
-                    let actions = [
-                        WindowAction::Close,
-                        WindowAction::Minimize,
-                        WindowAction::ToggleMaximize,
-                    ];
-                    for (c, a) in DOTS.iter().zip(actions.iter()) {
-                        t.rect("")
-                            .size_px(14.0, 14.0)
-                            .color(*c)
-                            .radius(7.0)
-                            .window_action(*a);
-                    }
-                    t.text("title_label", "frostify-gfx demo", 16.0)
-                        .color([1.0, 1.0, 1.0, 0.95]);
-                });
-            p.rect("hero")
-                .w_px(380.0)
-                .h_px(70.0)
-                .color(animated(hero, Curve::EaseInOut, Duration::from_millis(220)))
-                .radius(20.0)
-                .border(2.0, [1.0, 1.0, 1.0, 0.85])
-                .shadow([0.0, 0.0], 22.0, [0.95, 0.25, 0.55, 1.0], 0.45)
-                .on_hover(sigs.hover.clone())
-                .on_press(sigs.pressed.clone())
-                .on_focus(sigs.focused.clone());
+            title_bar(
+                p,
+                TitleBarProps {
+                    title: "frostify-gfx demo".into(),
+                    dots: vec![
+                        DotProps {
+                            color: DOTS[0],
+                            action: WindowAction::Close,
+                        },
+                        DotProps {
+                            color: DOTS[1],
+                            action: WindowAction::Minimize,
+                        },
+                        DotProps {
+                            color: DOTS[2],
+                            action: WindowAction::ToggleMaximize,
+                        },
+                    ],
+                },
+            );
+
+            hero(
+                p,
+                HeroProps {
+                    lit: sigs.lit.clone(),
+                    hover: sigs.hover.clone(),
+                    pressed: sigs.pressed.clone(),
+                    focused: sigs.focused.clone(),
+                },
+            );
+
             p.row("stage")
                 .w(Len::Fill)
                 .h(Len::Fill)
                 .gap(20.0)
                 .child(|r| {
-                    r.col("sidebar")
-                        .w_px(200.0)
-                        .h(Len::Fill)
-                        .pad(12.0)
-                        .gap(8.0)
-                        .rgba(1.0, 1.0, 1.0, 0.04)
-                        .radius(14.0)
-                        .child(|c| {
-                            c.image("art", art).size_px(64.0, 64.0).radius(10.0);
-                            c.text("s0", "Library", 14.0).color([1.0, 1.0, 1.0, 0.85]);
-                            c.text("s1", "Playlists", 14.0).color([1.0, 1.0, 1.0, 0.55]);
-                            c.text("s2", "Recent", 14.0).color([1.0, 1.0, 1.0, 0.55]);
-                        });
+                    sidebar(r, SidebarProps { art });
                     r.col("canvas")
                         .w(Len::Fill)
                         .h(Len::Fill)
@@ -196,8 +143,6 @@ fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
                         .child(|c| {
                             // === BAND 1 — blurred-through-glass ===
                             // Three nodes declared *before* glass A.
-                            // All should appear softened/blurred when
-                            // the glass passes over them.
                             c.rect("b1_back")
                                 .abs(20.0, 20.0)
                                 .size_px(360.0, 200.0)
@@ -210,8 +155,6 @@ fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
                             c.text("b1_text", "BEHIND", 26.0)
                                 .abs(180.0, 80.0)
                                 .color([1.0, 1.0, 1.0, 0.95]);
-                            // Glass A: horizontal pane covering the
-                            // bottom of band 1.
                             c.glass("glass_a")
                                 .abs(20.0, 130.0)
                                 .size_px(440.0, 90.0)
@@ -220,7 +163,6 @@ fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
                                 .refraction(8.0)
                                 .rgba(1.0, 1.0, 1.0, 0.10);
                             // Three nodes declared *after* glass A.
-                            // All crisp; they sit on top of the pane.
                             c.rect("b1_chip")
                                 .abs(40.0, 156.0)
                                 .size_px(60.0, 38.0)
@@ -235,8 +177,6 @@ fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
                                 .abs(174.0, 162.0)
                                 .color([1.0, 1.0, 1.0, 1.0]);
                             // === BAND 2 — vertical glass crossing ===
-                            // Two stacked rects + label declared
-                            // *before* glass B.
                             c.rect("b2_a")
                                 .abs(500.0, 20.0)
                                 .size_px(220.0, 90.0)
@@ -250,11 +190,6 @@ fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
                             c.text("b2_lbl", "stacked rects", 16.0)
                                 .abs(520.0, 50.0)
                                 .color([1.0, 1.0, 1.0, 0.9]);
-                            // Glass B: vertical pane spanning the
-                            // band; cuts through both rects and
-                            // overlaps glass A's right edge — note
-                            // glass A is not blurred by glass B
-                            // (glass is skipped from backdrop pass).
                             c.glass("glass_b")
                                 .abs(420.0, 30.0)
                                 .size_px(120.0, 230.0)
@@ -262,55 +197,28 @@ fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
                                 .blur(28.0)
                                 .refraction(10.0)
                                 .rgba(1.0, 1.0, 1.0, 0.08);
-                            // Crisp text on glass B.
                             c.text("b2_front", "GLASS B", 22.0)
                                 .abs(440.0, 130.0)
                                 .color([1.0, 1.0, 1.0, 1.0]);
-                            // === BAND 3 — animated blob crosses all ===
-                            // Declared LAST → always on top regardless
-                            // of where it moves. Arrow keys tween its
-                            // x; B toggles size. Watch it slide across
-                            // glass A, glass B, and the bare panel —
-                            // z-order is preserved.
-                            c.rect("blob")
-                                .pos(animated(
-                                    sigs.blob_pos.clone(),
-                                    Curve::EaseInOut,
-                                    Duration::from_millis(260),
-                                ))
-                                .size_bind(animated(
-                                    sigs.blob_size.clone(),
-                                    Curve::EaseInOut,
-                                    Duration::from_millis(260),
-                                ))
-                                .rgba(0.10, 0.85, 0.95, 1.0)
-                                .radius(28.0)
-                                .border(2.0, [1.0, 1.0, 1.0, 0.85])
-                                .shadow([0.0, 6.0], 18.0, [0.10, 0.85, 0.95, 1.0], 0.55);
-                            c.text("blob_lbl", "TOP", 16.0)
-                                .pos(animated(
-                                    sigs.blob_pos.clone(),
-                                    Curve::EaseInOut,
-                                    Duration::from_millis(260),
-                                ))
-                                .color([0.0, 0.0, 0.0, 0.9]);
+                            // === BAND 3 — animated blob, declared last so
+                            // it paints on top regardless of where it sits.
+                            blob(
+                                c,
+                                BlobProps {
+                                    pos: sigs.blob_pos.clone(),
+                                    size: sigs.blob_size.clone(),
+                                },
+                            );
                         });
                 });
         });
-    // Touch axis to silence unused-import warning when the feature
-    // vanishes. The row/col helpers set axis already; this is just a
-    // defensive reference.
-    let _ = Axis::Row;
 }
 
 fn run_headless(h: &mut HeadlessHelper, sigs: Sigs) {
     if env::var_os("FROSTIFY_AUTOCAPTURE_HIT").is_some() {
         // Hit the hero rect after layout places it.
         let (cx, cy) = match h.ctx.node("hero").and_then(|id| h.ctx.tree.get(id)) {
-            Some(n) => (
-                n.rect[0] + n.rect[2] * 0.5,
-                n.rect[1] + n.rect[3] * 0.5,
-            ),
+            Some(n) => (n.rect[0] + n.rect[2] * 0.5, n.rect[1] + n.rect[3] * 0.5),
             None => return,
         };
         let _ = h.input.on_cursor_moved(cx, cy, h.hits, &h.ctx.tree);

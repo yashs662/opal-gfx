@@ -15,6 +15,13 @@ const SHAPE_KIND_RECT: u32  = 0u;
 const SHAPE_KIND_GLASS: u32 = 1u;
 const SHAPE_KIND_GLYPH: u32 = 2u;
 const SHAPE_KIND_IMAGE: u32 = 3u;
+const SHAPE_KIND_MASK: u32  = 0xFFu;
+// Border-side bits stored in `shape_kind >> 8`. 0b1111 = all (default).
+const BORDER_SIDE_TOP: u32    = 0x1u;
+const BORDER_SIDE_RIGHT: u32  = 0x2u;
+const BORDER_SIDE_BOTTOM: u32 = 0x4u;
+const BORDER_SIDE_LEFT: u32   = 0x8u;
+const BORDER_SIDES_ALL: u32   = 0xFu;
 
 struct ShapeInstance {
     color: vec4<f32>,
@@ -38,6 +45,12 @@ struct ShapeInstance {
     shadow_blur: f32,
     shadow_opacity: f32,
     opacity: f32,
+    /// Per-shape visual scale around the rect centre. `(1.0, 1.0)` is
+    /// identity. Layout + hit-test see the pre-scale geometry (this is
+    /// purely a vertex/fragment-side transform), so hover-grow effects
+    /// don't shift click boxes.
+    scale: vec2<f32>,
+    _pad1: vec2<f32>,
 }
 
 struct Frame {
@@ -93,8 +106,14 @@ fn vs_main(
         abs(inst.shadow_offset.x) + max(inst.shadow_blur, 0.0) * 2.0,
         abs(inst.shadow_offset.y) + max(inst.shadow_blur, 0.0) * 2.0,
     );
-    let min_px = inst.position - shadow_pad;
-    let max_px = inst.position + inst.size + shadow_pad;
+    // Per-shape scale is applied around the rect centre. Use max(1.0)
+    // as the cover scale so scales < 1.0 still get the original quad
+    // area (saves nothing to shrink coverage; the FS clips via SDF).
+    let center_px = inst.position + inst.size * 0.5;
+    let cover_scale = max(inst.scale, vec2<f32>(1.0));
+    let half_scaled = inst.size * 0.5 * cover_scale + shadow_pad;
+    let min_px = center_px - half_scaled;
+    let max_px = center_px + half_scaled;
 
     // Two triangles, six verts. vertex_index -> unit-square corner.
     var corner: vec2<f32>;
@@ -178,15 +197,49 @@ struct Body { rgb: vec3<f32>, a: f32 };
 
 // Rect / border fill — shared between both fragment entry points.
 // Color channels are sRGB-decoded to linear before any blending math.
+//
+// Per-side border (e.g. Spotify bottom-tab) is detected via the upper-
+// bit mask in `shape_kind`. When the mask is anything other than
+// "all sides" the shader takes an asymmetric inner-AABB path that
+// **forces square corners** — `border_radius` is ignored. Use the
+// default `BorderSides::ALL` for radius-aware borders.
 fn compute_fill(inst: ShapeInstance, p: vec2<f32>, outer_half: vec2<f32>,
                 comp_alpha: f32, aa: f32) -> Body {
     var body: Body;
     let color_lin = srgb_to_linear(inst.color.rgb);
     if (inst.border_width > 0.0) {
         let border_lin = srgb_to_linear(inst.border_color.rgb);
-        let inner_half = max(outer_half - vec2<f32>(inst.border_width), vec2<f32>(0.0));
-        let inner_radii = max(inst.border_radius - vec4<f32>(inst.border_width), vec4<f32>(0.0));
-        let inner_dist = sd_rounded_rect(p, inner_half, inner_radii);
+        let sides = (inst.shape_kind >> 8u) & 0xFu;
+        // sides == 0 means an older path without the mask set — treat
+        // as ALL so existing call sites keep working.
+        let mask = select(sides, BORDER_SIDES_ALL, sides == 0u);
+        // Scale border_width alongside outer_half so a scaled-up shape
+        // has a proportionally scaled border (and not a 1px sliver lost
+        // inside a 1.5×-scaled outer). Uniform scale assumed for the
+        // border thickness — non-uniform `scale_xy` axis-distorts the
+        // border in width vs height, which is the documented behavior.
+        let bw = inst.border_width * inst.scale.x;
+        let radii_s = inst.border_radius * inst.scale.x;
+
+        var inner_dist: f32;
+        if (mask == BORDER_SIDES_ALL) {
+            let inner_half = max(outer_half - vec2<f32>(bw), vec2<f32>(0.0));
+            let inner_radii = max(radii_s - vec4<f32>(bw), vec4<f32>(0.0));
+            inner_dist = sd_rounded_rect(p, inner_half, inner_radii);
+        } else {
+            // Asymmetric inner AABB, per-side mask. p is in centered
+            // coords (origin at rect center). A masked-off side leaves
+            // the inner edge at the outer edge — i.e. no border there.
+            let inset_t = select(0.0, bw, (mask & BORDER_SIDE_TOP) != 0u);
+            let inset_r = select(0.0, bw, (mask & BORDER_SIDE_RIGHT) != 0u);
+            let inset_b = select(0.0, bw, (mask & BORDER_SIDE_BOTTOM) != 0u);
+            let inset_l = select(0.0, bw, (mask & BORDER_SIDE_LEFT) != 0u);
+            let inner_min = vec2<f32>(-outer_half.x + inset_l, -outer_half.y + inset_t);
+            let inner_max = vec2<f32>( outer_half.x - inset_r,  outer_half.y - inset_b);
+            let inner_center = (inner_min + inner_max) * 0.5;
+            let inner_half = max((inner_max - inner_min) * 0.5, vec2<f32>(0.0));
+            inner_dist = sd_rectangle(p - inner_center, inner_half);
+        }
         let inner_alpha = smoothstep(aa, -aa, inner_dist);
         let border_alpha = clamp(comp_alpha - inner_alpha, 0.0, 1.0);
         let fill_a = inst.color.a * inner_alpha;
@@ -209,8 +262,9 @@ fn compute_shadow(inst: ShapeInstance, px: vec2<f32>, center: vec2<f32>,
     s.rgb = vec3<f32>(0.0);
     s.a = 0.0;
     if (inst.shadow_opacity > 0.0) {
+        let radii_s = inst.border_radius * inst.scale.x;
         let sd = sd_rounded_rect(px - (center + inst.shadow_offset),
-                                 outer_half, inst.border_radius);
+                                 outer_half, radii_s);
         let s_edge = max(inst.shadow_blur, 1.0);
         let s_i = smoothstep(s_edge, -s_edge, sd);
         s.a = inst.shadow_color.a * s_i * inst.shadow_opacity;
@@ -227,7 +281,7 @@ fn compute_shadow(inst: ShapeInstance, px: vec2<f32>, center: vec2<f32>,
 @fragment
 fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
     let inst = instances[in.inst_idx];
-    if (inst.shape_kind == SHAPE_KIND_GLASS) {
+    if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLASS) {
         // Glass samples the backdrop it would otherwise write into —
         // skip it here so the blur input contains everything *behind*
         // each glass panel without the glass itself contaminating it.
@@ -239,7 +293,7 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    if (inst.shape_kind == SHAPE_KIND_GLYPH) {
+    if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLYPH) {
         let size = max(inst.size, vec2<f32>(1.0));
         let rel = (px - inst.position) / size;
         if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
@@ -252,18 +306,19 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
         return vec4<f32>(rgb_lin * a, a);
     }
 
-    if (inst.shape_kind == SHAPE_KIND_IMAGE) {
-        let size = max(inst.size, vec2<f32>(1.0));
-        let rel = (px - inst.position) / size;
+    if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_IMAGE) {
+        let size = max(inst.size * inst.scale, vec2<f32>(1.0));
+        let center_img = inst.position + inst.size * 0.5;
+        let rel = (px - (center_img - size * 0.5)) / size;
         if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
             discard;
         }
         let uv = inst.backdrop_uv_rect.xy + rel * inst.backdrop_uv_rect.zw;
         let sample = textureSampleLevel(image_tex, image_samp, uv, 0.0);
-        let center = inst.position + inst.size * 0.5;
-        let p = px - center;
-        let outer_half = inst.size * 0.5;
-        let comp_dist = sd_rounded_rect(p, outer_half, inst.border_radius);
+        let p = px - center_img;
+        let outer_half = inst.size * 0.5 * inst.scale;
+        let radii_s = inst.border_radius * inst.scale.x;
+        let comp_dist = sd_rounded_rect(p, outer_half, radii_s);
         let aa = max(fwidth(comp_dist), 0.5);
         let comp_alpha = smoothstep(aa, -aa, comp_dist);
         let tint_lin = srgb_to_linear(inst.color.rgb);
@@ -274,8 +329,9 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
 
     let center = inst.position + inst.size * 0.5;
     let p = px - center;
-    let outer_half = inst.size * 0.5;
-    let comp_dist = sd_rounded_rect(p, outer_half, inst.border_radius);
+    let outer_half = inst.size * 0.5 * inst.scale;
+    let radii_scaled = inst.border_radius * inst.scale.x;
+    let comp_dist = sd_rounded_rect(p, outer_half, radii_scaled);
     let aa = max(fwidth(comp_dist), 0.5);
     let comp_alpha = smoothstep(aa, -aa, comp_dist);
 
@@ -298,7 +354,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    if (inst.shape_kind == SHAPE_KIND_GLYPH) {
+    if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLYPH) {
         // `backdrop_uv_rect` = (u0, v0, w, h) into the R8 glyph atlas.
         let size = max(inst.size, vec2<f32>(1.0));
         let rel = (px - inst.position) / size;
@@ -313,20 +369,21 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         return vec4<f32>(rgb_lin * a, a);
     }
 
-    if (inst.shape_kind == SHAPE_KIND_IMAGE) {
+    if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_IMAGE) {
         // `backdrop_uv_rect` = (u0, v0, w, h) into the Rgba8UnormSrgb image atlas.
         // Tint = `inst.color` (white = unmodified). Per-corner radii clip via SDF.
-        let size = max(inst.size, vec2<f32>(1.0));
-        let rel = (px - inst.position) / size;
+        let size_s = max(inst.size * inst.scale, vec2<f32>(1.0));
+        let center_img = inst.position + inst.size * 0.5;
+        let rel = (px - (center_img - size_s * 0.5)) / size_s;
         if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
             discard;
         }
         let uv = inst.backdrop_uv_rect.xy + rel * inst.backdrop_uv_rect.zw;
         let sample = textureSampleLevel(image_tex, image_samp, uv, 0.0);
-        let center = inst.position + inst.size * 0.5;
-        let p = px - center;
-        let outer_half = inst.size * 0.5;
-        let comp_dist = sd_rounded_rect(p, outer_half, inst.border_radius);
+        let p = px - center_img;
+        let outer_half = inst.size * 0.5 * inst.scale;
+        let radii_s = inst.border_radius * inst.scale.x;
+        let comp_dist = sd_rounded_rect(p, outer_half, radii_s);
         let aa = max(fwidth(comp_dist), 0.5);
         let comp_alpha = smoothstep(aa, -aa, comp_dist);
         let tint_lin = srgb_to_linear(inst.color.rgb);
@@ -337,13 +394,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     let center = inst.position + inst.size * 0.5;
     let p = px - center;
-    let outer_half = inst.size * 0.5;
-    let comp_dist = sd_rounded_rect(p, outer_half, inst.border_radius);
+    let outer_half = inst.size * 0.5 * inst.scale;
+    let radii_scaled = inst.border_radius * inst.scale.x;
+    let comp_dist = sd_rounded_rect(p, outer_half, radii_scaled);
     let aa = max(fwidth(comp_dist), 0.5);
     let comp_alpha = smoothstep(aa, -aa, comp_dist);
 
     var body: Body;
-    if (inst.shape_kind == SHAPE_KIND_GLASS) {
+    if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLASS) {
         // Per-glass blur + refraction parameters. `backdrop_uv_rect` is
         // repurposed for glass: x = blur radius (px), y = refraction
         // strength (px). Both authored in physical px (CPU scaled them

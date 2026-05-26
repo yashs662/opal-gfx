@@ -5,13 +5,24 @@
 //! upload PNG bytes via [`ImageAtlas::upload_png`] and stash the handle
 //! to reference the image in scene nodes.
 //!
-//! When the atlas fills up [`ImageAtlas::upload_png`] returns `None` —
-//! stage-1 has no eviction. `Rgba8UnormSrgb` matches the shape pipeline
-//! convention: PNG bytes are sRGB-authored, the texture decode flag
-//! converts to linear when sampled, fragment math stays linear, the
-//! swapchain encodes back to sRGB on store.
+//! **Eviction model: snapshot-rebuild.** Every uploaded image's source
+//! bytes are cached in `sources` (cost: ~4 B/px × all uploads ever). On
+//! direct [`ImageAtlas::upload_rgba`] failure the caller can invoke
+//! [`ImageAtlas::rebuild_keeping`] with a `HashSet` of currently-live
+//! handles — the allocator resets, non-live sources are dropped from
+//! the cache, and the live set is re-uploaded into a fresh atlas
+//! layout. Each surviving handle's `ImageEntry::uv` is rewritten in
+//! place, so existing nodes that reference it pick up the new UVs on
+//! the next flatten pass. [`ImageAtlas::upload_rgba_or_evict`] is the
+//! convenience wrapper: try a normal upload, run a rebuild on failure
+//! using the supplied live set, retry once.
+//!
+//! `Rgba8UnormSrgb` matches the shape pipeline convention: PNG bytes
+//! are sRGB-authored, the texture decode flag converts to linear when
+//! sampled, fragment math stays linear, the swapchain encodes back to
+//! sRGB on store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use etagere::{size2, AtlasAllocator};
@@ -40,6 +51,18 @@ pub struct ImageAtlas {
     /// Transparent border around each image to keep linear filtering
     /// from bleeding across neighbours.
     padding: i32,
+    /// CPU-side source-byte cache. Populated on every `upload_rgba`
+    /// (including the re-uploads inside `rebuild_keeping`). Required
+    /// so `rebuild_keeping` can re-write each surviving handle's pixel
+    /// data into the fresh atlas layout. Drops entries on rebuild for
+    /// any handle absent from the supplied live set.
+    sources: HashMap<ImageHandle, ImageSource>,
+}
+
+struct ImageSource {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
 impl ImageAtlas {
@@ -114,6 +137,7 @@ impl ImageAtlas {
             occupants: HashMap::new(),
             next_handle: 0,
             padding: 1,
+            sources: HashMap::new(),
         }
     }
 
@@ -181,13 +205,116 @@ impl ImageAtlas {
 
     /// Upload pre-decoded `Rgba8UnormSrgb` pixels (`w*h*4` bytes,
     /// row-major, top-left origin). Stricter than [`upload_png`] —
-    /// caller is responsible for color-space correctness.
+    /// caller is responsible for color-space correctness. Caches the
+    /// source bytes so a later [`rebuild_keeping`] can re-pack them.
     pub fn upload_rgba(
         &mut self,
         queue: &wgpu::Queue,
         w: u32,
         h: u32,
         rgba: &[u8],
+    ) -> Option<ImageHandle> {
+        self.upload_internal(queue, w, h, rgba, None)
+    }
+
+    /// Convenience: try [`upload_rgba`]; on allocator failure, run
+    /// [`rebuild_keeping`] with `live` (dropping any non-live sources)
+    /// and retry once. Used by `App::upload_image_rgba` to handle
+    /// "atlas full while album art lands" without forcing every caller
+    /// to do the walk-tree-then-rebuild dance.
+    pub fn upload_rgba_or_evict(
+        &mut self,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+        live: &HashSet<ImageHandle>,
+    ) -> Option<ImageHandle> {
+        if let Some(h) = self.upload_rgba(queue, w, h, rgba) {
+            return Some(h);
+        }
+        self.rebuild_keeping(queue, live);
+        self.upload_rgba(queue, w, h, rgba)
+    }
+
+    /// Drop every cached source whose handle is missing from `live`,
+    /// reset the allocator, and re-upload the survivors into a fresh
+    /// atlas layout. Each surviving handle keeps its `ImageHandle`
+    /// value; only its `ImageEntry::uv` changes. Pure CPU + texture
+    /// writes — no GPU sync required, callers' instance buffers pick
+    /// up the new UVs on their next flatten.
+    ///
+    /// Failure cases (live source larger than atlas, OOM, etc.) drop
+    /// the offending handle entirely. The remaining live set still
+    /// packs — partial rebuild is preferred to all-or-nothing.
+    pub fn rebuild_keeping(&mut self, queue: &wgpu::Queue, live: &HashSet<ImageHandle>) {
+        // 1. Drop sources not in live set + their occupant entries.
+        self.sources.retain(|h, _| live.contains(h));
+        self.occupants.retain(|h, _| live.contains(h));
+
+        // 2. Fresh allocator. Old packing is discarded; the GPU texture
+        //    is left untouched (dead pixels at no-longer-allocated
+        //    coords are unreferenced and harmless — sampler never
+        //    addresses them).
+        self.allocator = AtlasAllocator::new(size2(self.size as i32, self.size as i32));
+
+        // 3. Re-upload each surviving source into a fresh slot. Snapshot
+        //    the (handle, w, h, bytes) tuples first to release the
+        //    sources borrow before calling upload_internal (which
+        //    mutates `self`).
+        let snapshot: Vec<(ImageHandle, u32, u32, Vec<u8>)> = self
+            .sources
+            .iter()
+            .map(|(h, s)| (*h, s.width, s.height, s.rgba.clone()))
+            .collect();
+
+        for (handle, w, h, bytes) in snapshot {
+            // upload_internal with fixed_handle = Some(handle) re-uses
+            // the existing handle id (no new mint, no source re-cache).
+            // Drops the occupant entry on packing failure rather than
+            // panicking — see method-level doc.
+            if self.upload_internal(queue, w, h, &bytes, Some(handle)).is_none() {
+                self.occupants.remove(&handle);
+                self.sources.remove(&handle);
+            }
+        }
+    }
+
+    /// Iterate every currently-live handle in the atlas. Useful for
+    /// composing the `live` set passed to `rebuild_keeping`.
+    pub fn live_handles(&self) -> impl Iterator<Item = ImageHandle> + '_ {
+        self.occupants.keys().copied()
+    }
+
+    /// CPU memory used by source-byte caches. GPU memory is separately
+    /// reported by [`memory_bytes`].
+    pub fn source_bytes(&self) -> u64 {
+        self.sources.values().map(|s| s.rgba.len() as u64).sum()
+    }
+
+    /// Reported GPU bytes used by the atlas texture.
+    pub fn memory_bytes(&self) -> u64 {
+        self.size as u64 * self.size as u64 * 4
+    }
+
+    /// Test hook: look up a source's cached bytes. None when no upload
+    /// has used that handle (or it was dropped by a rebuild).
+    #[cfg(test)]
+    pub(crate) fn source_size(&self, h: ImageHandle) -> Option<(u32, u32)> {
+        self.sources.get(&h).map(|s| (s.width, s.height))
+    }
+
+    /// Shared body for both new-handle uploads (`fixed_handle = None`)
+    /// and rebuild re-uploads (`fixed_handle = Some(h)` — reuses the
+    /// existing handle, skips source caching since the bytes are
+    /// already cached). Allocates, writes pixels, returns the handle.
+    fn upload_internal(
+        &mut self,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+        fixed_handle: Option<ImageHandle>,
     ) -> Option<ImageHandle> {
         if w == 0 || h == 0 || rgba.len() != (w * h * 4) as usize {
             return None;
@@ -236,15 +363,159 @@ impl ImageAtlas {
             width: w,
             height: h,
         };
-        let handle = ImageHandle(self.next_handle);
-        self.next_handle = self.next_handle.wrapping_add(1);
+        let handle = match fixed_handle {
+            Some(h) => h,
+            None => {
+                let new = ImageHandle(self.next_handle);
+                self.next_handle = self.next_handle.wrapping_add(1);
+                // Cache source bytes only for net-new uploads. Rebuild
+                // re-uploads already have a live source entry.
+                self.sources.insert(
+                    new,
+                    ImageSource { width: w, height: h, rgba: rgba.to_vec() },
+                );
+                new
+            }
+        };
         let _ = alloc.id;
         self.occupants.insert(handle, entry);
         Some(handle)
     }
+}
 
-    /// Reported GPU bytes used by the atlas texture.
-    pub fn memory_bytes(&self) -> u64 {
-        self.size as u64 * self.size as u64 * 4
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Spin up a noop wgpu device. Cheap (~1 ms) — no GPU required.
+    /// `noop.enable = true` is the runtime opt-in for the NOOP backend:
+    /// the feature flag compiles it in, this field activates it.
+    /// Without `enable: true` `request_adapter` returns `NotFound` with
+    /// `active_backends = 0x0`.
+    fn noop_device() -> (wgpu::Device, wgpu::Queue) {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::NOOP,
+            backend_options: wgpu::BackendOptions {
+                noop: wgpu::NoopBackendOptions { enable: true },
+                ..Default::default()
+            },
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        let adapter = pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            },
+        ))
+        .expect("noop adapter");
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .expect("noop device")
+    }
+
+    fn solid_rgba(w: u32, h: u32, c: [u8; 4]) -> Vec<u8> {
+        (0..(w * h))
+            .flat_map(|_| c.iter().copied())
+            .collect()
+    }
+
+    #[test]
+    fn upload_rgba_caches_source_bytes() {
+        let (device, queue) = noop_device();
+        let mut atlas = ImageAtlas::new(&device, 64);
+        let bytes = solid_rgba(8, 8, [255, 0, 0, 255]);
+        let h = atlas.upload_rgba(&queue, 8, 8, &bytes).expect("upload");
+        assert_eq!(atlas.source_size(h), Some((8, 8)));
+        assert_eq!(atlas.source_bytes(), (8 * 8 * 4) as u64);
+    }
+
+    #[test]
+    fn rebuild_keeping_empty_drops_everything() {
+        let (device, queue) = noop_device();
+        let mut atlas = ImageAtlas::new(&device, 64);
+        let a = atlas.upload_rgba(&queue, 8, 8, &solid_rgba(8, 8, [1; 4])).unwrap();
+        let b = atlas.upload_rgba(&queue, 8, 8, &solid_rgba(8, 8, [2; 4])).unwrap();
+        atlas.rebuild_keeping(&queue, &HashSet::new());
+        assert!(atlas.get(a).is_none(), "a should be evicted");
+        assert!(atlas.get(b).is_none(), "b should be evicted");
+        assert_eq!(atlas.source_bytes(), 0, "source cache must be empty");
+        assert_eq!(atlas.live_handles().count(), 0);
+    }
+
+    #[test]
+    fn rebuild_keeping_preserves_live_handles() {
+        let (device, queue) = noop_device();
+        let mut atlas = ImageAtlas::new(&device, 64);
+        let live = atlas.upload_rgba(&queue, 8, 8, &solid_rgba(8, 8, [1; 4])).unwrap();
+        let _dead = atlas.upload_rgba(&queue, 8, 8, &solid_rgba(8, 8, [2; 4])).unwrap();
+        let pre_uv = atlas.get(live).unwrap().uv;
+        let keep: HashSet<_> = [live].into_iter().collect();
+        atlas.rebuild_keeping(&queue, &keep);
+        let post = atlas.get(live).expect("live handle survives");
+        assert_eq!(post.width, 8);
+        assert_eq!(post.height, 8);
+        // Live handle's UV is typically the same after rebuild (first
+        // alloc lands at the same spot) — just assert it's a valid
+        // entry rather than asserting identity, since etagere's
+        // packing order is an implementation detail.
+        let _ = pre_uv;
+        assert_eq!(atlas.live_handles().count(), 1);
+        assert!(atlas.source_size(live).is_some());
+    }
+
+    #[test]
+    fn upload_rgba_or_evict_succeeds_after_rebuild() {
+        let (device, queue) = noop_device();
+        // Tiny atlas — first big upload fills it. Second upload
+        // would otherwise fail; with eviction it succeeds.
+        let mut atlas = ImageAtlas::new(&device, 32);
+        let bytes_a = solid_rgba(30, 30, [1; 4]);
+        let bytes_b = solid_rgba(30, 30, [2; 4]);
+        let a = atlas.upload_rgba(&queue, 30, 30, &bytes_a).expect("first fits");
+        // Direct second upload fails — no room.
+        assert!(
+            atlas.upload_rgba(&queue, 30, 30, &bytes_b).is_none(),
+            "second upload must fail without eviction (atlas full)"
+        );
+        // Eviction path with empty live set drops `a` and succeeds.
+        let live = HashSet::new();
+        let b = atlas
+            .upload_rgba_or_evict(&queue, 30, 30, &bytes_b, &live)
+            .expect("retry after eviction");
+        assert!(atlas.get(a).is_none(), "a should have been evicted");
+        assert!(atlas.get(b).is_some());
+    }
+
+    #[test]
+    fn handle_value_is_stable_across_rebuild() {
+        // ImageHandle is the public stable identifier — rebuild must
+        // not mint new handles for survivors.
+        let (device, queue) = noop_device();
+        let mut atlas = ImageAtlas::new(&device, 64);
+        let live = atlas.upload_rgba(&queue, 8, 8, &solid_rgba(8, 8, [1; 4])).unwrap();
+        let keep: HashSet<_> = [live].into_iter().collect();
+        atlas.rebuild_keeping(&queue, &keep);
+        // Same handle value; new entry.
+        assert!(atlas.get(live).is_some());
+        assert_eq!(atlas.live_handles().next(), Some(live));
+    }
+
+    #[test]
+    fn rebuild_compacts_so_new_uploads_fit_after_clearing() {
+        // Fill atlas with 4 tiles, evict all, verify 4 more fit.
+        let (device, queue) = noop_device();
+        let mut atlas = ImageAtlas::new(&device, 32);
+        let h1 = atlas.upload_rgba(&queue, 14, 14, &solid_rgba(14, 14, [1; 4])).unwrap();
+        let h2 = atlas.upload_rgba(&queue, 14, 14, &solid_rgba(14, 14, [2; 4])).unwrap();
+        // Two 14x14 (padded 16x16) tiles fill the 32x32 atlas roughly.
+        // Drop both via empty live + verify new uploads succeed.
+        atlas.rebuild_keeping(&queue, &HashSet::new());
+        assert!(atlas.get(h1).is_none());
+        assert!(atlas.get(h2).is_none());
+        let h3 = atlas.upload_rgba(&queue, 14, 14, &solid_rgba(14, 14, [3; 4]));
+        assert!(h3.is_some(), "post-rebuild upload should succeed");
     }
 }

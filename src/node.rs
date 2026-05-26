@@ -43,6 +43,10 @@ pub struct TextRef {
     pub content: String,
     pub font_size: f32,
     pub line_height: f32,
+    /// When set, the glyph builder shapes the truncated `prefix + "…"`
+    /// form to fit within this many **physical** pixels. Already
+    /// scale-multiplied by `expand_events_into`.
+    pub max_width: Option<f32>,
     /// Scissor rect propagated from the nearest Scroll/Hidden ancestor.
     /// `crate::gpu::NO_CLIP` when none. Stamped onto every glyph
     /// instance built from this ref.
@@ -254,12 +258,61 @@ pub struct NodeId {
     generation: u32,
 }
 
+impl NodeId {
+    /// Invalid sentinel used by test fixtures + as a placeholder when
+    /// a real `NodeId` isn't yet available (e.g. an `EditorState`
+    /// being constructed before its sibling children exist). Any tree
+    /// lookup with this id returns `None`.
+    pub const SENTINEL: NodeId = NodeId {
+        index: u32::MAX,
+        generation: u32::MAX,
+    };
+}
+
+/// Per-side border mask. Bit 0 = top, 1 = right, 2 = bottom, 3 = left.
+/// Default [`BorderSides::ALL`] (0x0F) restores the all-sides
+/// rounded-rect inner-SDF border. Any other mask switches the shader
+/// to an asymmetric per-side path that forces **square corners** —
+/// `border_radius` is ignored when a side mask is partial. Spotify
+/// bottom-tab borders are [`BorderSides::BOTTOM`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BorderSides(pub u8);
+
+impl BorderSides {
+    pub const TOP: BorderSides = BorderSides(0b0001);
+    pub const RIGHT: BorderSides = BorderSides(0b0010);
+    pub const BOTTOM: BorderSides = BorderSides(0b0100);
+    pub const LEFT: BorderSides = BorderSides(0b1000);
+    pub const ALL: BorderSides = BorderSides(0b1111);
+    pub const NONE: BorderSides = BorderSides(0);
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for BorderSides {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl std::ops::BitOr for BorderSides {
+    type Output = BorderSides;
+    fn bitor(self, rhs: BorderSides) -> BorderSides {
+        BorderSides(self.0 | rhs.0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ShapeStyle {
     pub color: [f32; 4],
     pub border_color: [f32; 4],
     pub border_width: f32,
     pub border_radius: [f32; 4],
+    /// Mask of sides that receive the border. Default [`BorderSides::ALL`]
+    /// keeps the existing rounded-rect inner-SDF behavior; partial masks
+    /// switch to a square-cornered per-side path (radius ignored).
+    pub border_sides: BorderSides,
     pub shadow_color: [f32; 4],
     pub shadow_offset: [f32; 2],
     pub shadow_blur: f32,
@@ -279,6 +332,12 @@ pub struct ShapeStyle {
     /// so the surface looks pebbled rather than mirror-smooth. 0
     /// disables; ~1 = subtle frost, ~3 = pronounced.
     pub roughness: f32,
+    /// Per-shape visual scale around the rect centre. `[1.0, 1.0]` =
+    /// identity. Affects render only — layout + hit-test see the
+    /// pre-scale geometry, so hover_scale-style feedback doesn't shift
+    /// click targets. Set via [`crate::scene::NodeBuilderRef::scale_xy`]
+    /// or runtime [`NodeTree::set_scale_xy`].
+    pub scale: [f32; 2],
 }
 
 impl Default for ShapeStyle {
@@ -291,6 +350,7 @@ impl Default for ShapeStyle {
             border_color: [0.0, 0.0, 0.0, 1.0],
             border_width: 0.0,
             border_radius: [0.0; 4],
+            border_sides: BorderSides::ALL,
             shadow_color: [0.0, 0.0, 0.0, 1.0],
             shadow_offset: [0.0; 2],
             shadow_blur: 0.0,
@@ -300,6 +360,7 @@ impl Default for ShapeStyle {
             blur_amount: 12.0,
             refraction: 0.0,
             roughness: 0.0,
+            scale: [1.0, 1.0],
         }
     }
 }
@@ -329,6 +390,24 @@ pub struct NodeInteract {
     pub focused: Option<Signal<bool>>,
 }
 
+/// Captured base + hover/press color values used by the
+/// [`crate::scene::NodeBuilderRef::hover_color`] /
+/// [`crate::scene::NodeBuilderRef::press_color`] sugar. Allocated lazily
+/// on the first sugar call; subsequent calls mutate-in-place so the
+/// resulting `Computed` covers every wired state in one slot.
+///
+/// `base` snapshots `style.color` at the moment the first sugar method
+/// fired — so sugar pairs with `.rgba(...)` *before* the sugar call.
+/// Authoring a reactive `Signal<Color>` base and then layering sugar on
+/// top isn't supported (the sugar can't follow a live source); build a
+/// hand-rolled `Computed` instead.
+#[derive(Clone, Debug)]
+pub struct InteractColors {
+    pub base: [f32; 4],
+    pub hover: Option<[f32; 4]>,
+    pub press: Option<[f32; 4]>,
+}
+
 impl NodeInteract {
     pub fn is_any(&self) -> bool {
         self.hover.is_some() || self.pressed.is_some() || self.focused.is_some()
@@ -340,6 +419,12 @@ pub struct NodeText {
     pub content: String,
     pub font_size: f32,
     pub line_height: f32,
+    /// When set, layout measures and the glyph builder shapes the text
+    /// truncated with an ellipsis to fit within this many **logical**
+    /// pixels. `None` (default) lets the text size to its full natural
+    /// width. Layout multiplies this by the display scale at measure
+    /// time, mirroring `font_size` / `line_height`.
+    pub max_width: Option<f32>,
 }
 
 /// Per-node scroll state. Allocated only on containers whose layout has
@@ -483,7 +568,7 @@ impl ScrollState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Node {
     pub style: ShapeStyle,
     pub layout: LayoutStyle,
@@ -497,11 +582,97 @@ pub struct Node {
     /// Present iff `layout.scrolls()`. See [`ScrollState`].
     pub scroll: Option<ScrollState>,
     pub visible: bool,
+    /// True iff this node sits *behind* a glass overlay and so feeds the
+    /// blurred backdrop. Only these flag `dirty::BACKDROP` on change, so
+    /// the (expensive) full-window blur re-runs *only* when the content
+    /// actually visible through the glass changes — not for every scroll
+    /// tick / layout shuffle / front-panel recolour (which paint on top
+    /// of the glass and can't affect it). Default false: a node is
+    /// assumed to be in front of any glass unless it opts in.
+    pub blur_source: bool,
     pub children: Vec<NodeId>,
     pub interact: NodeInteract,
     pub text: Option<NodeText>,
     pub image: Option<ImageHandle>,
     pub window_action: Option<WindowAction>,
+    /// Click callback fired by the app shell when a left-button release
+    /// lands on the same node that captured the press. See
+    /// [`crate::event::EventHandler`].
+    pub on_click: Option<crate::event::EventHandler>,
+    /// Right-click callback. Same semantics as [`Self::on_click`] but
+    /// fires on right-button release-inside-captured. Used for context
+    /// menus.
+    pub on_right_click: Option<crate::event::EventHandler>,
+    /// Hover-dwell callback. Fires once when the cursor has been
+    /// continuously hovering this node for at least the stored
+    /// `Duration`. Re-arms whenever hover leaves and re-enters.
+    pub on_hover_dwell: Option<(std::time::Duration, crate::event::EventHandler)>,
+    /// Sugar-managed color state. Present iff the builder saw
+    /// `.hover_color(...)` or `.press_color(...)`; the actual bind slot
+    /// lives in `BindRegistry.color` like any other reactive color.
+    pub interact_colors: Option<InteractColors>,
+    /// Editable-text state. Present on nodes spawned via
+    /// `Scene::text_field`. Boxed so a `Node` without an editor stays
+    /// pointer-sized for the field.
+    pub editor: Option<Box<crate::editor::EditorState>>,
+    /// Virtualized-list state. Present on nodes spawned via
+    /// `Scene::lazy_list`. Drives the materialize-on-flush pass that
+    /// keeps only the visible row window as real children.
+    pub lazy_list: Option<Box<crate::lazy_list::LazyListState>>,
+    /// Modal / context-menu scrim flag. When true the node is a hit
+    /// target (so it blocks click-through to whatever is behind it)
+    /// **and** a left-press on it triggers the app's
+    /// [`crate::app::App::on_unhandled_press`] hook — i.e. it counts as
+    /// an "outside" click for dismissing a floating layer. Default
+    /// false.
+    pub dismiss_transparent: bool,
+    /// Continuous-drag callback. Fires on every cursor move while a
+    /// left-press is captured on this node. Drives sliders / scrubbers.
+    /// See [`crate::event::DragCtx`].
+    pub on_drag: Option<crate::event::DragHandler>,
+    /// Drag-and-drop payload. When a press starts on a node with a
+    /// payload, the lib latches a clone as the in-flight drag payload;
+    /// releasing over a node with `on_drop` delivers it. Type-erased
+    /// (`Rc<dyn Any>`) so the boundary stays non-generic.
+    pub drag_payload: Option<std::rc::Rc<dyn std::any::Any>>,
+    /// Drop-target callback. Fires when a left-press release lands on
+    /// this node while a drag payload is in flight. See
+    /// [`crate::event::DropCtx`].
+    pub on_drop: Option<crate::event::DropHandler>,
+    /// Drag-follow flag. When set, dragging this node lifts its subtree
+    /// out of layout flow (leaving a hole) and paints it on top,
+    /// following the cursor 1:1. The visual half of drag-and-drop —
+    /// reorderable lists pair this with `drag_payload` + `on_drop`.
+    pub drag_follow: bool,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("style", &self.style)
+            .field("layout", &self.layout)
+            .field("rect", &self.rect)
+            .field("content_size", &self.content_size)
+            .field("scroll", &self.scroll)
+            .field("visible", &self.visible)
+            .field("children", &self.children)
+            .field("interact", &self.interact)
+            .field("text", &self.text)
+            .field("image", &self.image)
+            .field("window_action", &self.window_action)
+            .field("on_click", &self.on_click.as_ref().map(|_| "<handler>"))
+            .field("on_right_click", &self.on_right_click.as_ref().map(|_| "<handler>"))
+            .field("on_hover_dwell", &self.on_hover_dwell.as_ref().map(|(d, _)| ("<handler>", d)))
+            .field("interact_colors", &self.interact_colors)
+            .field("editor", &self.editor)
+            .field("lazy_list", &self.lazy_list)
+            .field("dismiss_transparent", &self.dismiss_transparent)
+            .field("on_drag", &self.on_drag.as_ref().map(|_| "<handler>"))
+            .field("drag_payload", &self.drag_payload.as_ref().map(|_| "<payload>"))
+            .field("on_drop", &self.on_drop.as_ref().map(|_| "<handler>"))
+            .field("drag_follow", &self.drag_follow)
+            .finish()
+    }
 }
 
 impl Node {
@@ -514,11 +685,23 @@ impl Node {
                 content_size: [0.0; 2],
                 scroll: None,
                 visible: true,
+                blur_source: false,
                 children: Vec::new(),
                 interact: NodeInteract::default(),
                 text: None,
                 image: None,
                 window_action: None,
+                on_click: None,
+                on_right_click: None,
+                on_hover_dwell: None,
+                interact_colors: None,
+                editor: None,
+                lazy_list: None,
+                dismiss_transparent: false,
+                on_drag: None,
+                drag_payload: None,
+                on_drop: None,
+                drag_follow: false,
             },
         }
     }
@@ -540,6 +723,7 @@ impl Node {
             content: content.into(),
             font_size,
             line_height: font_size * 1.25,
+            max_width: None,
         });
         b
     }
@@ -598,6 +782,23 @@ impl NodeBuilder {
     }
     pub fn layout_abs(mut self, x: f32, y: f32) -> Self {
         self.node.layout.abs = Some([x, y]);
+        self
+    }
+    pub fn push_end(mut self) -> Self {
+        self.node.layout.push_end = true;
+        self
+    }
+    /// Opt this node into Tab-focus cycling at the given order. `0`
+    /// (the default) excludes it. Pair with [`Self::on_focus`] to drive
+    /// a focus-ring signal. See [`crate::App`] Tab handling.
+    pub fn focus_order(mut self, order: u32) -> Self {
+        self.node.layout.focus_order = order;
+        self
+    }
+    /// Shortcut for `layout_justify(Center).layout_align(Center)`.
+    pub fn center(mut self) -> Self {
+        self.node.layout.justify = Justify::Center;
+        self.node.layout.align = Align::Center;
         self
     }
 
@@ -727,7 +928,32 @@ impl NodeBuilder {
     pub fn border(mut self, width: f32, color: [f32; 4]) -> Self {
         self.node.style.border_width = width;
         self.node.style.border_color = color;
+        self.node.style.border_sides = BorderSides::ALL;
         self
+    }
+    /// Border on a specific mask of sides. Width + color are uniform
+    /// across the enabled sides. Partial masks force **square corners**
+    /// — `border_radius` is ignored when this is used. Compose multiple
+    /// sides with `|`: `.border_sides(BorderSides::TOP | BorderSides::BOTTOM, 2.0, color)`.
+    pub fn border_sides(mut self, sides: BorderSides, width: f32, color: [f32; 4]) -> Self {
+        self.node.style.border_width = width;
+        self.node.style.border_color = color;
+        self.node.style.border_sides = sides;
+        self
+    }
+    /// Convenience for the Spotify-style bottom-border tab. Equivalent
+    /// to `border_sides(BorderSides::BOTTOM, w, c)`.
+    pub fn border_bottom(self, width: f32, color: [f32; 4]) -> Self {
+        self.border_sides(BorderSides::BOTTOM, width, color)
+    }
+    pub fn border_top(self, width: f32, color: [f32; 4]) -> Self {
+        self.border_sides(BorderSides::TOP, width, color)
+    }
+    pub fn border_left(self, width: f32, color: [f32; 4]) -> Self {
+        self.border_sides(BorderSides::LEFT, width, color)
+    }
+    pub fn border_right(self, width: f32, color: [f32; 4]) -> Self {
+        self.border_sides(BorderSides::RIGHT, width, color)
     }
     pub fn shadow(mut self, offset: [f32; 2], blur: f32, color: [f32; 4], opacity: f32) -> Self {
         self.node.style.shadow_offset = offset;
@@ -740,8 +966,27 @@ impl NodeBuilder {
         self.node.style.opacity = o;
         self
     }
+    /// Per-shape visual scale around the rect centre. Layout + hit-test
+    /// are unchanged. Useful for hover-grow effects without shifting
+    /// click boxes. Uniform: `scale(1.05).scale(1.0, 1.05)` for axis-
+    /// independent.
+    pub fn scale(mut self, s: f32) -> Self {
+        self.node.style.scale = [s, s];
+        self
+    }
+    pub fn scale_xy(mut self, sx: f32, sy: f32) -> Self {
+        self.node.style.scale = [sx, sy];
+        self
+    }
     pub fn hidden(mut self) -> Self {
         self.node.visible = false;
+        self
+    }
+
+    /// Mark this node as backdrop content (behind a glass overlay) so its
+    /// changes re-run the blur. See [`Node::blur_source`].
+    pub fn blur_source(mut self) -> Self {
+        self.node.blur_source = true;
         self
     }
     pub fn kind(mut self, kind: ShapeKind) -> Self {
@@ -774,6 +1019,15 @@ impl NodeBuilder {
         }
         self
     }
+    /// Cap the text's rendered + measured width at `px` logical pixels.
+    /// When the unconstrained shape exceeds the cap, both layout and
+    /// glyph emission switch to the `prefix + "…"` truncation form.
+    pub fn max_width_px(mut self, px: f32) -> Self {
+        if let Some(t) = self.node.text.as_mut() {
+            t.max_width = Some(px);
+        }
+        self
+    }
     pub fn on_hover(mut self, signal: Signal<bool>) -> Self {
         self.node.interact.hover = Some(signal);
         self
@@ -788,6 +1042,81 @@ impl NodeBuilder {
     }
     pub fn window_action(mut self, action: WindowAction) -> Self {
         self.node.window_action = Some(action);
+        self
+    }
+
+    /// Mark this node as a modal / context-menu scrim: it becomes a hit
+    /// target (blocking click-through) and a left-press on it fires
+    /// [`crate::app::App::on_unhandled_press`]. See
+    /// [`crate::scene::NodeBuilderRef::dismiss_transparent`].
+    pub fn dismiss_transparent(mut self) -> Self {
+        self.node.dismiss_transparent = true;
+        self
+    }
+
+    /// Install a continuous-drag callback. See
+    /// [`crate::scene::NodeBuilderRef::on_drag`].
+    pub fn on_drag<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&mut crate::event::DragCtx<'a>) + 'static,
+    {
+        self.node.on_drag = Some(std::rc::Rc::new(f));
+        self
+    }
+
+    /// Attach a drag-and-drop payload. Pressing this node latches a
+    /// clone of the payload as the in-flight drag; see
+    /// [`crate::scene::NodeBuilderRef::drag_payload`].
+    pub fn drag_payload<P: 'static>(mut self, payload: P) -> Self {
+        self.node.drag_payload = Some(std::rc::Rc::new(payload));
+        self
+    }
+
+    /// Install a drop-target callback. See
+    /// [`crate::scene::NodeBuilderRef::on_drop`].
+    pub fn on_drop<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&mut crate::event::DropCtx<'a>) + 'static,
+    {
+        self.node.on_drop = Some(std::rc::Rc::new(f));
+        self
+    }
+
+    /// Make this node follow the cursor while dragged. See
+    /// [`crate::scene::NodeBuilderRef::drag_follow`].
+    pub fn drag_follow(mut self) -> Self {
+        self.node.drag_follow = true;
+        self
+    }
+
+    /// Install a click callback. See
+    /// [`crate::scene::NodeBuilderRef::on_click`] for semantics.
+    pub fn on_click<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&mut crate::event::EventCtx<'a>) + 'static,
+    {
+        self.node.on_click = Some(std::rc::Rc::new(f));
+        self
+    }
+    /// Install a right-click callback. Fires on right-button
+    /// release-inside-captured. See
+    /// [`crate::scene::NodeBuilderRef::on_right_click`].
+    pub fn on_right_click<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&mut crate::event::EventCtx<'a>) + 'static,
+    {
+        self.node.on_right_click = Some(std::rc::Rc::new(f));
+        self
+    }
+    /// Install a hover-dwell callback. Fires once when the cursor has
+    /// continuously hovered this node for at least `duration`. Re-arms
+    /// on hover-leave + re-enter. See
+    /// [`crate::scene::NodeBuilderRef::on_hover_dwell`].
+    pub fn on_hover_dwell<F>(mut self, duration: std::time::Duration, f: F) -> Self
+    where
+        F: for<'a> Fn(&mut crate::event::EventCtx<'a>) + 'static,
+    {
+        self.node.on_hover_dwell = Some((duration, std::rc::Rc::new(f)));
         self
     }
     pub fn build(self) -> Node {
@@ -822,6 +1151,13 @@ pub struct NodeTree {
     /// public method. Updated by the app at init + on
     /// `ScaleFactorChanged`. Defaults to `1.0` for headless tests.
     current_scale: f32,
+    /// Active drag-follow target: `(node, [dx, dy])`. When set,
+    /// the flatten pass skips this node in its normal tree position and
+    /// re-emits its subtree **last** (so it paints on top of everything)
+    /// shifted by `[dx, dy]` physical px — the cursor delta since the
+    /// drag began. Set by the app shell during a `drag_follow` drag;
+    /// `None` otherwise.
+    drag_follow: Option<(NodeId, [f32; 2])>,
 }
 
 impl Default for NodeTree {
@@ -834,6 +1170,7 @@ impl Default for NodeTree {
             glass_count: 0,
             scrollable_ids: Vec::new(),
             current_scale: 1.0,
+            drag_follow: None,
         }
     }
 }
@@ -862,6 +1199,23 @@ impl NodeTree {
                 s.time_since_input = 0.0;
             }
         }
+    }
+
+    /// Set (or clear) the active drag-follow target. `Some((node, delta))`
+    /// makes the flatten pass lift `node`'s subtree out of its normal
+    /// position and re-paint it last, shifted by `delta` physical px.
+    /// Marks TRANSFORM dirty so the next flush re-flattens. No-op if the
+    /// value is unchanged.
+    pub fn set_drag_follow(&mut self, follow: Option<(NodeId, [f32; 2])>) {
+        if self.drag_follow != follow {
+            self.drag_follow = follow;
+            self.dirty |= dirty::TRANSFORM;
+        }
+    }
+
+    /// The node currently being drag-followed, if any.
+    pub fn drag_follow_target(&self) -> Option<NodeId> {
+        self.drag_follow.map(|(id, _)| id)
     }
 
     /// Update the cached display scale used by scroll math. Call from
@@ -933,6 +1287,12 @@ impl NodeTree {
         id
     }
 
+    /// Remove a single node from the arena. Prefer
+    /// [`Self::remove_subtree`] for anything that may have children —
+    /// this method does **not** recurse, does **not** prune the
+    /// removed id from its parent's `children: Vec<NodeId>`, and does
+    /// **not** touch the bind registry (which lives on `SceneCtx`).
+    /// Kept as a low-level building block for `remove_subtree`.
     pub fn remove(&mut self, id: NodeId) {
         let Some(slot) = self.slots.get_mut(id.index as usize) else {
             return;
@@ -955,40 +1315,114 @@ impl NodeTree {
         self.dirty |= dirty::TREE;
         if was_glass {
             self.glass_count = self.glass_count.saturating_sub(1);
-            // Removed glass → backdrop no longer needed for it but
-            // any remaining glass still samples the same texture; safe
-            // to skip BACKDROP. TREE flag drives a full re-flatten which
-            // already triggers a re-blur via set_instances if needed.
         }
     }
 
-    // --- layout-mutating setters (flag TRANSFORM + BACKDROP conservatively) ---
+    /// Remove a node and every transitive descendant. Returns the
+    /// `NodeId`s that were dropped, in **pre-order** (parents first) —
+    /// callers (`SceneCtx::remove_subtree`) walk this set to tombstone
+    /// matching `BindRegistry` slots and stop matching timeline tweens.
+    ///
+    /// Detaches the node from any parent's `children: Vec<NodeId>`
+    /// (search is linear in the parent's child count; in practice
+    /// fan-out is small). Roots are removed from `self.roots`. A bogus
+    /// id (stale generation or out-of-bounds) returns an empty Vec.
+    pub fn remove_subtree(&mut self, id: NodeId) -> Vec<NodeId> {
+        // Stale or invalid id → nothing to do.
+        if self.get(id).is_none() {
+            return Vec::new();
+        }
+        // Detach from parent. We don't store back-references; linear
+        // search every parent's child list. O(N) over all nodes but
+        // only fires once per remove_subtree call.
+        for slot in self.slots.iter_mut() {
+            if let Some(node) = slot.payload.as_mut() {
+                node.children.retain(|c| *c != id);
+            }
+        }
+        // Collect ids in pre-order (parents before children) so the
+        // returned ordering matches DFS — useful for callers that
+        // want predictable cleanup order.
+        let mut dropped = Vec::new();
+        self.collect_subtree(id, &mut dropped);
+        // Free each slot bottom-up so any internal invariants that
+        // care about leaf-first ordering hold. The visible API
+        // contract is pre-order; the freeing loop runs in reverse.
+        for &dead in dropped.iter().rev() {
+            self.remove(dead);
+        }
+        dropped
+    }
+
+    fn collect_subtree(&self, id: NodeId, out: &mut Vec<NodeId>) {
+        let Some(node) = self.get(id) else {
+            return;
+        };
+        out.push(id);
+        // Clone the child list — collect_subtree borrows &self while
+        // we walk; the alternative is interleaved get() which is the
+        // same allocation in practice. Cheap (Vec<NodeId>, small).
+        let kids = node.children.clone();
+        for c in kids {
+            self.collect_subtree(c, out);
+        }
+    }
+
+    // --- layout-mutating setters ---
+    // Flag TRANSFORM always; BACKDROP only when the mutated node is a
+    // `blur_source` (behind glass). A normal node's layout change can't
+    // alter what the glass blurs, so re-blurring for it is wasted GPU —
+    // this is what keeps a per-frame progress-bar width animation cheap.
 
     pub fn set_layout_width(&mut self, id: NodeId, w: Len) {
-        let mask = self.transform_mask();
-        if let Some(n) = self.get_mut_raw(id)
-            && n.layout.width != w {
+        let has_glass = self.has_glass();
+        let changed_bs = match self.get_mut_raw(id) {
+            Some(n) if n.layout.width != w => {
                 n.layout.width = w;
-                self.dirty |= mask;
+                Some(n.blur_source)
             }
+            _ => None,
+        };
+        if let Some(bs) = changed_bs {
+            self.dirty |= dirty::TRANSFORM;
+            if bs && has_glass {
+                self.dirty |= dirty::BACKDROP;
+            }
+        }
     }
 
     pub fn set_layout_height(&mut self, id: NodeId, h: Len) {
-        let mask = self.transform_mask();
-        if let Some(n) = self.get_mut_raw(id)
-            && n.layout.height != h {
+        let has_glass = self.has_glass();
+        let changed_bs = match self.get_mut_raw(id) {
+            Some(n) if n.layout.height != h => {
                 n.layout.height = h;
-                self.dirty |= mask;
+                Some(n.blur_source)
             }
+            _ => None,
+        };
+        if let Some(bs) = changed_bs {
+            self.dirty |= dirty::TRANSFORM;
+            if bs && has_glass {
+                self.dirty |= dirty::BACKDROP;
+            }
+        }
     }
 
     pub fn set_layout_abs(&mut self, id: NodeId, pos: Option<[f32; 2]>) {
-        let mask = self.transform_mask();
-        if let Some(n) = self.get_mut_raw(id)
-            && n.layout.abs != pos {
+        let has_glass = self.has_glass();
+        let changed_bs = match self.get_mut_raw(id) {
+            Some(n) if n.layout.abs != pos => {
                 n.layout.abs = pos;
-                self.dirty |= mask;
+                Some(n.blur_source)
             }
+            _ => None,
+        };
+        if let Some(bs) = changed_bs {
+            self.dirty |= dirty::TRANSFORM;
+            if bs && has_glass {
+                self.dirty |= dirty::BACKDROP;
+            }
+        }
     }
 
     /// Convenience for animated position binds: forces `layout.abs =
@@ -1001,13 +1435,19 @@ impl NodeTree {
     pub fn set_layout_size_px(&mut self, id: NodeId, size: [f32; 2]) {
         let w = Len::Px(size[0]);
         let h = Len::Px(size[1]);
-        let mask = self.transform_mask();
-        if let Some(n) = self.get_mut_raw(id) {
-            let changed = n.layout.width != w || n.layout.height != h;
-            if changed {
+        let has_glass = self.has_glass();
+        let changed_bs = match self.get_mut_raw(id) {
+            Some(n) if n.layout.width != w || n.layout.height != h => {
                 n.layout.width = w;
                 n.layout.height = h;
-                self.dirty |= mask;
+                Some(n.blur_source)
+            }
+            _ => None,
+        };
+        if let Some(bs) = changed_bs {
+            self.dirty |= dirty::TRANSFORM;
+            if bs && has_glass {
+                self.dirty |= dirty::BACKDROP;
             }
         }
     }
@@ -1139,6 +1579,9 @@ impl NodeTree {
             //   (b) Forward chase via exponential ease — engages
             //       otherwise. Monotonic, no overshoot, snappy. Right
             //       feel for ordinary scrolling.
+            // Indexes several per-axis arrays (current/target/max/bounce_*)
+            // in lockstep, so a range loop is the clear form here.
+            #[allow(clippy::needless_range_loop)]
             for axis in 0..2 {
                 let cur = s.current[axis];
                 let tgt = s.target[axis];
@@ -1639,24 +2082,57 @@ impl NodeTree {
         let has_glass = self.has_glass();
         if let Some(n) = self.get_mut_raw(id)
             && n.style.color != color {
-                // Glass + Image render in the final pass only, so they
-                // don't enter the blurred backdrop. And without any
-                // glass node sampling it, the blur pass is skipped
-                // anyway — no need to flag BACKDROP.
-                let is_opaque_change =
-                    !matches!(n.style.kind, ShapeKind::Glass | ShapeKind::Image);
+                // Only re-run the blur if this node feeds the backdrop
+                // (sits behind the glass — `blur_source`). A front-of-glass
+                // recolour (accent pill, hover tint, …) paints on top of
+                // the glass and can't change what it blurs, so flagging
+                // BACKDROP for it just burns GPU on a redundant blur.
+                let bs = n.blur_source;
                 n.style.color = color;
                 self.dirty |= dirty::VISUAL;
-                if is_opaque_change && has_glass {
+                if bs && has_glass {
                     self.dirty |= dirty::BACKDROP;
                 }
             }
+    }
+
+    /// Swap an image node's texture handle (or clear it with `None`).
+    /// Lets a reactive image bind change the rendered cover without a
+    /// scene rebuild. Flags `BACKDROP` when glass exists for the same
+    /// reason as [`Self::set_color`]: a full-window album-art Image sits
+    /// behind the glass overlay, so changing it must re-run the blur.
+    pub fn set_image(&mut self, id: NodeId, image: Option<ImageHandle>) {
+        let has_glass = self.has_glass();
+        let changed_bs = match self.get_mut_raw(id) {
+            Some(n) if n.image != image => {
+                n.image = image;
+                Some(n.blur_source)
+            }
+            _ => None,
+        };
+        if let Some(bs) = changed_bs {
+            self.dirty |= dirty::VISUAL;
+            // Only the backdrop layers (album art behind glass) re-blur.
+            if bs && has_glass {
+                self.dirty |= dirty::BACKDROP;
+            }
+        }
     }
 
     pub fn set_opacity(&mut self, id: NodeId, opacity: f32) {
         if let Some(n) = self.get_mut_raw(id)
             && n.style.opacity != opacity {
                 n.style.opacity = opacity;
+                self.dirty |= dirty::VISUAL;
+            }
+    }
+
+    /// Runtime visual-scale setter. Layout + hit-test are untouched —
+    /// only the rendered geometry scales around the rect centre.
+    pub fn set_scale_xy(&mut self, id: NodeId, scale: [f32; 2]) {
+        if let Some(n) = self.get_mut_raw(id)
+            && n.style.scale != scale {
+                n.style.scale = scale;
                 self.dirty |= dirty::VISUAL;
             }
     }
@@ -1713,16 +2189,16 @@ impl NodeTree {
         }
     }
 
-    /// Mask for scroll-offset writes. Layout doesn't need to re-run
-    /// (rects are unchanged), only flatten — so `SCROLL` instead of
-    /// `TRANSFORM`. Backdrop still re-blurs when glass exists because
-    /// opaque content under glass moved.
+    /// Mask for scroll-offset writes. Flatten only (rects unchanged), so
+    /// `SCROLL` not `TRANSFORM`. Never flags `BACKDROP`: scrolling content
+    /// lives in front of the glass (a scroll container *behind* the blur
+    /// is exotic), so re-running the full-window blur on every scroll —
+    /// including the idle `settle_target` re-fires while the loop is kept
+    /// awake by another animation (e.g. the progress tween) — was a large,
+    /// pointless GPU cost. A blur_source needing live scroll-blur would
+    /// have to flag it explicitly.
     fn scroll_mask(&self) -> u32 {
-        if self.has_glass() {
-            dirty::SCROLL | dirty::BACKDROP
-        } else {
-            dirty::SCROLL
-        }
+        dirty::SCROLL
     }
 
     pub fn take_dirty(&mut self) -> u32 {
@@ -1733,6 +2209,93 @@ impl NodeTree {
 
     pub fn mark_all_dirty(&mut self) {
         self.dirty |= dirty::ANY;
+    }
+
+    /// Targeted dirty: set only the TRANSFORM flag. Used by editor
+    /// caret repositioning (which only needs flatten to re-emit) and
+    /// any other path that mutates layout without touching style or
+    /// the tree topology.
+    pub fn mark_transform_dirty(&mut self) {
+        self.dirty |= dirty::TRANSFORM;
+    }
+
+    /// Bump the version counter on a node's `LazyListState` so the
+    /// next materialize pass re-renders every visible row. Use after
+    /// mutating the data the render closure reads from (the list's
+    /// length is unchanged, so the visible window math wouldn't
+    /// otherwise notice). No-op on non-lazy_list nodes.
+    pub fn invalidate_lazy_list(&mut self, id: NodeId) {
+        if let Some(n) = self.get_mut_raw(id)
+            && let Some(ll) = n.lazy_list.as_mut() {
+                ll.version = ll.version.wrapping_add(1);
+                self.dirty |= dirty::TRANSFORM;
+            }
+    }
+
+    /// Resize a lazy-list. Setting a different `item_count` adjusts
+    /// the scroll container's content extent on the next layout;
+    /// `item_height` reshapes every visible row.
+    pub fn set_lazy_list_count(&mut self, id: NodeId, item_count: u32) {
+        if let Some(n) = self.get_mut_raw(id)
+            && let Some(ll) = n.lazy_list.as_mut()
+                && ll.item_count != item_count {
+                    ll.item_count = item_count;
+                    ll.version = ll.version.wrapping_add(1);
+                    // If a row_heights vec exists, keep it in sync with
+                    // the new row count. New rows take `item_height`.
+                    if let Some(heights) = ll.row_heights.as_mut() {
+                        heights.resize(item_count as usize, ll.item_height);
+                        ll.heights_version = ll.heights_version.wrapping_add(1);
+                        ll.first_dirty_row = 0;
+                    }
+                    self.dirty |= dirty::TRANSFORM;
+                }
+    }
+
+    /// Set the logical height of row `row` on a lazy-list. Switches
+    /// the list into variable-height mode on first call. Idempotent
+    /// no-op when the height hasn't changed. The materialize pass
+    /// will re-position rows below `row` and re-flow the scroll
+    /// container's content_size on the next flush.
+    ///
+    /// This is the per-frame entry point for height animations:
+    /// drive a `Signal<f32>` or a `Tween` and write the current value
+    /// here each tick.
+    pub fn set_lazy_list_row_height(&mut self, id: NodeId, row: u32, height: f32) {
+        let changed = self
+            .get_mut_raw(id)
+            .and_then(|n| n.lazy_list.as_mut())
+            .map(|ll| ll.set_row_height(row, height))
+            .unwrap_or(false);
+        if changed {
+            self.dirty |= dirty::TRANSFORM;
+        }
+    }
+
+    /// Replace every row's height in one call. Wholesale invalidation.
+    pub fn set_lazy_list_row_heights(&mut self, id: NodeId, heights: Vec<f32>) {
+        if let Some(n) = self.get_mut_raw(id)
+            && let Some(ll) = n.lazy_list.as_mut() {
+                ll.set_row_heights(heights);
+                self.dirty |= dirty::TRANSFORM;
+            }
+    }
+
+    /// Iterate every live `NodeId` in the arena. Order is slot order
+    /// (insertion-ordered with freed slots refilled by `add_child`).
+    /// Used by post-layout passes (e.g. caret reposition) that need
+    /// to find every node with a particular property without
+    /// pre-building an index.
+    pub fn iter_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                slot.payload.as_ref().map(|_| NodeId {
+                    index: i as u32,
+                    generation: slot.generation,
+                })
+            })
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
@@ -1819,17 +2382,45 @@ impl NodeTree {
         scroll_hits.clear();
         scroll_bars.clear();
         let mut scroll_stack: Vec<NodeId> = Vec::new();
+        // A drag-follow node is skipped in its normal tree slot (leaving
+        // a hole) and re-emitted last below so it paints on top.
+        let skip = self.drag_follow.map(|(id, _)| id);
         for root in &self.roots {
             self.flatten_into(
                 *root,
                 1.0,
                 NO_CLIP,
                 [0.0; 2],
+                skip,
                 &mut scroll_stack,
                 events,
                 hits,
                 scroll_hits,
                 scroll_bars,
+                scale,
+            );
+        }
+        // Re-emit the drag-follow subtree last (paints on top of all
+        // other content), shifted by the cursor delta. `offset` is
+        // subtracted from each rect (`abs = rect - offset`), so a
+        // negative delta shifts the subtree by `+delta`. Hits/scroll for
+        // the ghost are thrown away — the node is pointer-captured during
+        // the drag, so it needs no fresh hit entry.
+        if let Some((node, [dx, dy])) = self.drag_follow {
+            let mut throwaway_hits = Vec::new();
+            let mut throwaway_scroll = Vec::new();
+            let mut throwaway_bars = Vec::new();
+            self.flatten_into(
+                node,
+                1.0,
+                NO_CLIP,
+                [-dx, -dy],
+                None,
+                &mut scroll_stack,
+                events,
+                &mut throwaway_hits,
+                &mut throwaway_scroll,
+                &mut throwaway_bars,
                 scale,
             );
         }
@@ -1848,6 +2439,7 @@ impl NodeTree {
         parent_opacity: f32,
         clip: [f32; 4],
         offset: [f32; 2],
+        skip: Option<NodeId>,
         scroll_stack: &mut Vec<NodeId>,
         events: &mut Vec<FlatEvent>,
         hits: &mut Vec<HitEntry>,
@@ -1855,6 +2447,11 @@ impl NodeTree {
         scroll_bars: &mut Vec<ScrollbarHit>,
         scale: f32,
     ) {
+        // Skip the drag-follow node in its normal slot — re-emitted last
+        // by the caller so it paints on top.
+        if Some(id) == skip {
+            return;
+        }
         let Some(node) = self.get(id) else { return };
         if !node.visible {
             return;
@@ -1888,12 +2485,15 @@ impl NodeTree {
                     position: abs,
                     size,
                     shadow_offset: node.style.shadow_offset,
-                    shape_kind: node.style.kind.as_u32(),
+                    shape_kind: node.style.kind.as_u32()
+                        | ((node.style.border_sides.bits() as u32) << 8),
                     roughness: node.style.roughness,
                     border_width: node.style.border_width,
                     shadow_blur: node.style.shadow_blur,
                     shadow_opacity: node.style.shadow_opacity,
                     opacity,
+                    scale: node.style.scale,
+                    _pad1: [0.0, 0.0],
                 }));
             }
             ShapeKind::Text => {
@@ -1905,6 +2505,7 @@ impl NodeTree {
                         content: t.content.clone(),
                         font_size: t.font_size,
                         line_height: t.line_height,
+                        max_width: t.max_width,
                         clip_rect: clip,
                     }));
                 }
@@ -1923,7 +2524,17 @@ impl NodeTree {
                 }
             }
         }
-        if node.interact.is_any() || node.window_action.is_some() {
+        if node.interact.is_any()
+            || node.window_action.is_some()
+            || node.on_click.is_some()
+            || node.on_right_click.is_some()
+            || node.on_hover_dwell.is_some()
+            || node.dismiss_transparent
+            || node.on_drag.is_some()
+            || node.drag_payload.is_some()
+            || node.on_drop.is_some()
+            || node.drag_follow
+        {
             hits.push(HitEntry {
                 node_id: id,
                 bounds: [abs[0], abs[1], abs[0] + size[0], abs[1] + size[1]],
@@ -1974,6 +2585,7 @@ impl NodeTree {
                 opacity,
                 child_clip,
                 child_offset,
+                skip,
                 scroll_stack,
                 events,
                 hits,
@@ -2048,6 +2660,8 @@ fn emit_scrollbars(
             shadow_blur: 0.0,
             shadow_opacity: 0.0,
             opacity: 1.0,
+            scale: [1.0, 1.0],
+            _pad1: [0.0, 0.0],
         }));
     };
 
@@ -2329,6 +2943,187 @@ mod tests {
     use crate::layout::Len;
 
     #[test]
+    fn scale_default_is_identity() {
+        let n = Node::rect().build();
+        assert_eq!(n.style.scale, [1.0, 1.0]);
+    }
+
+    // --- drag-follow flatten ---
+
+    fn shape_positions(events: &[FlatEvent]) -> Vec<[f32; 2]> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                FlatEvent::Shape(s) => Some(s.position),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drag_follow_lifts_node_last_and_offset() {
+        let mut t = NodeTree::new();
+        let a = t.add_root(Node::rect().build());
+        let b = t.add_root(Node::rect().build());
+        t.get_mut_raw(a).unwrap().rect = [0.0, 0.0, 10.0, 10.0];
+        t.get_mut_raw(b).unwrap().rect = [0.0, 20.0, 10.0, 10.0];
+        // Without follow: painter order is A then B.
+        assert_eq!(shape_positions(&t.flatten(1.0).0), vec![[0.0, 0.0], [0.0, 20.0]]);
+        // Follow A with a +5,+7 cursor delta.
+        t.set_drag_follow(Some((a, [5.0, 7.0])));
+        let positions = shape_positions(&t.flatten(1.0).0);
+        // A is skipped in place (hole) and re-emitted LAST, shifted.
+        assert_eq!(positions, vec![[0.0, 20.0], [5.0, 7.0]]);
+    }
+
+    #[test]
+    fn drag_follow_carries_children_offset() {
+        let mut t = NodeTree::new();
+        let parent = t.add_root(Node::rect().build());
+        let child = t.add_child(parent, Node::rect().build());
+        t.get_mut_raw(parent).unwrap().rect = [10.0, 10.0, 40.0, 40.0];
+        t.get_mut_raw(child).unwrap().rect = [15.0, 15.0, 10.0, 10.0];
+        t.set_drag_follow(Some((parent, [100.0, 0.0])));
+        let positions = shape_positions(&t.flatten(1.0).0);
+        // Whole subtree shifts by +100 on x; parent painted before child.
+        assert_eq!(positions, vec![[110.0, 10.0], [115.0, 15.0]]);
+    }
+
+    #[test]
+    fn drag_follow_target_getter_and_clear() {
+        let mut t = NodeTree::new();
+        let a = t.add_root(Node::rect().build());
+        assert_eq!(t.drag_follow_target(), None);
+        t.set_drag_follow(Some((a, [1.0, 2.0])));
+        assert_eq!(t.drag_follow_target(), Some(a));
+        t.set_drag_follow(None);
+        assert_eq!(t.drag_follow_target(), None);
+    }
+
+    #[test]
+    fn scale_builder_sets_uniform() {
+        let n = Node::rect().scale(1.25).build();
+        assert_eq!(n.style.scale, [1.25, 1.25]);
+    }
+
+    #[test]
+    fn set_scale_xy_marks_visual_dirty() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(Node::rect().build());
+        t.take_dirty();
+        t.set_scale_xy(id, [1.1, 1.1]);
+        assert_eq!(t.get(id).unwrap().style.scale, [1.1, 1.1]);
+        assert_ne!(t.take_dirty() & dirty::VISUAL, 0);
+    }
+
+    #[test]
+    fn set_scale_xy_idempotent_at_same_value() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(Node::rect().scale(1.2).build());
+        t.take_dirty();
+        t.set_scale_xy(id, [1.2, 1.2]);
+        assert_eq!(t.take_dirty() & dirty::VISUAL, 0);
+    }
+
+    #[test]
+    fn border_sides_default_is_all() {
+        let style = ShapeStyle::default();
+        assert_eq!(style.border_sides, BorderSides::ALL);
+        assert_eq!(BorderSides::ALL.bits(), 0b1111);
+    }
+
+    #[test]
+    fn border_sides_bitor_composes() {
+        let mask = BorderSides::TOP | BorderSides::BOTTOM;
+        assert_eq!(mask.bits(), 0b0101);
+    }
+
+    #[test]
+    fn border_bottom_builder_sets_only_bottom_bit() {
+        let n = Node::rect().border_bottom(2.0, [1.0; 4]).build();
+        assert_eq!(n.style.border_sides, BorderSides::BOTTOM);
+        assert_eq!(n.style.border_width, 2.0);
+    }
+
+    #[test]
+    fn border_all_resets_mask_back_to_all_sides() {
+        // Start with bottom-only, then call .border(..) which should
+        // reset the mask to ALL.
+        let n = Node::rect()
+            .border_bottom(2.0, [1.0; 4])
+            .border(1.0, [0.5; 4])
+            .build();
+        assert_eq!(n.style.border_sides, BorderSides::ALL);
+        assert_eq!(n.style.border_width, 1.0);
+    }
+
+    #[test]
+    fn remove_subtree_drops_descendants_in_preorder() {
+        let mut t = NodeTree::new();
+        let root = t.add_root(Node::rect().build());
+        let a = t.add_child(root, Node::rect().build());
+        let b = t.add_child(root, Node::rect().build());
+        let aa = t.add_child(a, Node::rect().build());
+        let ab = t.add_child(a, Node::rect().build());
+        // Pre-order DFS: [a, aa, ab].
+        let dropped = t.remove_subtree(a);
+        assert_eq!(dropped, vec![a, aa, ab]);
+        assert!(t.get(a).is_none());
+        assert!(t.get(aa).is_none());
+        assert!(t.get(ab).is_none());
+        // Root + sibling untouched.
+        assert!(t.get(root).is_some());
+        assert!(t.get(b).is_some());
+    }
+
+    #[test]
+    fn remove_subtree_prunes_parent_children_list() {
+        let mut t = NodeTree::new();
+        let root = t.add_root(Node::rect().build());
+        let a = t.add_child(root, Node::rect().build());
+        let b = t.add_child(root, Node::rect().build());
+        assert_eq!(t.get(root).unwrap().children, vec![a, b]);
+        let _ = t.remove_subtree(a);
+        assert_eq!(t.get(root).unwrap().children, vec![b]);
+    }
+
+    #[test]
+    fn remove_subtree_on_root_removes_from_roots() {
+        let mut t = NodeTree::new();
+        let r1 = t.add_root(Node::rect().build());
+        let r2 = t.add_root(Node::rect().build());
+        let _child = t.add_child(r1, Node::rect().build());
+        let dropped = t.remove_subtree(r1);
+        assert_eq!(dropped.len(), 2);
+        // r2 still alive.
+        assert!(t.get(r2).is_some());
+        // r1 detached from roots.
+        let _ = t.add_root(Node::rect().build()); // smoke — shouldn't panic
+    }
+
+    #[test]
+    fn remove_subtree_handles_stale_id() {
+        let mut t = NodeTree::new();
+        let id = t.add_root(Node::rect().build());
+        let _ = t.remove_subtree(id);
+        // Second remove on the same id is a noop.
+        let dropped2 = t.remove_subtree(id);
+        assert!(dropped2.is_empty());
+    }
+
+    #[test]
+    fn remove_subtree_decrements_glass_count() {
+        let mut t = NodeTree::new();
+        let r = t.add_root(Node::rect().build());
+        let _g1 = t.add_child(r, Node::glass().build());
+        let _g2 = t.add_child(r, Node::glass().build());
+        assert!(t.has_glass());
+        // Drop the whole subtree including 2 glass nodes.
+        let _ = t.remove_subtree(r);
+        assert!(!t.has_glass());
+    }
+
+    #[test]
     fn glass_count_tracks_inserts_and_removes() {
         let mut t = NodeTree::new();
         assert!(!t.has_glass());
@@ -2358,15 +3153,26 @@ mod tests {
     }
 
     #[test]
-    fn layout_setter_flags_backdrop_with_glass() {
+    fn layout_setter_flags_backdrop_only_for_blur_source() {
         let mut t = NodeTree::new();
-        let id = t.add_root(Node::rect().build());
+        // Front-of-glass node (default): layout change → TRANSFORM, no
+        // BACKDROP (it can't alter the blur, so no re-blur).
+        let fg = t.add_root(Node::rect().build());
+        // blur_source node (behind glass): layout change → also BACKDROP.
+        let bg = t.add_root(Node::rect().blur_source().build());
         let _g = t.add_root(Node::glass().build());
+
         t.take_dirty();
-        t.set_layout_width(id, Len::Px(50.0));
+        t.set_layout_width(fg, Len::Px(50.0));
         let d = t.dirty_for_test();
         assert!(d & dirty::TRANSFORM != 0);
-        assert!(d & dirty::BACKDROP != 0);
+        assert!(d & dirty::BACKDROP == 0, "front-of-glass layout must not re-blur");
+
+        t.take_dirty();
+        t.set_layout_width(bg, Len::Px(60.0));
+        let d = t.dirty_for_test();
+        assert!(d & dirty::TRANSFORM != 0);
+        assert!(d & dirty::BACKDROP != 0, "blur_source layout must re-blur");
     }
 
     #[test]
@@ -2453,6 +3259,46 @@ mod tests {
         assert!(
             d & dirty::BACKDROP == 0,
             "glass color change doesn't enter the backdrop"
+        );
+    }
+
+    #[test]
+    fn set_color_on_image_behind_glass_flags_backdrop() {
+        // A full-window album-art Image sitting behind a glass overlay
+        // IS part of the blurred backdrop. Changing its alpha (a
+        // crossfade) must flag BACKDROP so the blur pass re-runs —
+        // otherwise the glass shows a stale snapshot until some unrelated
+        // opaque change invalidates it (the "snaps on hover" bug).
+        let mut t = NodeTree::new();
+        // Opt the backdrop image in via `blur_source`; only then does its
+        // colour change re-run the blur.
+        let img = t.add_root(Node::image(crate::gpu::ImageHandle(0)).blur_source().build());
+        let _glass = t.add_root(Node::glass().build());
+        t.take_dirty();
+        t.set_color(img, [1.0, 1.0, 1.0, 0.5]);
+        let d = t.dirty_for_test();
+        assert!(d & dirty::VISUAL != 0);
+        assert!(
+            d & dirty::BACKDROP != 0,
+            "blur_source image color change must re-run the blur"
+        );
+    }
+
+    #[test]
+    fn set_color_on_non_blur_source_skips_backdrop_even_with_glass() {
+        // A front-of-glass node (default, not blur_source) must NOT
+        // re-blur on recolour, even when glass exists — this is what
+        // keeps scroll/progress/accent updates off the blur path.
+        let mut t = NodeTree::new();
+        let fg = t.add_root(Node::rect().build());
+        let _glass = t.add_root(Node::glass().build());
+        t.take_dirty();
+        t.set_color(fg, [0.2, 0.2, 0.2, 1.0]);
+        let d = t.dirty_for_test();
+        assert!(d & dirty::VISUAL != 0);
+        assert!(
+            d & dirty::BACKDROP == 0,
+            "front-of-glass recolour must not re-run the blur"
         );
     }
 

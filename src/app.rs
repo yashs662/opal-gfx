@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 use crate::anim::Timeline;
@@ -44,7 +44,10 @@ use crate::debug;
 use crate::gpu::{FrameStats, GpuContext, ImageHandle, ShapeInstance};
 use crate::input::InputState;
 use crate::node::{FlatEvent, HitEntry, ScrollAxis, ScrollHit, ScrollbarHit, WindowAction};
-use crate::scene::{ColorBindSlot, PositionBindSlot, Scene, SceneCtx, SizeBindSlot};
+use crate::scene::{
+    ColorBindSlot, ImageBindSlot, PositionBindSlot, Scene, SceneCtx, SizeBindSlot, TextBindSlot,
+    WidthPctBindSlot,
+};
 
 /// Pixel band on each window edge that triggers a system resize-drag
 /// instead of a normal click. 6 px matches Windows' frameless feel.
@@ -57,6 +60,11 @@ const RESIZE_GUTTER: f32 = 6.0;
 const BIND_TWEEN_KEY_COLOR: u32 = 0xC000_0000;
 const BIND_TWEEN_KEY_POSITION: u32 = 0xC100_0000;
 const BIND_TWEEN_KEY_SIZE: u32 = 0xC200_0000;
+/// Dedicated tween key for the drag-follow snap-back animation. Lives
+/// above the bind-tween windows so it can never alias a slot tween.
+const DRAG_RETURN_TWEEN_KEY: u32 = 0xD000_0000;
+/// Snap-back duration when a dragged node returns to its resting slot.
+const DRAG_RETURN_MS: u64 = 160;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -121,6 +129,24 @@ pub type HeadlessFn = Box<dyn FnOnce(&mut HeadlessHelper)>;
 /// flushes the tree, and requests a redraw if anything changed.
 pub type KeyFn = Box<dyn FnMut(KeyCode, ElementState, &mut SceneCtx)>;
 
+/// Optional per-frame hook. Fires once per `about_to_wait` iteration
+/// — i.e. on every wake-up from input, animation tick, or scheduled
+/// wait. Use for driving custom animations that read from `Signal`s
+/// or mutate the tree on a schedule (e.g. interpolating a lazy-list
+/// row height between click-to-expand and click-to-collapse). Gets
+/// access to the timeline so it can poll active tweens or start new
+/// ones.
+pub type FrameFn = Box<dyn FnMut(&mut SceneCtx, &mut crate::anim::Timeline, Instant)>;
+
+/// Optional outside-press hook. Fires on a left-button
+/// **press** that lands on no interactive node — or on a node tagged
+/// [`crate::node::Node::dismiss_transparent`] (a modal / context-menu
+/// scrim that blocks click-through yet should still dismiss). The
+/// canonical dismiss path for floating layers: the handler flips the
+/// layer's visibility `Signal` (+ rebuild token) and the press never
+/// reaches whatever is behind. After it returns the shell reacts.
+pub type UnhandledPressFn = Box<dyn FnMut(&mut SceneCtx)>;
+
 pub struct App {
     config: AppConfig,
     ctx: SceneCtx,
@@ -143,6 +169,25 @@ pub struct App {
     /// latest pointer here and let `about_to_wait` apply it at frame
     /// rate via `set_scroll_immediate`.
     pending_drag_cursor: Option<[f32; 2]>,
+    /// Generic-drag bookkeeping. `drag_origin` is the
+    /// cursor at press on a draggable node; `drag_last` is the cursor at
+    /// the previous `on_drag` fire (so `DragCtx::delta` is per-event).
+    /// Both clear on release / capture loss.
+    drag_origin: Option<[f32; 2]>,
+    drag_last: Option<[f32; 2]>,
+    /// In-flight drag-and-drop payload. Latched from the pressed node's
+    /// `drag_payload`; delivered to a drop target on release.
+    drag_payload: Option<std::rc::Rc<dyn std::any::Any>>,
+    /// Node currently animating back to its resting slot after a
+    /// `drag_follow` release. The timeline tweens `drag_return_offset`
+    /// toward `[0,0]`; `tick_drag_return` mirrors it into the tree's
+    /// drag-follow offset each frame and clears the lift when it lands.
+    drag_return: Option<crate::node::NodeId>,
+    drag_return_offset: crate::signal::Signal<[f32; 2]>,
+    /// System clipboard handle, lazily created on first copy / cut /
+    /// paste. `None` if arboard init failed (headless / no display) — the
+    /// editor still works, clipboard ops just no-op.
+    clipboard: Option<arboard::Clipboard>,
     /// Latched modifier state from `WindowEvent::ModifiersChanged`.
     /// Consulted by wheel routing for shift-axis swap.
     modifiers: winit::event::Modifiers,
@@ -159,6 +204,8 @@ pub struct App {
     input: InputState,
     timeline: Timeline,
     on_key: Option<KeyFn>,
+    on_frame: Option<FrameFn>,
+    on_unhandled_press: Option<UnhandledPressFn>,
     headless: Option<HeadlessFn>,
     /// Number of still frames to capture and exit after, or `None` for
     /// a normal interactive run. `Some(n)` triggers headless capture
@@ -227,13 +274,96 @@ pub struct App {
     /// allocates handles sequentially from 0, so the two stay in
     /// lock-step as long as we drain in order.
     staged_images: Vec<StagedImage>,
+    /// Stored scene builder. `App::scene` runs the closure once
+    /// immediately and stashes it here so [`App::rebuild_scene`] can
+    /// re-invoke it after clearing the tree — the canonical way to
+    /// swap views (Library ⇄ Search) without leaking bind slots or
+    /// timeline tweens. `FnMut` rather than `FnOnce` because rebuilds
+    /// may fire many times over the app's lifetime; captured state
+    /// must be re-usable.
+    scene_builder: Option<Box<dyn FnMut(&mut Scene)>>,
+    /// Cooperative rebuild signal. Closures (e.g. `on_click` handlers)
+    /// can't reach `&mut App` to call `rebuild_scene` directly — they
+    /// own a clone of this `Rc<Cell<bool>>` via [`App::rebuild_token`]
+    /// and flip it to `true`. The shell consumes the flag at the top
+    /// of `about_to_wait` and triggers the rebuild before the next
+    /// frame. Cleared atomically via `replace(false)` so a handler
+    /// firing during the rebuild itself queues a fresh one.
+    rebuild_request: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Hover-dwell tracker. At most one node is hovered (input
+    /// pin), so a single slot is enough. `node` is the currently-armed
+    /// dwell target, `deadline` is when its handler should fire,
+    /// `fired` flips true once the handler has run so we don't refire
+    /// from cursor jitter inside the same node.
+    dwell: Option<DwellTracker>,
+    /// External-wake plumbing for the case where the event loop is
+    /// parked on `Wait` (no animation / scroll / dwell) and another
+    /// thread (e.g. a worker delivering an async result) needs the UI
+    /// to tick `on_frame` so it can drain a response channel. The
+    /// `flag` is set by [`WakeHandle::wake`]; `about_to_wait` reads
+    /// (and clears) it at the top of every iteration. The proxy wakes
+    /// winit so we *get* to the next `about_to_wait` instead of
+    /// sleeping until input.
+    wake: Arc<WakeHandle>,
+    /// Cross-thread image upload queue. Drained on `about_to_wait`.
+    /// Shares the `wake` handle so an enqueue from a worker thread also
+    /// wakes the parked event loop.
+    uploader: Arc<crate::uploader::Uploader>,
     // Lazy:
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
 }
 
+/// External wake-up token. Clone into any thread that needs to nudge
+/// the UI event loop out of `ControlFlow::Wait` — e.g. a worker that
+/// just delivered a response on an `mpsc::Receiver` the UI thread
+/// polls in [`App::on_frame`]. Calling [`WakeHandle::wake`] guarantees
+/// the next `about_to_wait` tick fires the on-frame hook.
+pub struct WakeHandle {
+    flag: std::sync::atomic::AtomicBool,
+    /// Set by `App::run` after the event loop is constructed. `OnceLock`
+    /// keeps the no-proxy-yet window safe (e.g. if a worker fires a
+    /// wake before `run` was called — the flag still flips, the next
+    /// `about_to_wait` after run starts will observe it).
+    proxy: std::sync::OnceLock<EventLoopProxy<()>>,
+}
+
+impl WakeHandle {
+    fn new() -> Self {
+        Self {
+            flag: std::sync::atomic::AtomicBool::new(false),
+            proxy: std::sync::OnceLock::new(),
+        }
+    }
+    /// Flip the wake flag and (if `App::run` has begun) nudge winit so
+    /// the loop returns from `Wait` to fire `about_to_wait`. Safe to
+    /// call from any thread. No-op when the proxy isn't installed yet —
+    /// the flag still latches so the next tick observes it.
+    pub fn wake(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(p) = self.proxy.get() {
+            // Send a no-op user event; the empty payload is enough to
+            // wake the loop. If the receiver is gone (window closing),
+            // the error is harmless.
+            let _ = p.send_event(());
+        }
+    }
+    /// Atomically read + clear the flag.
+    fn take(&self) -> bool {
+        self.flag.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DwellTracker {
+    node: crate::node::NodeId,
+    deadline: Instant,
+    fired: bool,
+}
+
 impl App {
     pub fn new(title: impl Into<String>, width: u32, height: u32) -> Self {
+        let wake = Arc::new(WakeHandle::new());
         Self {
             config: AppConfig::new(title, width, height),
             ctx: SceneCtx::new(),
@@ -245,11 +375,19 @@ impl App {
             scroll_bars: Vec::new(),
             bar_drag: None,
             pending_drag_cursor: None,
+            drag_origin: None,
+            drag_last: None,
+            drag_payload: None,
+            drag_return: None,
+            drag_return_offset: crate::signal::Signal::new([0.0, 0.0]),
+            clipboard: None,
             modifiers: winit::event::Modifiers::default(),
             held_scroll_keys: std::collections::HashSet::new(),
             input: InputState::new(),
             timeline: Timeline::new(),
             on_key: None,
+            on_frame: None,
+            on_unhandled_press: None,
             headless: None,
             capture_frames: None,
             last_dirty_mask: 0,
@@ -265,9 +403,48 @@ impl App {
             last_scroll_tick: None,
             last_hud_refresh: None,
             staged_images: Vec::new(),
+            scene_builder: None,
+            rebuild_request: std::rc::Rc::new(std::cell::Cell::new(false)),
+            dwell: None,
+            wake: wake.clone(),
+            uploader: crate::uploader::Uploader::new(wake),
             window: None,
             gpu: None,
         }
+    }
+
+    /// Get a clone of the rebuild-request token. Pass into closures
+    /// that want to trigger a scene rebuild — calling `.set(true)` on
+    /// the returned `Rc<Cell<bool>>` schedules a rebuild at the top of
+    /// the next event loop iteration.
+    ///
+    /// ```ignore
+    /// let rebuild = app.rebuild_token();
+    /// let view = view_sig.clone();
+    /// some_button.on_click(move |_| {
+    ///     view.set(View::Search);
+    ///     rebuild.set(true);
+    /// });
+    /// ```
+    pub fn rebuild_token(&self) -> std::rc::Rc<std::cell::Cell<bool>> {
+        self.rebuild_request.clone()
+    }
+
+    /// Get a clone of the cross-thread wake handle. Pass into worker
+    /// threads so they can nudge the UI loop out of `ControlFlow::Wait`
+    /// after delivering a response on an `mpsc` channel the UI polls
+    /// in [`Self::on_frame`]. Without this, a `Wait`-parked loop never
+    /// sees the response until the user moves the mouse.
+    pub fn wake_handle(&self) -> Arc<WakeHandle> {
+        self.wake.clone()
+    }
+
+    /// Get a clone of the cross-thread image upload token. Pass to any
+    /// worker that needs to ship decoded RGBA bytes onto the GPU at
+    /// runtime — e.g. album art or remote avatars. See
+    /// [`crate::Uploader`] for the threading model.
+    pub fn uploader(&self) -> Arc<crate::uploader::Uploader> {
+        self.uploader.clone()
     }
 
     /// Stage a PNG byte slice for upload to the image atlas. Returns
@@ -281,6 +458,18 @@ impl App {
         ImageHandle(id)
     }
 
+    /// Stage an SVG byte slice. Rasterized at `px × px` physical pixels
+    /// via [`crate::svg::rasterize_svg`] and queued for upload alongside
+    /// PNG / RGBA stages. Pick `px` to over-sample your largest expected
+    /// display size — the image atlas bilinear-downsamples for smaller
+    /// draws without re-rasterizing.
+    ///
+    /// `include_bytes!(...)` is the typical source.
+    pub fn stage_image_svg(&mut self, bytes: &[u8], px: u32) -> ImageHandle {
+        let rgba = crate::svg::rasterize_svg(bytes, px);
+        self.stage_image_rgba(px, px, rgba)
+    }
+
     /// Stage pre-decoded `Rgba8UnormSrgb` pixels (`w*h*4` bytes,
     /// row-major, top-left origin). Same scheduling as
     /// [`Self::stage_image_png`].
@@ -291,12 +480,17 @@ impl App {
         ImageHandle(id)
     }
 
-    /// Run the user-supplied scene builder. Mutates the inner
-    /// `SceneCtx` immediately — by the time `run` is called the tree
-    /// and the bind registry are fully populated.
-    pub fn scene<F: FnOnce(&mut Scene)>(mut self, f: F) -> Self {
-        let mut scene = Scene::root(&mut self.ctx);
-        f(&mut scene);
+    /// Install the scene builder. Runs the closure once immediately
+    /// against the empty `SceneCtx` (preserving existing one-shot
+    /// behavior) and stashes it for future [`App::rebuild_scene`]
+    /// calls. The closure must be `FnMut` since rebuilds may fire
+    /// repeatedly — capture signals + handles by clone, not by move.
+    pub fn scene<F: FnMut(&mut Scene) + 'static>(mut self, mut f: F) -> Self {
+        {
+            let mut scene = Scene::root(&mut self.ctx);
+            f(&mut scene);
+        }
+        self.scene_builder = Some(Box::new(f));
         self
     }
 
@@ -308,6 +502,30 @@ impl App {
         f: F,
     ) -> Self {
         self.on_key = Some(Box::new(f));
+        self
+    }
+
+    /// Provide a closure invoked once per `about_to_wait` iteration —
+    /// the per-frame hook for custom animations that need to interpolate
+    /// state over time (e.g. lazy-list row heights). The shell calls
+    /// it after consuming the rebuild token and before the timeline
+    /// tick, so any tree mutations the closure makes ride this frame.
+    /// `now` is the wall-clock at the start of the iteration.
+    pub fn on_frame<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&mut SceneCtx, &mut crate::anim::Timeline, Instant) + 'static,
+    {
+        self.on_frame = Some(Box::new(f));
+        self
+    }
+
+    /// Register the outside-press hook. Fires on a
+    /// left-button press that lands on no interactive node, or on a
+    /// node tagged [`crate::scene::NodeBuilderRef::dismiss_transparent`].
+    /// The canonical dismiss driver for modals + context menus: flip the
+    /// layer's visibility signal in the closure and request a rebuild.
+    pub fn on_unhandled_press<F: FnMut(&mut SceneCtx) + 'static>(mut self, f: F) -> Self {
+        self.on_unhandled_press = Some(Box::new(f));
         self
     }
 
@@ -387,6 +605,11 @@ impl App {
     /// headless script exits.
     pub fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
         let event_loop = EventLoop::new()?;
+        // Install the wake proxy now that the loop exists. Any
+        // `WakeHandle::wake` calls from worker threads from this point
+        // forward will deliver an empty UserEvent that breaks the
+        // loop out of `Wait`.
+        let _ = self.wake.proxy.set(event_loop.create_proxy());
         event_loop.run_app(&mut self)?;
         Ok(())
     }
@@ -395,19 +618,53 @@ impl App {
 
     /// Re-flatten + upload the tree if any dirty flag is set.
     fn flush_tree(&mut self) -> bool {
+        // Refresh text-field display strings (value ↔ placeholder
+        // swap on focus change / value clear) **before** `take_dirty`
+        // so any text mutations made here ride this flush rather than
+        // queuing a follow-up. `set_text` is idempotent — no-op when
+        // content is unchanged — so this is cheap on idle frames.
+        self.refresh_text_fields();
         let mask = self.ctx.tree.take_dirty();
         if mask == 0 {
             return false;
         }
         self.last_dirty_mask = mask;
-        if mask & (crate::node::dirty::TREE | crate::node::dirty::TRANSFORM) != 0 {
-            let viewport = self.viewport();
+        // Rebuild prefix-sum tables for any variable-height lazy
+        // lists whose heights have moved. compute_layout's
+        // `content_size` override + materialize's `visible_window`
+        // both read from `total_height_logical()` / `prefix`, so
+        // those need to be current before either runs.
+        self.ensure_lazy_list_prefixes();
+        let needs_initial_layout =
+            mask & (crate::node::dirty::TREE | crate::node::dirty::TRANSFORM) != 0;
+        let viewport = self.viewport();
+        if needs_initial_layout {
             crate::layout::compute_layout(
                 &mut self.ctx.tree,
                 viewport,
                 &mut self.ctx.text,
                 self.scale_factor,
             );
+        }
+        // Lazy-list materialization runs whenever the tree is touched
+        // — including SCROLL-only flushes, since scrolling can cross a
+        // row boundary and bring new rows into view. Internally gated
+        // on `(new_range, version)` so idle frames cost nothing.
+        if self.materialize_lazy_lists() {
+            crate::layout::compute_layout(
+                &mut self.ctx.tree,
+                viewport,
+                &mut self.ctx.text,
+                self.scale_factor,
+            );
+        }
+        if needs_initial_layout {
+            // Post-layout caret + visibility sync. Editor caret rects
+            // depend on the text-child's post-layout rect, so this
+            // MUST run after `compute_layout` and BEFORE
+            // `flatten_into_buffers` (which snapshots `rect` +
+            // `visible` into instances).
+            self.reposition_carets();
         }
         self.ctx.tree.flatten_into_buffers(
             self.scale_factor,
@@ -501,6 +758,67 @@ impl App {
         self.gpu.as_ref().map(|g| g.memory_report())
     }
 
+    /// Drain the `Uploader` queue: perform each pending RGBA upload on
+    /// the UI thread (where the GPU lives) and fire the caller's
+    /// completion callback with the resolved [`ImageHandle`]. No-op when
+    /// the queue is empty. Called from `about_to_wait`.
+    fn drain_image_uploads(&mut self) {
+        let pending = self.uploader.drain();
+        if pending.is_empty() {
+            return;
+        }
+        for p in pending {
+            let handle = self.upload_image_rgba(p.w, p.h, &p.bytes);
+            (p.cb)(handle);
+        }
+    }
+
+    /// Runtime image upload (post-GPU-init). Unlike [`stage_image_*`]
+    /// — which queues bytes until first frame — this uploads
+    /// immediately into the live atlas. Returns `None` if the GPU
+    /// isn't initialised yet, the input dims are invalid, or the
+    /// image is larger than the atlas itself.
+    ///
+    /// When the atlas is full, walks the tree for live image handles,
+    /// drops sources for any handle no longer referenced, repacks the
+    /// survivors into a fresh atlas layout, then retries the upload
+    /// once. The repack updates every surviving handle's UVs in place
+    /// — flatten + instance rebuild on the next frame picks them up
+    /// automatically (TREE/TRANSFORM dirty flags are set by this
+    /// method to force one).
+    pub fn upload_image_rgba(
+        &mut self,
+        w: u32,
+        h: u32,
+        bytes: &[u8],
+    ) -> Option<crate::gpu::ImageHandle> {
+        let live = collect_live_image_handles(&self.ctx.tree);
+        let gpu = self.gpu.as_mut()?;
+        let handle = gpu
+            .image_atlas
+            .upload_rgba_or_evict(&gpu.queue, w, h, bytes, &live)?;
+        // Force a re-flatten so any node still pointing at a handle
+        // whose UV moved during rebuild rebuilds its instance with
+        // the fresh atlas slot.
+        self.ctx.tree.mark_all_dirty();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+        Some(handle)
+    }
+
+    /// Runtime SVG upload. Rasterizes `bytes` to `px × px` and forwards
+    /// to [`Self::upload_image_rgba`]. Same eviction semantics — over a
+    /// full atlas, walks the tree for live handles and repacks survivors.
+    pub fn upload_image_svg(
+        &mut self,
+        bytes: &[u8],
+        px: u32,
+    ) -> Option<crate::gpu::ImageHandle> {
+        let rgba = crate::svg::rasterize_svg(bytes, px);
+        self.upload_image_rgba(px, px, &rgba)
+    }
+
     /// Combine the renderer's GPU stats with the app-side CPU + dirty mask.
     pub fn current_stats(&self) -> FrameStats {
         let mut s = self
@@ -534,23 +852,26 @@ impl App {
             &mut self.timeline,
             now,
         );
+        process_image_binds(&mut self.ctx.binds.image, &mut self.ctx.tree);
+        process_text_binds(&mut self.ctx.binds.text, &mut self.ctx.tree);
+        process_width_pct_binds(&mut self.ctx.binds.width_pct, &mut self.ctx.tree);
     }
 
     /// For animated binds, copy the current `displayed` signal value
     /// (driven by the timeline) into the tree. Called after every
     /// timeline tick.
     fn pump_animated_displays(&mut self) {
-        for slot in &self.ctx.binds.color {
+        for slot in self.ctx.binds.color.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_color(slot.node_id, disp.get());
             }
         }
-        for slot in &self.ctx.binds.position {
+        for slot in self.ctx.binds.position.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_layout_pos_abs(slot.node_id, disp.get());
             }
         }
-        for slot in &self.ctx.binds.size {
+        for slot in self.ctx.binds.size.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_layout_size_px(slot.node_id, disp.get());
             }
@@ -564,6 +885,899 @@ impl App {
         self.pump_animated_displays();
         if self.flush_tree() {
             self.request_redraw();
+        }
+    }
+
+    /// Re-sync the hover-dwell tracker against the current hovered
+    /// node. Called after any input event that may have changed
+    /// `input.hovered`. If the hovered node owns a dwell handler and
+    /// either no tracker is armed or the tracker points at a different
+    /// node, arm a fresh deadline. If the hovered node has no dwell
+    /// handler (or no node is hovered), clear the tracker. Idempotent
+    /// while hover stays on the same dwell-handler-bearing node.
+    fn refresh_dwell(&mut self, now: Instant) {
+        let hovered_dwell = self
+            .input
+            .hovered
+            .and_then(|id| self.ctx.tree.get(id).and_then(|n| n.on_hover_dwell.as_ref().map(|(d, _)| (id, *d))));
+        match (hovered_dwell, self.dwell) {
+            (None, _) => self.dwell = None,
+            (Some((id, duration)), Some(tracker)) if tracker.node == id => {
+                // Same node — keep existing armed deadline (no reset
+                // on micro cursor moves over the same node).
+                let _ = duration;
+            }
+            (Some((id, duration)), _) => {
+                self.dwell = Some(DwellTracker {
+                    node: id,
+                    deadline: now + duration,
+                    fired: false,
+                });
+            }
+        }
+    }
+
+    /// If a dwell deadline has elapsed and not yet fired, invoke the
+    /// node's handler and mark fired. Returns true if a handler ran
+    /// (caller should `react()`).
+    fn tick_dwell(&mut self, now: Instant) -> bool {
+        let Some(tracker) = self.dwell else { return false };
+        if tracker.fired || now < tracker.deadline {
+            return false;
+        }
+        // Confirm hover is still on the tracker's node.
+        if self.input.hovered != Some(tracker.node) {
+            self.dwell = None;
+            return false;
+        }
+        let handler = self
+            .ctx
+            .tree
+            .get(tracker.node)
+            .and_then(|n| n.on_hover_dwell.as_ref().map(|(_, h)| h.clone()));
+        let Some(h) = handler else {
+            self.dwell = None;
+            return false;
+        };
+        // Mark fired *before* invoking so a handler that mutates the
+        // tree (and triggers a flush re-evaluating hover) doesn't
+        // re-enter and double-fire.
+        if let Some(t) = self.dwell.as_mut() {
+            t.fired = true;
+        }
+        let mut ectx = crate::event::EventCtx {
+            tree: &mut self.ctx.tree,
+            timeline: &mut self.timeline,
+            node: tracker.node,
+            now,
+        };
+        h(&mut ectx);
+        true
+    }
+
+    /// Drop a node and every descendant, cleaning up bind slots, named
+    /// references, and any in-flight tweens that targeted them. The
+    /// scene rebuilds its instance stream on the next flush. Use this
+    /// for dynamic UIs — track-list refresh, view-routing, modal
+    /// dismiss. Returns the same [`crate::scene::SubtreeRemoval`] as
+    /// `SceneCtx::remove_subtree`; most callers ignore it.
+    pub fn remove_subtree(&mut self, id: crate::node::NodeId) -> crate::scene::SubtreeRemoval {
+        let removal = self.ctx.remove_subtree(id);
+        stop_tweens_for_removal(&mut self.timeline, &removal);
+        if self.flush_tree() {
+            self.request_redraw();
+        }
+        removal
+    }
+
+    /// Apply an [`crate::editor::EditOp`] to the editor on `node_id`.
+    /// Handles the full ripple: edit state mutation → text-child
+    /// `set_text` → `on_change` fire → caret reposition (deferred to
+    /// the next `flush_tree`) → `on_submit` fire → react.
+    ///
+    /// No-op if `node_id` has no editor.
+    fn apply_edit(&mut self, node_id: crate::node::NodeId, op: crate::editor::EditOp) {
+        // Step 1: apply op + capture every piece of post-edit state we
+        // need below. Done in a scoped block so the &mut editor borrow
+        // releases before subsequent tree mutations.
+        let (mut outcome, new_value, on_change, on_submit, text_node) = {
+            let Some(node) = self.ctx.tree.get_mut_raw(node_id) else {
+                return;
+            };
+            let Some(ed) = node.editor.as_mut() else {
+                return;
+            };
+            let outcome = crate::editor::apply(op, ed);
+            (
+                outcome,
+                ed.value.clone(),
+                ed.on_change.clone(),
+                ed.on_submit.clone(),
+                ed.text_node,
+            )
+        };
+
+        // Clipboard write (Copy / Cut). Best-effort — a failed arboard
+        // init just drops the write; the edit (Cut's delete) still ran.
+        if let Some(text) = outcome.clipboard_write.take() {
+            self.write_clipboard(text);
+        }
+
+        // Step 2: refresh the text child node's content. Marks
+        // VISUAL | TRANSFORM so the layout pass re-measures + re-shapes
+        // on the next flush.
+        if outcome.value_changed {
+            self.ctx.tree.set_text(text_node, new_value.as_str());
+        }
+
+        // Step 3: fire user callbacks. `on_change` runs with all
+        // exclusive borrows released; `on_submit` re-borrows the tree
+        // (EventCtx) so the user can drive sibling state in response
+        // to Enter.
+        if outcome.value_changed
+            && let Some(cb) = on_change {
+                cb(&new_value);
+            }
+        if outcome.submitted
+            && let Some(h) = on_submit {
+                let mut ectx = crate::event::EventCtx {
+                    tree: &mut self.ctx.tree,
+                    timeline: &mut self.timeline,
+                    node: node_id,
+                    now: Instant::now(),
+                };
+                h(&mut ectx);
+            }
+
+        // Step 4: react — runs bind processing + pumps animated
+        // displays + flushes the tree (which calls reposition_carets
+        // post-layout via flush_tree).
+        if outcome.any() {
+            // Cursor moves + selection changes without a value change
+            // still want a re-render so the caret / highlight reposition.
+            // The TRANSFORM flag isn't auto-set by those — set it here.
+            if (outcome.cursor_moved || outcome.selection_changed) && !outcome.value_changed {
+                self.ctx.tree.mark_transform_dirty();
+            }
+            self.react();
+        }
+    }
+
+    /// Lazily init the system clipboard and write `text`. Best-effort:
+    /// silently drops the write if arboard can't init (headless / no
+    /// display) or the set call fails.
+    fn write_clipboard(&mut self, text: String) {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(text);
+        }
+    }
+
+    /// Lazily init the system clipboard and read its text. Returns an
+    /// empty string when unavailable.
+    fn read_clipboard(&mut self) -> String {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        self.clipboard
+            .as_mut()
+            .and_then(|cb| cb.get_text().ok())
+            .unwrap_or_default()
+    }
+
+    /// Rebuild every lazy-list's prefix-sum table if its heights have
+    /// changed since last seen. Runs before `compute_layout` so the
+    /// layout pass can read `total_height_logical()` for its
+    /// `content_size` override and `visible_window` for the materialize
+    /// pass below. Each list's `ensure_prefix_fresh` is internally
+    /// gated on `heights_version` — idle frames cost nothing.
+    fn ensure_lazy_list_prefixes(&mut self) {
+        let lazy_ids: Vec<crate::node::NodeId> = self
+            .ctx
+            .tree
+            .iter_ids()
+            .filter(|id| {
+                self.ctx
+                    .tree
+                    .get(*id)
+                    .map(|n| n.lazy_list.is_some())
+                    .unwrap_or(false)
+            })
+            .collect();
+        for id in lazy_ids {
+            if let Some(n) = self.ctx.tree.get_mut_raw(id)
+                && let Some(ll) = n.lazy_list.as_mut() {
+                    ll.ensure_prefix_fresh();
+                }
+        }
+    }
+
+    /// Walk lazy-list nodes and reconcile their materialized children
+    /// with the current visible window. Removes children that have
+    /// scrolled off; invokes the render closure once per row newly
+    /// in view (or when the list's version was bumped). Returns true
+    /// if any list mutated its children — caller (`flush_tree`) uses
+    /// this to decide whether a second layout pass is needed.
+    fn materialize_lazy_lists(&mut self) -> bool {
+        let lazy_ids: Vec<crate::node::NodeId> = self
+            .ctx
+            .tree
+            .iter_ids()
+            .filter(|id| {
+                self.ctx
+                    .tree
+                    .get(*id)
+                    .map(|n| n.lazy_list.is_some())
+                    .unwrap_or(false)
+            })
+            .collect();
+        if lazy_ids.is_empty() {
+            return false;
+        }
+
+        let scale = self.scale_factor;
+        let mut any_changed = false;
+
+        for list_id in lazy_ids {
+            // Snapshot per-list state. `render` is an `Rc<dyn Fn>`;
+            // the clone is cheap. Drop the &mut tree borrow before
+            // invoking it (the closure spawns children, re-borrowing
+            // the tree).
+            let (render, prev_range, prev_materialized,
+                 current_version, last_seen_version,
+                 current_heights_version, last_seen_heights_version) = {
+                let Some(n) = self.ctx.tree.get(list_id) else { continue };
+                let Some(ll) = n.lazy_list.as_ref() else { continue };
+                (
+                    ll.render.clone(),
+                    ll.range,
+                    ll.materialized.clone(),
+                    ll.version,
+                    ll.last_seen_version,
+                    ll.heights_version,
+                    ll.last_heights_version,
+                )
+            };
+
+            // The list is its own scroll container; read viewport
+            // size + scroll offset from its rect + ScrollState.
+            let (scroll_top, viewport_h) = {
+                let Some(n) = self.ctx.tree.get(list_id) else { continue };
+                let scroll_top = n.scroll.as_ref().map(|s| s.current[1]).unwrap_or(0.0);
+                let viewport_h = n.rect[3];
+                (scroll_top, viewport_h)
+            };
+
+            let new_range = {
+                let Some(n) = self.ctx.tree.get(list_id) else { continue };
+                let ll = n.lazy_list.as_ref().unwrap();
+                ll.visible_window(scroll_top, viewport_h, scale)
+            };
+
+            // Detect "needs re-position only" (heights changed but
+            // window still covers the same rows). When this is the
+            // case, skip the remove+render cycle and just rewrite
+            // the abs offsets of the existing materialized children.
+            let window_unchanged = new_range == prev_range;
+            let version_changed = current_version != last_seen_version;
+            let heights_changed = current_heights_version != last_seen_heights_version;
+            let _ = last_seen_heights_version;
+            if window_unchanged && !version_changed && !heights_changed {
+                continue;
+            }
+            if window_unchanged && !version_changed && heights_changed {
+                // Reposition existing rows in-place from the fresh
+                // prefix table — much cheaper than full re-render.
+                let mut any_moved = false;
+                for (k, child_id) in prev_materialized.iter().enumerate() {
+                    let i = new_range[0] + k as u32;
+                    let top = self
+                        .ctx
+                        .tree
+                        .get(list_id)
+                        .and_then(|n| n.lazy_list.as_ref())
+                        .map(|ll| ll.row_top_logical(i))
+                        .unwrap_or(0.0);
+                    if let Some(c) = self.ctx.tree.get_mut_raw(*child_id)
+                        && c.layout.abs != Some([0.0, top]) {
+                            c.layout.abs = Some([0.0, top]);
+                            any_moved = true;
+                        }
+                }
+                if let Some(n) = self.ctx.tree.get_mut_raw(list_id)
+                    && let Some(ll) = n.lazy_list.as_mut() {
+                        ll.last_heights_version = current_heights_version;
+                    }
+                if any_moved {
+                    any_changed = true;
+                }
+                continue;
+            }
+
+            // Remove the previous materialized set. Each removal
+            // walks descendant children, tombstones binds, and stops
+            // matching tweens.
+            for child_id in &prev_materialized {
+                let removal = self.ctx.remove_subtree(*child_id);
+                stop_tweens_for_removal(&mut self.timeline, &removal);
+            }
+
+            // Materialize the new window. The render closure runs
+            // under a Scene scope rooted at the list node. Snapshot
+            // children-count before + after each call to identify the
+            // single new child emitted for row `i`; write its
+            // `layout.abs` so layout positions it at the right offset.
+            let mut new_materialized = Vec::with_capacity((new_range[1] - new_range[0]) as usize);
+            for i in new_range[0]..new_range[1] {
+                let prev_count = self
+                    .ctx
+                    .tree
+                    .get(list_id)
+                    .map(|n| n.children.len())
+                    .unwrap_or(0);
+                {
+                    let mut scene = crate::scene::Scene::with_parent(&mut self.ctx, list_id);
+                    render(&mut scene, i);
+                }
+                let next_count = self
+                    .ctx
+                    .tree
+                    .get(list_id)
+                    .map(|n| n.children.len())
+                    .unwrap_or(0);
+                if next_count > prev_count {
+                    let new_child = self.ctx.tree.get(list_id).unwrap().children[prev_count];
+                    let top = self
+                        .ctx
+                        .tree
+                        .get(list_id)
+                        .and_then(|n| n.lazy_list.as_ref())
+                        .map(|ll| ll.row_top_logical(i))
+                        .unwrap_or(0.0);
+                    if let Some(c) = self.ctx.tree.get_mut_raw(new_child) {
+                        c.layout.abs = Some([0.0, top]);
+                    }
+                    new_materialized.push(new_child);
+                }
+            }
+
+            // Commit the new state.
+            if let Some(n) = self.ctx.tree.get_mut_raw(list_id)
+                && let Some(ll) = n.lazy_list.as_mut() {
+                    ll.materialized = new_materialized;
+                    ll.range = new_range;
+                    ll.last_seen_version = current_version;
+                    ll.last_heights_version = current_heights_version;
+                }
+
+            any_changed = true;
+        }
+
+        any_changed
+    }
+
+    /// Walk every text-field node and write the right display string
+    /// into its `text_node`: `placeholder` when value is empty and
+    /// the field is not focused, otherwise `value`. Idempotent — does
+    /// nothing on idle frames because `tree.set_text` short-circuits
+    /// when content matches.
+    fn refresh_text_fields(&mut self) {
+        let editor_ids: Vec<crate::node::NodeId> = self
+            .ctx
+            .tree
+            .iter_ids()
+            .filter(|id| {
+                self.ctx
+                    .tree
+                    .get(*id)
+                    .map(|n| n.editor.is_some())
+                    .unwrap_or(false)
+            })
+            .collect();
+        for id in editor_ids {
+            let (text_node, display) = {
+                let Some(n) = self.ctx.tree.get(id) else {
+                    continue;
+                };
+                let Some(ed) = n.editor.as_ref() else {
+                    continue;
+                };
+                let focused = n
+                    .interact
+                    .focused
+                    .as_ref()
+                    .map(|s| s.get())
+                    .unwrap_or(false);
+                let show_placeholder = ed.value.is_empty() && !focused && !ed.placeholder.is_empty();
+                let display = if show_placeholder {
+                    ed.placeholder.clone()
+                } else {
+                    ed.value.clone()
+                };
+                (ed.text_node, display)
+            };
+            self.ctx.tree.set_text(text_node, display);
+        }
+    }
+
+    /// Walk every text-field node and update its caret child's `rect`
+    /// + `visible` based on current value/cursor/focus state. Called
+    /// from `flush_tree` after `compute_layout` so the text child's
+    /// post-layout bounds are fresh. Caret rect is written **directly**
+    /// (bypassing the layout pass) so we don't pay a second layout
+    /// cycle per edit.
+    fn reposition_carets(&mut self) {
+        // Collect node ids first to keep the walk + the mutating
+        // updates from aliasing the same &mut tree.
+        let editor_ids: Vec<crate::node::NodeId> = self
+            .ctx
+            .tree
+            .iter_ids()
+            .filter(|id| {
+                self.ctx
+                    .tree
+                    .get(*id)
+                    .map(|n| n.editor.is_some())
+                    .unwrap_or(false)
+            })
+            .collect();
+        let scale = self.scale_factor;
+        for id in editor_ids {
+            // Snapshot every needed read from the editor + sibling
+            // nodes before re-borrowing for the write.
+            let (cursor, value, font_size, text_node, caret_node, selection_node, sel_range, focused) = {
+                let Some(n) = self.ctx.tree.get(id) else {
+                    continue;
+                };
+                let Some(ed) = n.editor.as_ref() else {
+                    continue;
+                };
+                let focused = n
+                    .interact
+                    .focused
+                    .as_ref()
+                    .map(|s| s.get())
+                    .unwrap_or(false);
+                (
+                    ed.cursor,
+                    ed.value.clone(),
+                    ed.font_size,
+                    ed.text_node,
+                    ed.caret_node,
+                    ed.selection_node,
+                    crate::editor::selection_range(ed),
+                    focused,
+                )
+            };
+            // Measure helper in *physical* px (scaled font size + line
+            // height), matching how the layout pass shaped the text.
+            let measure_w = |text: &mut crate::text::TextResources, upto: usize| {
+                text.measure(
+                    &value[..upto.min(value.len())],
+                    font_size * scale,
+                    font_size * scale * 1.25,
+                )
+                .width
+            };
+            let prefix_w = measure_w(&mut self.ctx.text, cursor);
+            let sel_px = sel_range
+                .map(|(lo, hi)| (measure_w(&mut self.ctx.text, lo), measure_w(&mut self.ctx.text, hi)));
+            let text_rect = self
+                .ctx
+                .tree
+                .get(text_node)
+                .map(|n| n.rect)
+                .unwrap_or([0.0; 4]);
+            if let Some(c) = self.ctx.tree.get_mut_raw(caret_node) {
+                // Caret rect is absolute (screen-space, physical px).
+                // x = text origin + prefix width; y/h = match text.
+                c.rect = [
+                    text_rect[0] + prefix_w,
+                    text_rect[1],
+                    2.0 * scale,
+                    text_rect[3],
+                ];
+                c.visible = focused;
+            }
+            // Selection highlight: span from start-width to end-width,
+            // hidden when there's no selection.
+            if let Some(s) = self.ctx.tree.get_mut_raw(selection_node) {
+                match sel_px {
+                    Some((lo_w, hi_w)) => {
+                        s.rect = [
+                            text_rect[0] + lo_w,
+                            text_rect[1],
+                            (hi_w - lo_w).max(0.0),
+                            text_rect[3],
+                        ];
+                        s.visible = true;
+                    }
+                    None => s.visible = false,
+                }
+            }
+        }
+    }
+
+    /// Defensively end any in-flight scrollbar drag. Mirrors the
+    /// release-path cleanup: applies the last pending cursor (so the
+    /// final pixel of scroll lands) and calls `end_drag` to clear the
+    /// `bar_active` flag and retarget for snap/bounce. Invoked when
+    /// the OS can no longer guarantee we'll see the matching
+    /// MouseInput::Released event — window loses focus, cursor exits
+    /// the client area without an active capture, etc.
+    fn end_bar_drag_if_active(&mut self) {
+        if let Some(d) = self.bar_drag.take() {
+            if let Some(c) = self.pending_drag_cursor.take() {
+                let _ = crate::input::drag_to(
+                    c,
+                    d.node_id,
+                    d.axis,
+                    d.pointer_origin,
+                    d.scroll_origin,
+                    d.track_travel,
+                    d.max_offset,
+                    &mut self.ctx.tree,
+                );
+            }
+            crate::input::end_drag(d.node_id, d.axis, &mut self.ctx.tree);
+            self.react();
+        }
+    }
+
+    /// Blur a focused text field: flip its focused signal to false and
+    /// clear `input.focused` so subsequent keys don't route. Triggers
+    /// a react so the caret repaints invisible.
+    fn blur_text_field(&mut self, node_id: crate::node::NodeId) {
+        if let Some(sig) = self
+            .ctx
+            .tree
+            .get(node_id)
+            .and_then(|n| n.interact.focused.clone())
+        {
+            sig.set(false);
+        }
+        if self.input.focused == Some(node_id) {
+            self.input.focused = None;
+        }
+        // Caret visibility depends on the focused signal — mark
+        // transform dirty so reposition_carets runs and hides it.
+        self.ctx.tree.mark_transform_dirty();
+        self.react();
+    }
+
+    /// Move focus to `target` (or clear it with `None`). Flips the old
+    /// node's `interact.focused` signal off and the new one's on,
+    /// updates `input.focused`, and reacts. Invariant preserved: at most
+    /// one node's focused signal is true at a time. No-op if focus is
+    /// already where requested.
+    fn set_focus(&mut self, target: Option<crate::node::NodeId>) {
+        if self.input.focused == target {
+            return;
+        }
+        if let Some(prev) = self.input.focused
+            && let Some(sig) = self.ctx.tree.get(prev).and_then(|n| n.interact.focused.clone())
+        {
+            sig.set(false);
+        }
+        if let Some(next) = target
+            && let Some(sig) = self.ctx.tree.get(next).and_then(|n| n.interact.focused.clone())
+        {
+            sig.set(true);
+        }
+        self.input.focused = target;
+        // A focused text field repositions/show its caret in
+        // reposition_carets, which gates on TRANSFORM.
+        self.ctx.tree.mark_transform_dirty();
+        self.react();
+    }
+
+    /// Fire [`App::on_unhandled_press`] when the just-captured left-press
+    /// target is "outside" any floating layer — i.e. there is no captured
+    /// node (press hit empty space) or the captured node is tagged
+    /// [`crate::node::Node::dismiss_transparent`] (a scrim). Take-then-
+    /// restore so the hook can re-enter `&mut self.ctx`. No-op without a
+    /// registered hook.
+    fn maybe_fire_unhandled_press(&mut self) {
+        let unhandled = match self.input.captured {
+            None => true,
+            Some(id) => self
+                .ctx
+                .tree
+                .get(id)
+                .map(|n| n.dismiss_transparent)
+                .unwrap_or(false),
+        };
+        if unhandled && let Some(mut hook) = self.on_unhandled_press.take() {
+            hook(&mut self.ctx);
+            self.on_unhandled_press = Some(hook);
+            self.react();
+        }
+    }
+
+    /// On a fresh left-press, latch drag state if the captured node is
+    /// draggable (has `on_drag` and/or a `drag_payload`). Records the
+    /// press origin + last-fire cursor and latches a clone of any
+    /// payload as the in-flight drag. No-op for non-draggable targets.
+    fn begin_drag_if_draggable(&mut self) {
+        let Some(cap) = self.input.captured else { return };
+        let Some(origin) = self.input.cursor else { return };
+        let (has_drag, payload, follow) = self
+            .ctx
+            .tree
+            .get(cap)
+            .map(|n| (n.on_drag.is_some(), n.drag_payload.clone(), n.drag_follow))
+            .unwrap_or((false, None, false));
+        if has_drag || payload.is_some() || follow {
+            // A fresh grab cancels any in-flight snap-back so the new
+            // drag owns the follow state.
+            if self.drag_return.is_some() {
+                self.timeline.stop(DRAG_RETURN_TWEEN_KEY);
+                self.drag_return = None;
+            }
+            self.drag_origin = Some(origin);
+            self.drag_last = Some(origin);
+            self.drag_payload = payload;
+            // Lift the node immediately (zero offset) so it's already on
+            // top before the first move.
+            if follow {
+                self.ctx.tree.set_drag_follow(Some((cap, [0.0, 0.0])));
+            }
+            // Click-to-set: fire `on_drag` once at the press position so a
+            // plain click (no drag) jumps the value. `delta` is zero here
+            // (drag_last == origin); absolute handlers use `current`,
+            // delta handlers no-op. Drives slider/scrubber click-to-seek.
+            if has_drag {
+                self.fire_drag(origin[0], origin[1]);
+                self.react();
+            }
+        }
+    }
+
+    /// Update the drag-follow offset for the captured node (if it opted
+    /// into `drag_follow`) to track the cursor. Returns true if a follow
+    /// is active (caller should react so the ghost re-flattens).
+    fn update_drag_follow(&mut self, x: f32, y: f32) -> bool {
+        let Some(cap) = self.input.captured else { return false };
+        let Some(origin) = self.drag_origin else { return false };
+        let follows = self.ctx.tree.get(cap).map(|n| n.drag_follow).unwrap_or(false);
+        if follows {
+            self.ctx
+                .tree
+                .set_drag_follow(Some((cap, [x - origin[0], y - origin[1]])));
+        }
+        follows
+    }
+
+    /// Fire the captured node's `on_drag` (if any) for a cursor move to
+    /// `[x, y]`. `DragCtx::delta` is relative to the previous fire.
+    /// Returns true if a handler ran (caller should react).
+    fn fire_drag(&mut self, x: f32, y: f32) -> bool {
+        let Some(cap) = self.input.captured else { return false };
+        let Some(start) = self.drag_origin else { return false };
+        let Some(h) = self.ctx.tree.get(cap).and_then(|n| n.on_drag.clone()) else {
+            return false;
+        };
+        let last = self.drag_last.unwrap_or(start);
+        let mut dctx = crate::event::DragCtx {
+            tree: &mut self.ctx.tree,
+            node: cap,
+            start,
+            current: [x, y],
+            delta: [x - last[0], y - last[1]],
+        };
+        h(&mut dctx);
+        self.drag_last = Some([x, y]);
+        true
+    }
+
+    /// On left-release, deliver any in-flight drag payload to the topmost
+    /// drop target under the cursor, then animate a lifted node back to
+    /// its resting slot. No-op when nothing was being dragged.
+    fn finish_drag_on_release(&mut self) {
+        let was_dragging = self.drag_payload.is_some() || self.drag_origin.is_some();
+        // 1. Deliver the payload to a drop target under the cursor.
+        if let Some(payload) = self.drag_payload.take()
+            && let Some([x, y]) = self.input.cursor
+        {
+            let tree = &self.ctx.tree;
+            let target = self
+                .hits
+                .iter()
+                .find(|h| {
+                    h.contains(x, y)
+                        && tree.get(h.node_id).map(|n| n.on_drop.is_some()).unwrap_or(false)
+                })
+                .map(|h| h.node_id);
+            if let Some(t) = target
+                && let Some(h) = self.ctx.tree.get(t).and_then(|n| n.on_drop.clone())
+            {
+                let mut dctx = crate::event::DropCtx {
+                    tree: &mut self.ctx.tree,
+                    node: t,
+                    payload,
+                };
+                h(&mut dctx);
+            }
+        }
+        // 2. Snap-back: if a node was lifted (drag_follow), animate its
+        //    offset from where it was dropped back to [0,0] rather than
+        //    popping it into place. The per-frame `tick_drag_return`
+        //    mirrors the tween into the tree and clears the lift when it
+        //    lands. Without a follow node there's nothing to animate.
+        let now = Instant::now();
+        if let (Some(node), Some(origin), Some([x, y])) = (
+            self.ctx.tree.drag_follow_target(),
+            self.drag_origin,
+            self.input.cursor,
+        ) {
+            let from = [x - origin[0], y - origin[1]];
+            if from[0].abs() < 0.5 && from[1].abs() < 0.5 {
+                // Barely moved (e.g. a plain click) — nothing to animate;
+                // a from==to tween would be a no-op and leave the lift
+                // stuck, so drop it back immediately.
+                self.ctx.tree.set_drag_follow(None);
+            } else {
+                self.drag_return_offset.set(from);
+                self.timeline.start(
+                    DRAG_RETURN_TWEEN_KEY,
+                    self.drag_return_offset.clone(),
+                    [0.0, 0.0],
+                    crate::anim::Curve::EaseInOut,
+                    std::time::Duration::from_millis(DRAG_RETURN_MS),
+                    now,
+                );
+                self.drag_return = Some(node);
+                // Hold the ghost at its drop position for this frame; the
+                // loop animates it home from here.
+                self.ctx.tree.set_drag_follow(Some((node, from)));
+            }
+        }
+        self.drag_origin = None;
+        self.drag_last = None;
+        self.drag_payload = None;
+        if was_dragging {
+            self.react();
+        }
+    }
+
+    /// Per-frame step of the drag snap-back. Mirrors the tweened
+    /// `drag_return_offset` into the tree's drag-follow offset; once it
+    /// lands at the slot (≈ zero), drops the lift entirely. Called from
+    /// `about_to_wait` while the return tween is active.
+    fn tick_drag_return(&mut self) {
+        if let Some(node) = self.drag_return {
+            let off = self.drag_return_offset.get();
+            if off[0].abs() < 0.5 && off[1].abs() < 0.5 {
+                self.ctx.tree.set_drag_follow(None);
+                self.drag_return = None;
+            } else {
+                self.ctx.tree.set_drag_follow(Some((node, off)));
+            }
+        }
+    }
+
+    /// Drop drag bookkeeping without delivering (capture loss — cursor
+    /// left, window blur). The payload is discarded.
+    fn clear_drag_state(&mut self) {
+        self.drag_origin = None;
+        self.drag_last = None;
+        self.drag_payload = None;
+        self.timeline.stop(DRAG_RETURN_TWEEN_KEY);
+        self.drag_return = None;
+        self.ctx.tree.set_drag_follow(None);
+    }
+
+    /// Advance keyboard focus to the next (`forward = true`, Tab) or
+    /// previous (`forward = false`, Shift+Tab) focusable node. Focusable
+    /// = `layout.focus_order != 0`, `visible`, and the node's rect
+    /// intersects the viewport. Visited in ascending `focus_order`, ties
+    /// broken by creation order (stable). Wraps around the ends; when
+    /// nothing is currently focused, Tab lands on the first candidate and
+    /// Shift+Tab on the last. No-op when no node is focusable.
+    fn focus_next(&mut self, forward: bool) {
+        let [vw, vh] = self.viewport();
+        let mut cands: Vec<(u32, crate::node::NodeId)> = Vec::new();
+        for id in self.ctx.tree.iter_ids() {
+            let Some(n) = self.ctx.tree.get(id) else { continue };
+            let order = n.layout.focus_order;
+            if order == 0 || !n.visible {
+                continue;
+            }
+            // Viewport intersection: rect is [x, y, w, h] in physical px.
+            let r = n.rect;
+            let onscreen = r[0] < vw && r[1] < vh && r[0] + r[2] > 0.0 && r[1] + r[3] > 0.0;
+            if !onscreen {
+                continue;
+            }
+            cands.push((order, id));
+        }
+        if cands.is_empty() {
+            return;
+        }
+        // Stable sort keeps iter_ids (creation) order for equal orders.
+        cands.sort_by_key(|(order, _)| *order);
+        let pos = self
+            .input
+            .focused
+            .and_then(|cur| cands.iter().position(|(_, id)| *id == cur));
+        let len = cands.len();
+        let next = match pos {
+            Some(i) if forward => (i + 1) % len,
+            Some(i) => (i + len - 1) % len,
+            None if forward => 0,
+            None => len - 1,
+        };
+        self.set_focus(Some(cands[next].1));
+    }
+
+    /// Drop every root + descendant and re-run the stored scene
+    /// builder against the cleared `SceneCtx`. The canonical way to
+    /// swap views — caller flips whatever signal the closure reads,
+    /// then calls this method to materialize the new tree.
+    ///
+    /// **Side effects beyond the tree:** clears `InputState`
+    /// (hovered/captured/focused — old `NodeId`s no longer exist) and
+    /// stops every active tween whose slot got tombstoned. Staged
+    /// images, GPU state, and the timeline's *idle* state (resting
+    /// signals not under an active tween) are preserved.
+    ///
+    /// No-op if [`App::scene`] was never called.
+    pub fn rebuild_scene(&mut self) {
+        // 1. Snapshot the root list, then drop each subtree. Iterating
+        //    `tree.roots()` directly while removing would alias the
+        //    same Vec.
+        let roots: Vec<crate::node::NodeId> = self.ctx.tree.roots().to_vec();
+        for r in roots {
+            let removal = self.ctx.remove_subtree(r);
+            stop_tweens_for_removal(&mut self.timeline, &removal);
+        }
+        // 2. Reset pointer state — old NodeIds in `captured` / `hovered` /
+        //    `focused` would be stale generation matches at best,
+        //    silent miss-fires at worst. Cursor *position* is the only
+        //    field worth preserving: re-derive hover against the fresh
+        //    hit cache below so the new tree's hover signals settle on
+        //    the same node the user is still pointing at. Without this,
+        //    every rebuild (e.g. a 5 Hz progress tick) would briefly
+        //    drop hover and let any subsequent spurious CursorMoved
+        //    flip it back on — visible as a hover-flicker on stationary
+        //    buttons.
+        let preserved_cursor = self.input.cursor;
+        self.input = InputState::new();
+        // Stale dwell tracker may point at a destroyed node id.
+        self.dwell = None;
+        // Drag bookkeeping references destroyed node ids — drop it.
+        self.clear_drag_state();
+        // 3. Re-invoke the stored builder on the now-empty ctx. Take
+        //    + put back so the closure can call back into &mut self
+        //    via captures without re-borrowing the builder slot.
+        let Some(mut builder) = self.scene_builder.take() else {
+            return;
+        };
+        {
+            let mut scene = Scene::root(&mut self.ctx);
+            builder(&mut scene);
+        }
+        self.scene_builder = Some(builder);
+        // 4. Flush + redraw. flush_tree returns true if anything
+        //    changed; rebuild always changes everything.
+        if self.flush_tree() {
+            self.request_redraw();
+        }
+        // 5. Re-derive hover from the preserved cursor against the
+        //    freshly-flattened hit cache. Mirrors the WindowEvent::
+        //    CursorMoved path minus the cursor-icon refresh (no new
+        //    OS-level cursor info to honor).
+        if let Some([x, y]) = preserved_cursor {
+            let _ = crate::input::update_scrollbar_hover(
+                Some([x, y]),
+                &self.scroll_bars,
+                &mut self.ctx.tree,
+            );
+            let _change = self
+                .input
+                .on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
         }
     }
 
@@ -674,6 +1888,23 @@ impl App {
     }
 }
 
+/// Walk the tree for every node referencing an `ImageHandle` (i.e.
+/// `ShapeKind::Image` with a `Some(handle)`). Returned set is used as
+/// the `live` argument to [`crate::gpu::ImageAtlas::rebuild_keeping`]
+/// so eviction drops sources for handles no longer in any node.
+pub fn collect_live_image_handles(
+    tree: &crate::node::NodeTree,
+) -> std::collections::HashSet<crate::gpu::ImageHandle> {
+    let mut out = std::collections::HashSet::new();
+    for id in tree.iter_ids() {
+        if let Some(n) = tree.get(id)
+            && let Some(h) = n.image {
+                out.insert(h);
+            }
+    }
+    out
+}
+
 /// Walk an ordered event list, expanding Text/Image events into GPU
 /// instances at their declared position. Preserves painter's order
 /// across all kinds so glass, text, images and rects can be layered
@@ -687,13 +1918,14 @@ fn expand_events_into(
     text: &mut crate::text::TextResources,
     scale: f32,
 ) -> u32 {
-    use crate::gpu::SHAPE_KIND_GLASS;
+    use crate::gpu::{SHAPE_KIND_GLASS, SHAPE_KIND_MASK};
     let mut glass_count: u32 = 0;
     for event in events {
         match event {
             FlatEvent::Shape(s) => {
                 let mut s = *s;
-                if s.shape_kind == SHAPE_KIND_GLASS {
+                let kind = s.shape_kind & SHAPE_KIND_MASK;
+                if kind == SHAPE_KIND_GLASS {
                     glass_count += 1;
                 }
                 // border_radius/border_width/shadow_offset/shadow_blur
@@ -708,7 +1940,7 @@ fn expand_events_into(
                 s.border_width *= scale;
                 s.shadow_offset = [s.shadow_offset[0] * scale, s.shadow_offset[1] * scale];
                 s.shadow_blur *= scale;
-                if s.shape_kind == SHAPE_KIND_GLASS {
+                if kind == SHAPE_KIND_GLASS {
                     // For glass: x = blur_amount (px), y = refraction (px).
                     // Both authored in logical px, scaled to physical.
                     s.backdrop_uv_rect[0] *= scale;
@@ -731,10 +1963,13 @@ fn expand_events_into(
             FlatEvent::Text(r) => {
                 // font_size + line_height in TextRef are logical;
                 // shaping needs physical px so the glyph atlas
-                // rasterizes at on-screen resolution.
+                // rasterizes at on-screen resolution. max_width is
+                // logical too — scale it alongside so the constrained
+                // shape runs at physical px against a physical limit.
                 let mut r = r.clone();
                 r.font_size *= scale;
                 r.line_height *= scale;
+                r.max_width = r.max_width.map(|w| w * scale);
                 let glyphs = gpu.build_glyph_instances(text, std::slice::from_ref(&r));
                 out.extend(glyphs);
             }
@@ -798,6 +2033,7 @@ fn build_hud_instances(
             // shaper — match that calling convention.
             font_size,
             line_height: line_h,
+            max_width: None,
             clip_rect: crate::gpu::NO_CLIP,
         })
         .collect();
@@ -810,12 +2046,13 @@ fn build_hud_instances(
 /// `last_version`, and either snap (`tree.set_color`) or start a
 /// tween on the slot's `displayed` signal.
 fn process_color_binds(
-    slots: &mut [ColorBindSlot],
+    slots: &mut [Option<ColorBindSlot>],
     tree: &mut crate::node::NodeTree,
     timeline: &mut Timeline,
     now: Instant,
 ) {
-    for (idx, slot) in slots.iter_mut().enumerate() {
+    for (idx, opt) in slots.iter_mut().enumerate() {
+        let Some(slot) = opt.as_mut() else { continue };
         let v = slot.bind.version();
         if v == slot.last_version {
             continue;
@@ -826,19 +2063,76 @@ fn process_color_binds(
         {
             let key = BIND_TWEEN_KEY_COLOR + idx as u32;
             timeline.start(key, disp.clone(), target, curve, dur, now);
+            log::debug!("[binds] color slot {idx}: animated tween started target={target:?}");
         } else {
             tree.set_color(slot.node_id, target);
+            log::debug!("[binds] color slot {idx}: snap target={target:?}");
         }
     }
 }
 
+/// Image-handle binds snap (no interpolation): when the source version
+/// moves, write the new handle straight into the node. `set_image`
+/// flags `BACKDROP` when glass exists, so a backdrop cover swap re-runs
+/// the blur just like a colour change.
+fn process_image_binds(slots: &mut [Option<ImageBindSlot>], tree: &mut crate::node::NodeTree) {
+    for opt in slots.iter_mut() {
+        let Some(slot) = opt.as_mut() else { continue };
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        tree.set_image(slot.node_id, slot.bind.read());
+        log::debug!("[binds] image slot updated -> {:?}", slot.bind.read());
+    }
+}
+
+/// Text-content binds snap (no interpolation): on a version bump, write
+/// the new string. `set_text` relayouts (text width may change), so a
+/// reactive label resizes correctly without a scene rebuild.
+fn process_text_binds(slots: &mut [Option<TextBindSlot>], tree: &mut crate::node::NodeTree) {
+    for opt in slots.iter_mut() {
+        let Some(slot) = opt.as_mut() else { continue };
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        tree.set_text(slot.node_id, slot.bind.read().to_string());
+        log::debug!("[binds] text slot updated -> {:?}", slot.bind.read());
+    }
+}
+
+/// Percentage-width binds snap: on a version bump, set the node's width
+/// to `Len::Pct(value)`. Drives responsive fills (progress bar) without
+/// a rebuild.
+fn process_width_pct_binds(
+    slots: &mut [Option<WidthPctBindSlot>],
+    tree: &mut crate::node::NodeTree,
+) {
+    for opt in slots.iter_mut() {
+        let Some(slot) = opt.as_mut() else { continue };
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        // `set_layout_width` flags BACKDROP only if the node is a
+        // blur_source — a progress fill isn't, so a per-frame width
+        // animation stays cheap (no full-window blur re-run).
+        tree.set_layout_width(slot.node_id, crate::layout::Len::Pct(slot.bind.read()));
+    }
+}
+
 fn process_position_binds(
-    slots: &mut [PositionBindSlot],
+    slots: &mut [Option<PositionBindSlot>],
     tree: &mut crate::node::NodeTree,
     timeline: &mut Timeline,
     now: Instant,
 ) {
-    for (idx, slot) in slots.iter_mut().enumerate() {
+    for (idx, opt) in slots.iter_mut().enumerate() {
+        let Some(slot) = opt.as_mut() else { continue };
         let v = slot.bind.version();
         if v == slot.last_version {
             continue;
@@ -856,12 +2150,13 @@ fn process_position_binds(
 }
 
 fn process_size_binds(
-    slots: &mut [SizeBindSlot],
+    slots: &mut [Option<SizeBindSlot>],
     tree: &mut crate::node::NodeTree,
     timeline: &mut Timeline,
     now: Instant,
 ) {
-    for (idx, slot) in slots.iter_mut().enumerate() {
+    for (idx, opt) in slots.iter_mut().enumerate() {
+        let Some(slot) = opt.as_mut() else { continue };
         let v = slot.bind.version();
         if v == slot.last_version {
             continue;
@@ -875,6 +2170,87 @@ fn process_size_binds(
         } else {
             tree.set_layout_size_px(slot.node_id, target);
         }
+    }
+}
+
+/// Resolve a winit `KeyEvent`'s `logical_key` + `text` into an
+/// [`EditOp`]. Returns `None` for keys the editor doesn't handle (so
+/// the caller can fall through to other shell-level handlers).
+///
+/// `text` is winit's pre-resolved "what character did this key
+/// produce" string (handles shift, dead keys, etc. for us). Control
+/// chars (\r, \n, escape, etc.) are filtered out — those come through
+/// as named keys instead.
+///
+/// `mods` routes Shift (selection-extend on arrows / Home / End) and the
+/// accelerator (Ctrl on Win/Linux, Cmd on macOS): accel+A = SelectAll,
+/// +C = Copy, +X = Cut. Paste (+V) is **not** produced here — it needs a
+/// clipboard read, so the caller handles it before calling this fn.
+fn resolve_edit_op(
+    logical: &Key,
+    text: Option<&str>,
+    mods: winit::keyboard::ModifiersState,
+) -> Option<crate::editor::EditOp> {
+    use crate::editor::EditOp;
+    let shift = mods.shift_key();
+    let accel = mods.control_key() || mods.super_key();
+    if let Key::Named(named) = logical {
+        match named {
+            NamedKey::Backspace => return Some(EditOp::DeleteBack),
+            NamedKey::Delete => return Some(EditOp::DeleteForward),
+            NamedKey::ArrowLeft => {
+                return Some(if shift { EditOp::SelectLeft } else { EditOp::MoveLeft });
+            }
+            NamedKey::ArrowRight => {
+                return Some(if shift { EditOp::SelectRight } else { EditOp::MoveRight });
+            }
+            NamedKey::Home => {
+                return Some(if shift { EditOp::SelectHome } else { EditOp::Home });
+            }
+            NamedKey::End => {
+                return Some(if shift { EditOp::SelectEnd } else { EditOp::End });
+            }
+            NamedKey::Enter => return Some(EditOp::Submit),
+            _ => {}
+        }
+    }
+    // Accelerator combos on character keys (Ctrl/Cmd + A/C/X). Suppress
+    // text insertion while accel is held — return None for anything else
+    // so non-edit shortcuts (Ctrl+S, etc.) fall through to the shell.
+    if accel {
+        if let Key::Character(s) = logical {
+            if s.as_str().eq_ignore_ascii_case("a") {
+                return Some(EditOp::SelectAll);
+            }
+            if s.as_str().eq_ignore_ascii_case("c") {
+                return Some(EditOp::Copy);
+            }
+            if s.as_str().eq_ignore_ascii_case("x") {
+                return Some(EditOp::Cut);
+            }
+        }
+        return None;
+    }
+    if let Some(s) = text
+        && !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+            return Some(EditOp::Insert(s.to_string()));
+        }
+    None
+}
+
+/// Translate a [`SubtreeRemoval`] into `Timeline::stop` calls for every
+/// bind-slot index that was tombstoned. App-shell wrappers around
+/// `SceneCtx::remove_subtree` call this immediately after the removal
+/// so any in-flight tween targeting a freed slot drops.
+fn stop_tweens_for_removal(timeline: &mut Timeline, r: &crate::scene::SubtreeRemoval) {
+    for &idx in &r.dropped_color_slots {
+        timeline.stop(BIND_TWEEN_KEY_COLOR + idx);
+    }
+    for &idx in &r.dropped_position_slots {
+        timeline.stop(BIND_TWEEN_KEY_POSITION + idx);
+    }
+    for &idx in &r.dropped_size_slots {
+        timeline.stop(BIND_TWEEN_KEY_SIZE + idx);
     }
 }
 
@@ -984,17 +2360,17 @@ impl<'a> HeadlessHelper<'a> {
         let _ = self
             .timeline
             .tick(Instant::now() + std::time::Duration::from_secs(10));
-        for slot in &self.ctx.binds.color {
+        for slot in self.ctx.binds.color.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_color(slot.node_id, disp.get());
             }
         }
-        for slot in &self.ctx.binds.position {
+        for slot in self.ctx.binds.position.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_layout_pos_abs(slot.node_id, disp.get());
             }
         }
-        for slot in &self.ctx.binds.size {
+        for slot in self.ctx.binds.size.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_layout_size_px(slot.node_id, disp.get());
             }
@@ -1035,17 +2411,17 @@ impl<'a> HeadlessHelper<'a> {
             self.timeline,
             now,
         );
-        for slot in &self.ctx.binds.color {
+        for slot in self.ctx.binds.color.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_color(slot.node_id, disp.get());
             }
         }
-        for slot in &self.ctx.binds.position {
+        for slot in self.ctx.binds.position.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_layout_pos_abs(slot.node_id, disp.get());
             }
         }
-        for slot in &self.ctx.binds.size {
+        for slot in self.ctx.binds.size.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_layout_size_px(slot.node_id, disp.get());
             }
@@ -1054,6 +2430,13 @@ impl<'a> HeadlessHelper<'a> {
 }
 
 impl ApplicationHandler for App {
+    /// Empty user-event handler. The only sender is
+    /// [`WakeHandle::wake`]; the payload is unused, the side effect
+    /// (winit returning from `Wait` into the next `about_to_wait`)
+    /// is what we want. The flag itself is consumed in
+    /// `about_to_wait`.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _: ()) {}
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1117,7 +2500,7 @@ impl ApplicationHandler for App {
 
         if let Some(mem) = self.memory_report() {
             log::info!(
-                "gpu memory: total={} KiB (instance={} overlay={} blur={} overdraw={} glyph_atlas={} image_atlas={} timing={} prev_cpu={})",
+                "gpu memory: total={} KiB (instance={} overlay={} blur={} overdraw={} glyph_atlas={} image_atlas={} img_src_cpu={} timing={} prev_cpu={})",
                 mem.total() / 1024,
                 mem.instance_buffer,
                 mem.overlay_buffer,
@@ -1125,6 +2508,7 @@ impl ApplicationHandler for App {
                 mem.overdraw_textures,
                 mem.glyph_atlas,
                 mem.image_atlas,
+                mem.image_sources_cpu,
                 mem.timing,
                 mem.prev_instances_cpu,
             );
@@ -1302,17 +2686,41 @@ impl ApplicationHandler for App {
                     self.input
                         .on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
                 self.refresh_cursor(x, y);
-                if change.any() || bar_changed {
+                // Generic on_drag: fire while a press is captured on a
+                // draggable node (slider/scrubber). Independent of the
+                // scrollbar-thumb drag handled above.
+                let dragged = self.fire_drag(x, y);
+                // Drag-follow: track the cursor for a lifted node.
+                let following = self.update_drag_follow(x, y);
+                if change.hovered_changed {
+                    self.refresh_dwell(Instant::now());
+                }
+                if change.any() || bar_changed || dragged || following {
                     self.react();
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                // With a working OS-level mouse capture, the cursor
+                // can leave the client area without `CursorLeft`
+                // firing (events are still routed to us). Receiving
+                // this event mid-drag means capture has been lost or
+                // never installed — settle the drag so `bar_active`
+                // doesn't latch on. Same rationale as the focus-loss
+                // path above.
+                self.end_bar_drag_if_active();
+                // Capture genuinely lost (OS capture would otherwise keep
+                // routing moves) — abandon any in-flight generic drag /
+                // drag-payload rather than leave it stuck.
+                self.clear_drag_state();
                 let bar_changed = crate::input::update_scrollbar_hover(
                     None,
                     &self.scroll_bars,
                     &mut self.ctx.tree,
                 );
                 let change = self.input.on_cursor_left(&self.hits, &self.ctx.tree);
+                if change.hovered_changed {
+                    self.dwell = None;
+                }
                 if self.last_cursor_icon != CursorIcon::Default {
                     self.last_cursor_icon = CursorIcon::Default;
                     if let Some(w) = &self.window {
@@ -1331,6 +2739,12 @@ impl ApplicationHandler for App {
                 // events for keys still down, so the held set would
                 // leak and suppress settle forever. Clear it now.
                 self.held_scroll_keys.clear();
+                // Same logic for an in-flight scrollbar drag: if focus
+                // moves elsewhere, we'll miss the eventual button
+                // release. Settle the drag now to free `bar_active`
+                // and avoid the thumb staying painted in its
+                // mouse-down color forever.
+                self.end_bar_drag_if_active();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let Some([cx, cy]) = self.input.cursor else {
@@ -1438,6 +2852,75 @@ impl ApplicationHandler for App {
                         self.input.on_left_released(&self.hits, &self.ctx.tree)
                     }
                 };
+                // Outside-press dismissal. On a *press* that hit no
+                // interactive node — or hit a dismiss-transparent scrim —
+                // fire the hook so floating layers (modals, context menus)
+                // can close. `input.captured` was just set to the press
+                // target by `on_left_pressed`.
+                if state == ElementState::Pressed {
+                    self.begin_drag_if_draggable();
+                    self.maybe_fire_unhandled_press();
+                } else {
+                    // Release: deliver any in-flight drag payload to a
+                    // drop target under the cursor, then clear drag state.
+                    self.finish_drag_on_release();
+                }
+                if change.hovered_changed {
+                    self.refresh_dwell(Instant::now());
+                }
+                // Fire the click handler (if any) for the released node.
+                // Clone the `Rc<dyn Fn>` out first so the immutable
+                // borrow of the node drops before we re-borrow `&mut
+                // tree` for the EventCtx.
+                if let Some(target) = change.click_target {
+                    let handler = self
+                        .ctx
+                        .tree
+                        .get(target)
+                        .and_then(|n| n.on_click.clone());
+                    if let Some(h) = handler {
+                        let mut ectx = crate::event::EventCtx {
+                            tree: &mut self.ctx.tree,
+                            timeline: &mut self.timeline,
+                            node: target,
+                            now: Instant::now(),
+                        };
+                        h(&mut ectx);
+                    }
+                }
+                if change.any() {
+                    self.react();
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Right,
+                ..
+            } => {
+                let change = match state {
+                    ElementState::Pressed => {
+                        self.input.on_right_pressed(&self.hits, &self.ctx.tree)
+                    }
+                    ElementState::Released => {
+                        self.input.on_right_released(&self.hits, &self.ctx.tree)
+                    }
+                };
+                if let Some(target) = change.right_click_target {
+                    let handler = self
+                        .ctx
+                        .tree
+                        .get(target)
+                        .and_then(|n| n.on_right_click.clone());
+                    if let Some(h) = handler {
+                        let mut ectx = crate::event::EventCtx {
+                            tree: &mut self.ctx.tree,
+                            timeline: &mut self.timeline,
+                            node: target,
+                            now: Instant::now(),
+                        };
+                        h(&mut ectx);
+                    }
+                }
                 if change.any() {
                     self.react();
                 }
@@ -1446,6 +2929,8 @@ impl ApplicationHandler for App {
                 event:
                     KeyEvent {
                         physical_key: PhysicalKey::Code(code),
+                        logical_key,
+                        text,
                         state,
                         repeat,
                         ..
@@ -1453,6 +2938,50 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 if state == ElementState::Pressed {
+                    // Text-field routing fires *before* the hotkey path.
+                    // While a TextField is focused, typeable keys + nav
+                    // keys (Backspace, Arrow*, Home, End, Enter) feed the
+                    // editor. Escape blurs. F-keys + other unmapped keys
+                    // fall through to the hotkey + scroll handlers so
+                    // F2 screenshot etc. still work mid-edit.
+                    if let Some(focused) = self.input.focused {
+                        let has_editor = self
+                            .ctx
+                            .tree
+                            .get(focused)
+                            .map(|n| n.editor.is_some())
+                            .unwrap_or(false);
+                        if has_editor {
+                            let mods = self.modifiers.state();
+                            if matches!(logical_key, Key::Named(NamedKey::Escape)) {
+                                self.blur_text_field(focused);
+                                return;
+                            }
+                            // Paste needs a clipboard read first, so it's
+                            // handled here rather than in resolve_edit_op.
+                            let accel = mods.control_key() || mods.super_key();
+                            let is_v = matches!(
+                                &logical_key,
+                                Key::Character(s) if s.as_str().eq_ignore_ascii_case("v")
+                            );
+                            if accel && is_v {
+                                let pasted = self.read_clipboard();
+                                if !pasted.is_empty() {
+                                    self.apply_edit(
+                                        focused,
+                                        crate::editor::EditOp::Paste(pasted),
+                                    );
+                                }
+                                return;
+                            }
+                            if let Some(op) =
+                                resolve_edit_op(&logical_key, text.as_deref(), mods)
+                            {
+                                self.apply_edit(focused, op);
+                                return;
+                            }
+                        }
+                    }
                     // Hotkeys fire on initial press only — holding F2
                     // shouldn't spam screenshots, holding Esc is just
                     // weird. Auto-repeat events are filtered here.
@@ -1497,6 +3026,17 @@ impl ApplicationHandler for App {
                                 if self.flush_tree() {
                                     self.request_redraw();
                                 }
+                                return;
+                            }
+                            KeyCode::Tab => {
+                                // Tab / Shift+Tab cycle keyboard focus.
+                                // Fires even with a text field focused —
+                                // standard "Tab leaves the field" UX. The
+                                // editor never claims Tab (resolve_edit_op
+                                // has no mapping for it), so it reaches
+                                // here untouched.
+                                let forward = !self.modifiers.state().shift_key();
+                                self.focus_next(forward);
                                 return;
                             }
                             _ => {}
@@ -1573,11 +3113,54 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Consume any rebuild request first — if a click handler
+        // flipped the token mid-event, the old tree is stale and
+        // every subsequent tick (animation, scroll, etc.) would
+        // operate on stale node ids. Rebuild before anything else.
+        if self.rebuild_request.replace(false) {
+            self.rebuild_scene();
+        }
+        // Drain queued cross-thread image uploads. Done before the
+        // on-frame wake check so a worker doing `upload_rgba(...)` +
+        // `wake()` in the same instant resolves the handle before the
+        // on-frame hook fires and reads it.
+        self.drain_image_uploads();
+        let now = Instant::now();
+        // External wake (worker delivered a response on a channel the
+        // `on_frame` hook drains, etc.). Fire `on_frame` even when no
+        // timeline / scroll work is pending so the channel gets drained
+        // — without this the worker's wake would land but the loop
+        // would still park since `timeline_active == false`.
+        if self.wake.take()
+            && let Some(mut hook) = self.on_frame.take()
+        {
+            log::debug!("[loop] wake-driven on_frame fired (timeline_tweens={})", self.timeline.len());
+            hook(&mut self.ctx, &mut self.timeline, now);
+            self.on_frame = Some(hook);
+            log::debug!("[loop] after on_frame: timeline_tweens={} rebuild_requested={}",
+                self.timeline.len(), self.rebuild_request.get());
+            // Drain any rebuild flag the hook just set so the rebuild
+            // rides this tick rather than waiting for the next wake.
+            if self.rebuild_request.replace(false) {
+                self.rebuild_scene();
+                log::debug!("[loop] rebuilt scene; timeline_tweens={}", self.timeline.len());
+            } else {
+                // No rebuild — but the hook may have set source signals
+                // (worker-delivered state, etc.). Walk the bind registry
+                // so those changes propagate to the tree (snap for
+                // non-animated reactive binds; start a tween for
+                // animated ones). Without this, `Signal::set` from any
+                // non-input path would be lost between rebuilds.
+                self.process_binds(now);
+            }
+            if self.flush_tree() {
+                self.request_redraw();
+            }
+        }
         // Animation + scroll pump. If both are idle, park on `Wait` so
         // the loop is 0% CPU. Otherwise: advance both, push interpolated
         // values through the bind registry, flush, redraw, and schedule
         // the next deadline.
-        let now = Instant::now();
         // Drain any coalesced thumb-drag cursor: a single
         // set_scroll_immediate per frame, regardless of how many
         // CursorMoved events fired since the last tick.
@@ -1604,6 +3187,15 @@ impl ApplicationHandler for App {
         }
         let timeline_active = self.timeline.active();
         let mut scroll_active = self.ctx.tree.has_active_scrolls();
+        // Dwell deadline is the third source of "stay awake" alongside
+        // timeline + scroll. Fire here if elapsed; either way, propagate
+        // the deadline below so the loop schedules a wake.
+        let dwell_fired = self.tick_dwell(now);
+        let dwell_pending = self
+            .dwell
+            .as_ref()
+            .map(|t| !t.fired)
+            .unwrap_or(false);
         // Hold-arrow continuous pump: replaces OS auto-repeat for the
         // arrow keys. Need a non-zero `dt` to compute the per-tick
         // delta — gate on a meaningful tick interval.
@@ -1622,11 +3214,16 @@ impl ApplicationHandler for App {
         if pumped {
             scroll_active = true;
         }
-        if !timeline_active && !scroll_active && !drag_moved {
+        if !timeline_active && !scroll_active && !drag_moved && !dwell_pending && !dwell_fired {
             self.last_scroll_tick = None;
             event_loop.set_control_flow(ControlFlow::Wait);
+            log::debug!("[loop] parking on Wait (idle)");
             return;
         }
+        log::debug!(
+            "[loop] active tick: timeline_tweens={} scroll={} drag={} dwell={}/{}",
+            self.timeline.len(), scroll_active, drag_moved, dwell_pending, dwell_fired,
+        );
         let dt = match self.last_scroll_tick {
             Some(prev) => (now - prev).as_secs_f32().min(0.05),
             None => 0.0,
@@ -1634,7 +3231,38 @@ impl ApplicationHandler for App {
         self.last_scroll_tick = Some(now);
         let scroll_moved = self.ctx.tree.tick_scrolls(dt);
         let res = self.timeline.tick(now);
-        if res.updated || scroll_moved || drag_moved {
+        // Mirror the snap-back tween into the tree's drag-follow offset
+        // (and clear the lift when it lands). The tween keeps the loop
+        // awake via `timeline_active`, so this runs every frame of the
+        // return until it completes.
+        self.tick_drag_return();
+        // Per-frame hook fires after the timeline tick so it observes
+        // the just-interpolated signal values — pushing those into
+        // non-bind targets (e.g. lazy-list row heights) lands with
+        // zero lag.
+        let hook_active = self.on_frame.is_some();
+        if let Some(mut hook) = self.on_frame.take() {
+            hook(&mut self.ctx, &mut self.timeline, now);
+            self.on_frame = Some(hook);
+        }
+        // Walk the bind registry every tick the loop is awake. This is
+        // the bridge from "Signal was set somewhere" to "tree picks up
+        // the new value":
+        //  - Timeline tweens that target user-owned source Signals
+        //    (e.g. a non-animated reactive bind whose Signal the caller
+        //    is tweening directly) bump the source version every tick
+        //    — process_binds snaps the new value into the tree.
+        //  - Computed binds whose deps just bumped (because a tween
+        //    above advanced one of their source signals) re-read here.
+        //  - on_frame Signal::set calls land before flush via the same
+        //    path.
+        // Animated binds whose source was set go through the timeline-
+        // start path inside process_binds; their displayed signals are
+        // then pumped below.
+        if res.updated || hook_active {
+            self.process_binds(now);
+        }
+        if res.updated || scroll_moved || drag_moved || hook_active || dwell_fired {
             if res.updated {
                 self.pump_animated_displays();
             }
@@ -1648,15 +3276,843 @@ impl ApplicationHandler for App {
         } else {
             None
         };
-        let combined = match (res.next_deadline, next_scroll_deadline) {
+        // Wake up at the dwell deadline so the tooltip fires on time
+        // even when nothing else is animating.
+        let dwell_deadline = self
+            .dwell
+            .as_ref()
+            .filter(|t| !t.fired)
+            .map(|t| t.deadline);
+        // process_binds above may have *started* new tweens (when an
+        // animated bind's source was just set). Those tweens didn't
+        // exist when timeline.tick computed `res.next_deadline`, so
+        // honour `timeline.active()` as the authoritative "still has
+        // work" check.
+        let timeline_deadline = if self.timeline.active() {
+            Some(now + self.timeline.tick_interval())
+        } else {
+            res.next_deadline
+        };
+        let combined = match (timeline_deadline, next_scroll_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let combined = match (combined, dwell_deadline) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
             (None, None) => None,
         };
         match combined {
-            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+            Some(deadline) => {
+                let dt = deadline.saturating_duration_since(Instant::now());
+                log::debug!("[loop] WaitUntil({:?} from now)", dt);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline))
+            }
+            None => {
+                log::debug!("[loop] no deadline; parking on Wait");
+                event_loop.set_control_flow(ControlFlow::Wait)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Len;
+    use crate::signal::Signal;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn collect_live_image_handles_finds_every_image_node() {
+        use crate::gpu::ImageHandle;
+        use crate::node::Node;
+
+        let mut tree = crate::node::NodeTree::new();
+        let h1 = ImageHandle(42);
+        let h2 = ImageHandle(99);
+        let h3 = ImageHandle(7);
+        tree.add_root(Node::image(h1).build());
+        tree.add_root(Node::image(h2).build());
+        // Non-image node — must not appear in live set.
+        tree.add_root(Node::rect().build());
+        let root3 = tree.add_root(Node::rect().build());
+        // Image node nested as child — must still appear.
+        tree.add_child(root3, Node::image(h3).build());
+
+        let live = collect_live_image_handles(&tree);
+        assert_eq!(live.len(), 3);
+        assert!(live.contains(&h1));
+        assert!(live.contains(&h2));
+        assert!(live.contains(&h3));
+    }
+
+    #[test]
+    fn rebuild_scene_swaps_named_nodes() {
+        let toggle = Rc::new(Cell::new(false));
+        let toggle_for_scene = toggle.clone();
+        let app = App::new("test", 100, 100).scene(move |s| {
+            if toggle_for_scene.get() {
+                s.rect("view_b").size_px(20.0, 20.0);
+            } else {
+                s.rect("view_a").size_px(10.0, 10.0);
+            }
+        });
+        // Initial: view_a is live.
+        assert!(app.ctx().node("view_a").is_some());
+        assert!(app.ctx().node("view_b").is_none());
+
+        // Flip toggle and rebuild.
+        toggle.set(true);
+        let mut app = app;
+        app.rebuild_scene();
+
+        // After rebuild: view_b is live, view_a is gone.
+        assert!(app.ctx().node("view_a").is_none());
+        assert!(app.ctx().node("view_b").is_some());
+    }
+
+    #[test]
+    fn rebuild_scene_clears_bind_registry_live_count() {
+        let s1 = Signal::new([1.0_f32, 0.0, 0.0, 1.0]);
+        let s2 = Signal::new([0.0_f32, 1.0, 0.0, 1.0]);
+        let s1_for_scene = s1.clone();
+        let s2_for_scene = s2.clone();
+        let mut app = App::new("test", 100, 100).scene(move |scene| {
+            scene.rect("a").color(s1_for_scene.clone());
+            scene.rect("b").color(s2_for_scene.clone());
+        });
+        let live_before = app
+            .ctx()
+            .binds
+            .color
+            .iter()
+            .filter(|s| s.is_some())
+            .count();
+        assert_eq!(live_before, 2);
+
+        app.rebuild_scene();
+
+        // After rebuild the prior slots are tombstoned, then the
+        // free-list reuses them for the new scene's binds. Live count is
+        // restored AND the vector stays bounded — no monotonic growth
+        // across rebuilds (the whole point of the free-list).
+        let live_after = app
+            .ctx()
+            .binds
+            .color
+            .iter()
+            .filter(|s| s.is_some())
+            .count();
+        assert_eq!(live_after, 2);
+        assert_eq!(
+            app.ctx().binds.color.len(),
+            2,
+            "tombstoned slots reused — length must not grow across rebuilds"
+        );
+    }
+
+    #[test]
+    fn rebuild_scene_with_no_builder_is_noop() {
+        let mut app = App::new("test", 100, 100);
+        // No `.scene(...)` call — no stored builder.
+        app.rebuild_scene();
+        assert_eq!(app.ctx().tree.len(), 0);
+    }
+
+    // --- Tab focus cycling ---
+
+    /// Build a 4-node Col scene where focus_order can differ from
+    /// creation order. Returns (app, [ids in creation order], [signals]).
+    fn focus_scene(
+        orders: [u32; 4],
+    ) -> (App, Vec<crate::node::NodeId>, Vec<Signal<bool>>) {
+        let sigs: Vec<Signal<bool>> = (0..4).map(|_| Signal::new(false)).collect();
+        let sigs_for_scene = sigs.clone();
+        let mut app = App::new("test", 400, 400).scene(move |s| {
+            for i in 0..4 {
+                let mut b = s.rect(format!("n{i}"));
+                b.size_px(100.0, 40.0).on_focus(sigs_for_scene[i].clone());
+                if orders[i] != 0 {
+                    b.focus_order(orders[i]);
+                }
+            }
+        });
+        let _ = app.flush_tree();
+        let ids: Vec<_> = (0..4)
+            .map(|i| app.ctx().node(&format!("n{i}")).unwrap())
+            .collect();
+        (app, ids, sigs)
+    }
+
+    #[test]
+    fn tab_cycles_focus_forward_and_wraps() {
+        let (mut app, ids, _) = focus_scene([1, 2, 3, 4]);
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[0]));
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[1]));
+        app.focus_next(true);
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[3]));
+        // Wrap back to the first.
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[0]));
+    }
+
+    #[test]
+    fn shift_tab_cycles_backward_and_wraps() {
+        let (mut app, ids, _) = focus_scene([1, 2, 3, 4]);
+        // From nothing, Shift+Tab lands on the last candidate.
+        app.focus_next(false);
+        assert_eq!(app.input.focused, Some(ids[3]));
+        app.focus_next(false);
+        assert_eq!(app.input.focused, Some(ids[2]));
+        // Wrap forward off the front.
+        app.focus_next(false);
+        app.focus_next(false);
+        assert_eq!(app.input.focused, Some(ids[0]));
+        app.focus_next(false);
+        assert_eq!(app.input.focused, Some(ids[3]));
+    }
+
+    #[test]
+    fn tab_visits_in_focus_order_not_creation_order() {
+        // Creation order n0,n1,n2,n3 but focus_order 3,1,4,2 → visit
+        // sequence by ascending order is n1(1), n3(2), n0(3), n2(4).
+        let (mut app, ids, _) = focus_scene([3, 1, 4, 2]);
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[1]));
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[3]));
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[0]));
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[2]));
+    }
+
+    #[test]
+    fn focus_order_zero_is_excluded() {
+        // n1 has focus_order 0 → skipped entirely.
+        let (mut app, ids, _) = focus_scene([1, 0, 2, 3]);
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[0]));
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[2]), "n1 (order 0) must be skipped");
+    }
+
+    #[test]
+    fn focus_toggles_signals_exclusively() {
+        let (mut app, _ids, sigs) = focus_scene([1, 2, 3, 4]);
+        app.focus_next(true);
+        assert!(sigs[0].get());
+        app.focus_next(true);
+        assert!(!sigs[0].get(), "old focus signal flips off");
+        assert!(sigs[1].get(), "new focus signal flips on");
+    }
+
+    #[test]
+    fn focus_skips_invisible_nodes() {
+        let (mut app, ids, _) = focus_scene([1, 2, 3, 4]);
+        app.ctx.tree.set_visible(ids[1], false);
+        let _ = app.flush_tree();
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[0]));
+        app.focus_next(true);
+        assert_eq!(app.input.focused, Some(ids[2]), "invisible n1 skipped");
+    }
+
+    #[test]
+    fn focus_next_noop_when_nothing_focusable() {
+        let (mut app, _, _) = focus_scene([0, 0, 0, 0]);
+        app.focus_next(true);
+        assert_eq!(app.input.focused, None);
+    }
+
+    // --- outside-press dismissal ---
+
+    #[test]
+    fn unhandled_press_fires_on_empty_hit() {
+        let count = Rc::new(Cell::new(0u32));
+        let count_for_hook = count.clone();
+        let mut app = App::new("test", 200, 200)
+            .on_unhandled_press(move |_ctx| {
+                count_for_hook.set(count_for_hook.get() + 1);
+            })
+            .scene(|s| {
+                s.rect("btn").size_px(50.0, 50.0).on_click(|_| {});
+            });
+        let _ = app.flush_tree();
+        // Press landed on empty space → captured is None.
+        app.input.captured = None;
+        app.maybe_fire_unhandled_press();
+        assert_eq!(count.get(), 1);
+    }
+
+    #[test]
+    fn unhandled_press_fires_on_dismiss_transparent_scrim() {
+        let count = Rc::new(Cell::new(0u32));
+        let count_for_hook = count.clone();
+        let mut app = App::new("test", 200, 200)
+            .on_unhandled_press(move |_ctx| {
+                count_for_hook.set(count_for_hook.get() + 1);
+            })
+            .scene(|s| {
+                s.rect("scrim").fill().dismiss_transparent();
+            });
+        let _ = app.flush_tree();
+        let scrim = app.ctx().node("scrim").unwrap();
+        app.input.captured = Some(scrim);
+        app.maybe_fire_unhandled_press();
+        assert_eq!(count.get(), 1);
+    }
+
+    #[test]
+    fn unhandled_press_skips_regular_interactive_node() {
+        let count = Rc::new(Cell::new(0u32));
+        let count_for_hook = count.clone();
+        let mut app = App::new("test", 200, 200)
+            .on_unhandled_press(move |_ctx| {
+                count_for_hook.set(count_for_hook.get() + 1);
+            })
+            .scene(|s| {
+                s.rect("btn").size_px(50.0, 50.0).on_click(|_| {});
+            });
+        let _ = app.flush_tree();
+        let btn = app.ctx().node("btn").unwrap();
+        // Press hit a normal button — not an outside click.
+        app.input.captured = Some(btn);
+        app.maybe_fire_unhandled_press();
+        assert_eq!(count.get(), 0, "press on a real button must not dismiss");
+    }
+
+    #[test]
+    fn unhandled_press_noop_without_hook() {
+        let mut app = App::new("test", 200, 200).scene(|s| {
+            s.rect("btn").size_px(50.0, 50.0).on_click(|_| {});
+        });
+        let _ = app.flush_tree();
+        app.input.captured = None;
+        // No hook registered — must not panic.
+        app.maybe_fire_unhandled_press();
+    }
+
+    #[test]
+    fn dismiss_transparent_node_is_a_hit_target() {
+        // A scrim with no other interactivity must still flatten into
+        // the hit cache so it blocks click-through.
+        let mut app = App::new("test", 200, 200).scene(|s| {
+            s.rect("scrim").fill().dismiss_transparent();
+        });
+        let _ = app.flush_tree();
+        let scrim = app.ctx().node("scrim").unwrap();
+        assert!(
+            app.hits.iter().any(|h| h.node_id == scrim),
+            "dismiss_transparent node should be a hit target"
+        );
+    }
+
+    // --- on_drag + drag-and-drop ---
+
+    fn center_of(app: &App, id: crate::node::NodeId) -> [f32; 2] {
+        let r = app.ctx().tree.get(id).unwrap().rect;
+        [r[0] + r[2] * 0.5, r[1] + r[3] * 0.5]
+    }
+
+    #[test]
+    fn on_drag_fires_with_per_event_delta() {
+        let last = Rc::new(Cell::new([0.0_f32, 0.0]));
+        let start_seen = Rc::new(Cell::new([0.0_f32, 0.0]));
+        let last_c = last.clone();
+        let start_c = start_seen.clone();
+        let mut app = App::new("test", 400, 400).scene(move |s| {
+            let last_c = last_c.clone();
+            let start_c = start_c.clone();
+            s.rect("knob").size_px(40.0, 40.0).on_drag(move |d| {
+                last_c.set(d.delta);
+                start_c.set(d.start);
+            });
+        });
+        let _ = app.flush_tree();
+        let knob = app.ctx().node("knob").unwrap();
+        app.input.captured = Some(knob);
+        app.input.cursor = Some([10.0, 10.0]);
+        app.begin_drag_if_draggable();
+        assert!(app.fire_drag(15.0, 10.0));
+        assert_eq!(last.get(), [5.0, 0.0], "delta is from press origin on first move");
+        assert_eq!(start_seen.get(), [10.0, 10.0]);
+        // Second move: delta is relative to the previous fire, not start.
+        assert!(app.fire_drag(22.0, 10.0));
+        assert_eq!(last.get(), [7.0, 0.0]);
+    }
+
+    #[test]
+    fn on_drag_not_fired_without_capture() {
+        let fired = Rc::new(Cell::new(false));
+        let fired_c = fired.clone();
+        let mut app = App::new("test", 400, 400).scene(move |s| {
+            let fired_c = fired_c.clone();
+            s.rect("knob").size_px(40.0, 40.0).on_drag(move |_| fired_c.set(true));
+        });
+        let _ = app.flush_tree();
+        // No press captured → no drag fires.
+        app.input.captured = None;
+        app.input.cursor = Some([10.0, 10.0]);
+        assert!(!app.fire_drag(20.0, 10.0));
+        assert!(!fired.get());
+    }
+
+    #[test]
+    fn drag_payload_delivered_to_drop_target() {
+        let got = Rc::new(Cell::new(None::<u32>));
+        let got_c = got.clone();
+        let mut app = App::new("test", 400, 400).scene(move |s| {
+            let got_c = got_c.clone();
+            s.col("root").fill().child(move |c| {
+                c.rect("src").size_px(100.0, 40.0).drag_payload(42_u32);
+                c.rect("dst").size_px(100.0, 40.0).on_drop(move |d| {
+                    if let Some(v) = d.payload.downcast_ref::<u32>() {
+                        got_c.set(Some(*v));
+                    }
+                });
+            });
+        });
+        let _ = app.flush_tree();
+        let src = app.ctx().node("src").unwrap();
+        let dst = app.ctx().node("dst").unwrap();
+        // Press on the source: latches the payload.
+        app.input.captured = Some(src);
+        app.input.cursor = Some(center_of(&app, src));
+        app.begin_drag_if_draggable();
+        assert!(app.drag_payload.is_some(), "payload latched on press");
+        // Release over the drop target.
+        app.input.cursor = Some(center_of(&app, dst));
+        app.finish_drag_on_release();
+        assert_eq!(got.get(), Some(42));
+        assert!(app.drag_payload.is_none(), "payload cleared after drop");
+    }
+
+    #[test]
+    fn drop_not_fired_when_released_off_target() {
+        let got = Rc::new(Cell::new(None::<u32>));
+        let got_c = got.clone();
+        let mut app = App::new("test", 400, 400).scene(move |s| {
+            let got_c = got_c.clone();
+            s.col("root").fill().child(move |c| {
+                c.rect("src").size_px(100.0, 40.0).drag_payload(7_u32);
+                c.rect("dst").size_px(100.0, 40.0).on_drop(move |d| {
+                    if let Some(v) = d.payload.downcast_ref::<u32>() {
+                        got_c.set(Some(*v));
+                    }
+                });
+            });
+        });
+        let _ = app.flush_tree();
+        let src = app.ctx().node("src").unwrap();
+        app.input.captured = Some(src);
+        app.input.cursor = Some(center_of(&app, src));
+        app.begin_drag_if_draggable();
+        // Release way off in empty space — no drop target there.
+        app.input.cursor = Some([350.0, 350.0]);
+        app.finish_drag_on_release();
+        assert_eq!(got.get(), None, "drop must not fire off-target");
+        assert!(app.drag_payload.is_none(), "payload still cleared");
+    }
+
+    #[test]
+    fn press_fires_initial_on_drag_for_click_to_set() {
+        // A plain click (press, no move) must fire on_drag once at the
+        // press position so sliders/scrubbers jump on click.
+        let seen = Rc::new(Cell::new([f32::NAN, f32::NAN]));
+        let seen_c = seen.clone();
+        let mut app = App::new("test", 400, 400).scene(move |s| {
+            let seen_c = seen_c.clone();
+            s.rect("track")
+                .size_px(200.0, 8.0)
+                .on_drag(move |d| seen_c.set(d.current));
+        });
+        let _ = app.flush_tree();
+        let track = app.ctx().node("track").unwrap();
+        app.input.captured = Some(track);
+        app.input.cursor = Some([120.0, 4.0]);
+        app.begin_drag_if_draggable();
+        assert_eq!(seen.get(), [120.0, 4.0], "on_drag fires at press position");
+    }
+
+    #[test]
+    fn drag_follow_tracks_and_clears() {
+        let mut app = App::new("test", 400, 400).scene(|s| {
+            s.col("root").fill().child(|c| {
+                c.rect("item")
+                    .size_px(80.0, 40.0)
+                    .drag_payload(1_u32)
+                    .drag_follow();
+            });
+        });
+        let _ = app.flush_tree();
+        let item = app.ctx().node("item").unwrap();
+        app.input.captured = Some(item);
+        app.input.cursor = Some([10.0, 10.0]);
+        app.begin_drag_if_draggable();
+        assert_eq!(app.ctx().tree.drag_follow_target(), Some(item), "lifts on press");
+        app.input.cursor = Some([30.0, 25.0]);
+        assert!(app.update_drag_follow(30.0, 25.0));
+        assert_eq!(app.ctx().tree.drag_follow_target(), Some(item));
+        // Release starts a snap-back animation — the lift is still active
+        // (animating home), not cleared instantly.
+        app.finish_drag_on_release();
+        assert!(app.drag_return.is_some(), "release starts a snap-back");
+        assert_eq!(app.ctx().tree.drag_follow_target(), Some(item), "still lifted mid-return");
+        // Simulate the tween reaching the slot, then tick the return.
+        app.drag_return_offset.set([0.0, 0.0]);
+        app.tick_drag_return();
+        assert_eq!(app.ctx().tree.drag_follow_target(), None, "lands → lift cleared");
+        assert!(app.drag_return.is_none());
+    }
+
+    #[test]
+    fn drag_follow_click_without_move_clears_immediately() {
+        let mut app = App::new("test", 400, 400).scene(|s| {
+            s.col("root").fill().child(|c| {
+                c.rect("item").size_px(80.0, 40.0).drag_payload(1_u32).drag_follow();
+            });
+        });
+        let _ = app.flush_tree();
+        let item = app.ctx().node("item").unwrap();
+        app.input.captured = Some(item);
+        app.input.cursor = Some([10.0, 10.0]);
+        app.begin_drag_if_draggable();
+        assert_eq!(app.ctx().tree.drag_follow_target(), Some(item));
+        // Release at the same spot — no snap-back needed.
+        app.finish_drag_on_release();
+        assert!(app.drag_return.is_none(), "no animation for a zero-move click");
+        assert_eq!(app.ctx().tree.drag_follow_target(), None, "lift cleared at once");
+    }
+
+    #[test]
+    fn drag_without_follow_flag_does_not_lift() {
+        let mut app = App::new("test", 400, 400).scene(|s| {
+            s.col("root").fill().child(|c| {
+                c.rect("item").size_px(80.0, 40.0).drag_payload(1_u32);
+            });
+        });
+        let _ = app.flush_tree();
+        let item = app.ctx().node("item").unwrap();
+        app.input.captured = Some(item);
+        app.input.cursor = Some([10.0, 10.0]);
+        app.begin_drag_if_draggable();
+        assert_eq!(app.ctx().tree.drag_follow_target(), None);
+        assert!(!app.update_drag_follow(30.0, 25.0));
+    }
+
+    #[test]
+    fn begin_drag_ignores_non_draggable_node() {
+        let mut app = App::new("test", 400, 400).scene(|s| {
+            s.rect("btn").size_px(40.0, 40.0).on_click(|_| {});
+        });
+        let _ = app.flush_tree();
+        let btn = app.ctx().node("btn").unwrap();
+        app.input.captured = Some(btn);
+        app.input.cursor = Some([10.0, 10.0]);
+        app.begin_drag_if_draggable();
+        assert!(app.drag_origin.is_none());
+        assert!(app.drag_payload.is_none());
+    }
+
+    // --- resolve_edit_op modifier routing ---
+
+    #[test]
+    fn resolve_shift_arrow_extends_selection() {
+        use crate::editor::EditOp;
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+        assert_eq!(
+            resolve_edit_op(&Key::Named(NamedKey::ArrowRight), None, ModifiersState::SHIFT),
+            Some(EditOp::SelectRight)
+        );
+        assert_eq!(
+            resolve_edit_op(&Key::Named(NamedKey::ArrowLeft), None, ModifiersState::SHIFT),
+            Some(EditOp::SelectLeft)
+        );
+        // Without shift, the same keys plain-move.
+        assert_eq!(
+            resolve_edit_op(&Key::Named(NamedKey::ArrowRight), None, ModifiersState::empty()),
+            Some(EditOp::MoveRight)
+        );
+    }
+
+    #[test]
+    fn resolve_shift_home_end_select_to_edges() {
+        use crate::editor::EditOp;
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+        assert_eq!(
+            resolve_edit_op(&Key::Named(NamedKey::Home), None, ModifiersState::SHIFT),
+            Some(EditOp::SelectHome)
+        );
+        assert_eq!(
+            resolve_edit_op(&Key::Named(NamedKey::End), None, ModifiersState::SHIFT),
+            Some(EditOp::SelectEnd)
+        );
+    }
+
+    #[test]
+    fn resolve_accel_combos() {
+        use crate::editor::EditOp;
+        use winit::keyboard::{Key, ModifiersState};
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(
+            resolve_edit_op(&Key::Character("a".into()), None, ctrl),
+            Some(EditOp::SelectAll)
+        );
+        assert_eq!(
+            resolve_edit_op(&Key::Character("c".into()), None, ctrl),
+            Some(EditOp::Copy)
+        );
+        assert_eq!(
+            resolve_edit_op(&Key::Character("x".into()), None, ctrl),
+            Some(EditOp::Cut)
+        );
+        // Unmapped accel combo (Ctrl+S) falls through, and the
+        // character isn't inserted while accel is held.
+        assert_eq!(resolve_edit_op(&Key::Character("s".into()), Some("s"), ctrl), None);
+    }
+
+    #[test]
+    fn resolve_plain_char_inserts() {
+        use crate::editor::EditOp;
+        use winit::keyboard::{Key, ModifiersState};
+        assert_eq!(
+            resolve_edit_op(&Key::Character("q".into()), Some("q"), ModifiersState::empty()),
+            Some(EditOp::Insert("q".to_string()))
+        );
+    }
+
+    #[test]
+    fn lazy_list_materializes_visible_window_only() {
+        // 10K-row list, item_height 40 logical px. With viewport
+        // height 200, ~5 rows visible. Buffer 2 each side → ~9 rows
+        // materialized.
+        let app = App::new("test", 400, 200);
+        let app = app.scene(move |s| {
+            s.lazy_list("list", 10_000, 40.0, |row, i| {
+                row.rect(format!("row{i}"))
+                    .w(Len::Fill)
+                    .h_px(40.0);
+            })
+            .fill();
+        });
+        let mut app = app;
+        // First flush — runs layout, materializes initial window.
+        let _ = app.flush_tree();
+        let list_id = app.ctx().node("list").unwrap();
+        let list = app.ctx().tree.get(list_id).unwrap();
+        let ll = list.lazy_list.as_ref().unwrap();
+        assert!(
+            ll.materialized.len() < 50,
+            "should not materialize all 10K rows: got {}",
+            ll.materialized.len()
+        );
+        assert!(
+            ll.materialized.len() >= 5,
+            "should materialize at least the visible rows: got {}",
+            ll.materialized.len()
+        );
+        // Content size must reflect total (10K * 40 = 400K logical
+        // px → 400K physical px at scale 1.0), driving scroll bounds.
+        assert!(
+            (list.content_size[1] - 400_000.0).abs() < 1.0,
+            "content_size {} should equal 10000 * 40",
+            list.content_size[1]
+        );
+    }
+
+    #[test]
+    fn lazy_list_scroll_re_materializes() {
+        let app = App::new("test", 400, 200);
+        let app = app.scene(move |s| {
+            s.lazy_list("list", 10_000, 40.0, |row, i| {
+                row.rect(format!("row{i}"))
+                    .w(Len::Fill)
+                    .h_px(40.0);
+            })
+            .fill();
+        });
+        let mut app = app;
+        let _ = app.flush_tree();
+        let list_id = app.ctx().node("list").unwrap();
+        let range_before = app
+            .ctx()
+            .tree
+            .get(list_id)
+            .unwrap()
+            .lazy_list
+            .as_ref()
+            .unwrap()
+            .range;
+        // Scroll down 4000 logical px (100 rows).
+        app.ctx
+            .tree
+            .set_scroll_target(list_id, [0.0, 4000.0]);
+        // Set current immediately to skip the spring (test harness
+        // doesn't run the timeline tick).
+        app.ctx
+            .tree
+            .set_scroll_immediate(list_id, crate::node::ScrollAxis::Y, 4000.0);
+        let _ = app.flush_tree();
+        let range_after = app
+            .ctx()
+            .tree
+            .get(list_id)
+            .unwrap()
+            .lazy_list
+            .as_ref()
+            .unwrap()
+            .range;
+        assert_ne!(range_before, range_after, "scrolling should shift window");
+        assert!(range_after[0] >= 90, "should materialize rows around index 100");
+    }
+
+    #[test]
+    fn rebuild_scene_resets_input_state() {
+        let mut app = App::new("test", 100, 100).scene(move |s| {
+            s.rect("a").size_px(10.0, 10.0);
+        });
+        // Pretend something captured a node id.
+        app.input.captured = app.ctx().node("a");
+        app.input.hovered = app.ctx().node("a");
+        assert!(app.input.captured.is_some());
+
+        app.rebuild_scene();
+
+        assert!(app.input.captured.is_none(), "captured must reset");
+        assert!(app.input.hovered.is_none(), "hovered must reset");
+    }
+
+    #[test]
+    fn rebuild_scene_preserves_hover_under_stationary_cursor() {
+        // Regression: rebuild_scene used to wipe `input.cursor` along
+        // with `hovered`, so a 5 Hz background rebuild (progress tick
+        // etc.) would clear hover signals on stationary buttons and let
+        // the next CursorMoved flip them back on — visible as flicker.
+        // Now cursor is preserved and hover is re-derived against the
+        // fresh hit cache so the signal stays on across rebuilds.
+        let hover_sig = crate::signal::Signal::new(false);
+        let hover_for_scene = hover_sig.clone();
+        let mut app = App::new("test", 100, 100).scene(move |s| {
+            s.rect("btn")
+                .size_px(40.0, 40.0)
+                .on_hover(hover_for_scene.clone());
+        });
+        let _ = app.flush_tree();
+        let id = app.ctx().node("btn").unwrap();
+        // Simulate the cursor sitting over the button.
+        let change = app
+            .input
+            .on_cursor_moved(20.0, 20.0, &app.hits, &app.ctx.tree);
+        assert!(change.hovered_changed);
+        assert_eq!(app.input.hovered, Some(id));
+        assert!(hover_sig.get(), "hover should latch on initial enter");
+
+        // Rebuild fires (e.g. periodic redraw). Cursor hasn't moved.
+        app.rebuild_scene();
+
+        let new_id = app.ctx().node("btn").unwrap();
+        assert_eq!(
+            app.input.hovered,
+            Some(new_id),
+            "hover must re-derive against the rebuilt tree"
+        );
+        assert!(
+            hover_sig.get(),
+            "hover signal must stay on across a no-op rebuild"
+        );
+    }
+
+    #[test]
+    fn dwell_arms_on_hover_into_dwell_node() {
+        let fired = Rc::new(Cell::new(0_u32));
+        let fired2 = fired.clone();
+        let mut app = App::new("test", 100, 100).scene(move |s| {
+            let fired_inner = fired2.clone();
+            s.rect("btn")
+                .size_px(40.0, 40.0)
+                .on_hover_dwell(std::time::Duration::from_millis(200), move |_| {
+                    fired_inner.set(fired_inner.get() + 1);
+                });
+        });
+        let id = app.ctx().node("btn").unwrap();
+        let now = Instant::now();
+        // No hover → refresh_dwell leaves tracker None.
+        app.refresh_dwell(now);
+        assert!(app.dwell.is_none());
+        // Simulate hover-enter.
+        app.input.hovered = Some(id);
+        app.refresh_dwell(now);
+        assert!(app.dwell.is_some(), "dwell should arm on hover-enter");
+        assert!(!app.dwell.unwrap().fired);
+        // Tick before deadline → no fire.
+        assert!(!app.tick_dwell(now + std::time::Duration::from_millis(100)));
+        assert_eq!(fired.get(), 0);
+        // Tick at/after deadline → fires once, marks fired.
+        assert!(app.tick_dwell(now + std::time::Duration::from_millis(250)));
+        assert_eq!(fired.get(), 1);
+        assert!(app.dwell.unwrap().fired);
+        // Tick again → no double-fire while still hovered.
+        assert!(!app.tick_dwell(now + std::time::Duration::from_millis(500)));
+        assert_eq!(fired.get(), 1);
+    }
+
+    #[test]
+    fn dwell_resets_when_hover_leaves() {
+        let fired = Rc::new(Cell::new(0_u32));
+        let fired2 = fired.clone();
+        let mut app = App::new("test", 100, 100).scene(move |s| {
+            let fired_inner = fired2.clone();
+            s.rect("btn")
+                .size_px(40.0, 40.0)
+                .on_hover_dwell(std::time::Duration::from_millis(200), move |_| {
+                    fired_inner.set(fired_inner.get() + 1);
+                });
+        });
+        let id = app.ctx().node("btn").unwrap();
+        let now = Instant::now();
+        app.input.hovered = Some(id);
+        app.refresh_dwell(now);
+        // Leave before deadline.
+        app.input.hovered = None;
+        app.refresh_dwell(now + std::time::Duration::from_millis(50));
+        assert!(app.dwell.is_none(), "dwell should clear on hover-leave");
+        // Re-enter → fresh deadline; previous 50ms doesn't count.
+        app.input.hovered = Some(id);
+        let now2 = now + std::time::Duration::from_millis(60);
+        app.refresh_dwell(now2);
+        assert!(!app.tick_dwell(now2 + std::time::Duration::from_millis(150)));
+        assert_eq!(fired.get(), 0);
+        assert!(app.tick_dwell(now2 + std::time::Duration::from_millis(210)));
+        assert_eq!(fired.get(), 1);
+    }
+
+    #[test]
+    fn dwell_handler_can_mutate_tree_via_ctx() {
+        let mut app = App::new("test", 100, 100).scene(move |s| {
+            // Tooltip child starts hidden — handler shows it on dwell.
+            s.rect("btn")
+                .size_px(40.0, 40.0)
+                .on_hover_dwell(std::time::Duration::from_millis(100), move |ctx| {
+                    if let Some(n) = ctx.tree.get_mut_raw(ctx.node) {
+                        n.style.color = [1.0, 0.0, 0.0, 1.0];
+                    }
+                });
+        });
+        let id = app.ctx().node("btn").unwrap();
+        let now = Instant::now();
+        app.input.hovered = Some(id);
+        app.refresh_dwell(now);
+        app.tick_dwell(now + std::time::Duration::from_millis(150));
+        let n = app.ctx().tree.get(id).unwrap();
+        assert_eq!(n.style.color, [1.0, 0.0, 0.0, 1.0]);
     }
 }

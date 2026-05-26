@@ -6,7 +6,7 @@ description = "Reactive GPU UI rendering library"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-wgpu = "29.0.1"
+wgpu = { version = "29.0.1", features = ["noop"] }
 winit = "0.30.13"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 pollster = "0.4"
@@ -15,6 +15,9 @@ env_logger = "0.11.10"
 png = "0.18.1"
 cosmic-text = "0.19.0"
 etagere = "0.3.0"
+resvg = "0.45"
+tiny-skia = "0.11"
+arboard = "3"
 
 [[example]]
 name = "hello_window"
@@ -27,3 +30,31 @@ path = "examples/layering.rs"
 [[example]]
 name = "glass_grid"
 path = "examples/glass_grid.rs"
+
+[[example]]
+name = "routes"
+path = "examples/routes.rs"
+
+[[example]]
+name = "text_input"
+path = "examples/text_input.rs"
+
+[[example]]
+name = "lazy_list"
+path = "examples/lazy_list.rs"
+
+[[example]]
+name = "lazy_list_expand"
+path = "examples/lazy_list_expand.rs"
+
+[[example]]
+name = "focus_cycle"
+path = "examples/focus_cycle.rs"
+
+[[example]]
+name = "modal"
+path = "examples/modal.rs"
+
+[[example]]
+name = "drag_drop"
+path = "examples/drag_drop.rs"

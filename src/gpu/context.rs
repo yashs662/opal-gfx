@@ -149,7 +149,10 @@ impl GpuContext {
         );
 
         let glyph_atlas = GlyphAtlas::new(&device, 1024);
-        let image_atlas = ImageAtlas::new(&device, 1024);
+        // 2048² (16 MiB RGBA) so multiple 640px album covers coexist
+        // without thrashing the eviction path. A single 640 cover nearly
+        // fills a 1024² atlas, forcing a repack on every track change.
+        let image_atlas = ImageAtlas::new(&device, 2048);
         let shape = ShapePipeline::new(
             &device,
             format,
@@ -365,7 +368,10 @@ impl GpuContext {
             if r.content.is_empty() {
                 continue;
             }
-            let shaped = text.shape(&r.content, r.font_size, r.line_height);
+            let shaped = match r.max_width {
+                Some(mw) => text.shape_constrained(&r.content, r.font_size, r.line_height, mw),
+                None => text.shape(&r.content, r.font_size, r.line_height),
+            };
             for g in shaped {
                 let Some(entry) =
                     self.glyph_atlas
@@ -396,6 +402,8 @@ impl GpuContext {
                     shadow_blur: 0.0,
                     shadow_opacity: 0.0,
                     opacity: r.opacity,
+                    scale: [1.0, 1.0],
+                    _pad1: [0.0, 0.0],
                 });
             }
         }
@@ -433,6 +441,8 @@ impl GpuContext {
                 shadow_blur: 0.0,
                 shadow_opacity: 0.0,
                 opacity: r.opacity,
+                scale: [1.0, 1.0],
+                _pad1: [0.0, 0.0],
             });
         }
         out
@@ -791,6 +801,7 @@ impl GpuContext {
             params_buffers,
             glyph_atlas: self.glyph_atlas.memory_bytes(),
             image_atlas: self.image_atlas.memory_bytes(),
+            image_sources_cpu: self.image_atlas.source_bytes(),
         }
     }
 
@@ -915,6 +926,10 @@ pub struct MemoryReport {
     pub params_buffers: u64,
     pub glyph_atlas: u64,
     pub image_atlas: u64,
+    /// CPU-side cache of source bytes for every uploaded image
+    /// (`ImageAtlas::source_bytes()`). Required so the eviction path
+    /// can re-pack survivors when the atlas fills.
+    pub image_sources_cpu: u64,
 }
 
 impl MemoryReport {
@@ -928,6 +943,7 @@ impl MemoryReport {
             + self.params_buffers
             + self.glyph_atlas
             + self.image_atlas
+            + self.image_sources_cpu
     }
 }
 

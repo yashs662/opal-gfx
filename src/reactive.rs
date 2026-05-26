@@ -39,7 +39,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::anim::{Curve, Lerp};
-use crate::signal::Signal;
+use crate::gpu::ImageHandle;
+use crate::signal::{Signal, TextSignal};
 
 /// Anything with a current value and a monotonic version counter.
 /// `Signal<T>` and `Computed<T>` both implement it so they compose
@@ -292,6 +293,123 @@ impl<T: Lerp> From<Computed<T>> for Bind<T> {
 impl<T: Lerp> From<AnimatedBind<T>> for Bind<T> {
     fn from(a: AnimatedBind<T>) -> Self {
         Bind::Animated(a)
+    }
+}
+
+/// Reactive image-handle prop, accepted by [`crate::scene::Scene::image_bound`].
+///
+/// Distinct from [`Bind`] because an `ImageHandle` is a discrete swap —
+/// there's nothing to interpolate, so it carries no animation policy and
+/// doesn't need [`Lerp`]. `Option` so a node can render nothing until its
+/// cover resolves (e.g. an album backdrop before the art lands). Accepts
+/// a literal handle, an `Option<ImageHandle>`, a `Signal`, or a
+/// `Computed` interchangeably via `From`.
+pub enum ImageBind {
+    Value(Option<ImageHandle>),
+    Signal(Signal<Option<ImageHandle>>),
+    Computed(Computed<Option<ImageHandle>>),
+}
+
+impl ImageBind {
+    pub fn read(&self) -> Option<ImageHandle> {
+        match self {
+            ImageBind::Value(v) => *v,
+            ImageBind::Signal(s) => s.get(),
+            ImageBind::Computed(c) => c.read(),
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        match self {
+            ImageBind::Value(_) => 0,
+            ImageBind::Signal(s) => s.version(),
+            ImageBind::Computed(c) => c.version(),
+        }
+    }
+
+    /// `false` for a static literal — no slot needs registering.
+    pub fn is_reactive(&self) -> bool {
+        !matches!(self, ImageBind::Value(_))
+    }
+}
+
+impl From<Option<ImageHandle>> for ImageBind {
+    fn from(v: Option<ImageHandle>) -> Self {
+        ImageBind::Value(v)
+    }
+}
+
+impl From<ImageHandle> for ImageBind {
+    fn from(v: ImageHandle) -> Self {
+        ImageBind::Value(Some(v))
+    }
+}
+
+impl From<Signal<Option<ImageHandle>>> for ImageBind {
+    fn from(s: Signal<Option<ImageHandle>>) -> Self {
+        ImageBind::Signal(s)
+    }
+}
+
+impl From<Computed<Option<ImageHandle>>> for ImageBind {
+    fn from(c: Computed<Option<ImageHandle>>) -> Self {
+        ImageBind::Computed(c)
+    }
+}
+
+/// Reactive text-content prop, accepted by [`crate::scene::Scene::text_bound`].
+///
+/// Like [`ImageBind`], it's separate from [`Bind`] — a string can't be
+/// interpolated and `String`/`Rc<str>` aren't `Copy`, so it can't ride
+/// the `Lerp`/`Source` machinery. No `Computed` variant: the `Source`
+/// trait is `Copy`-bound, so a computed string isn't expressible; pass a
+/// [`TextSignal`] (or update it from a closure) for derived text.
+pub enum TextBind {
+    Value(std::rc::Rc<str>),
+    Signal(TextSignal),
+}
+
+impl TextBind {
+    pub fn read(&self) -> std::rc::Rc<str> {
+        match self {
+            TextBind::Value(v) => v.clone(),
+            TextBind::Signal(s) => s.get(),
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        match self {
+            TextBind::Value(_) => 0,
+            TextBind::Signal(s) => s.version(),
+        }
+    }
+
+    pub fn is_reactive(&self) -> bool {
+        matches!(self, TextBind::Signal(_))
+    }
+}
+
+impl From<TextSignal> for TextBind {
+    fn from(s: TextSignal) -> Self {
+        TextBind::Signal(s)
+    }
+}
+
+impl From<&str> for TextBind {
+    fn from(s: &str) -> Self {
+        TextBind::Value(s.into())
+    }
+}
+
+impl From<String> for TextBind {
+    fn from(s: String) -> Self {
+        TextBind::Value(s.into())
+    }
+}
+
+impl From<std::rc::Rc<str>> for TextBind {
+    fn from(s: std::rc::Rc<str>) -> Self {
+        TextBind::Value(s)
     }
 }
 

@@ -113,6 +113,77 @@ impl TextResources {
         m
     }
 
+    /// Pick the longest character prefix of `text` whose `prefix + "…"`
+    /// renders at ≤ `max_width_px`. Used by both `measure_constrained`
+    /// and `shape_constrained` so the truncation point is consistent
+    /// across measure + render. When the full string already fits,
+    /// returns the original `text` unchanged (no ellipsis).
+    pub fn truncated_text(
+        &mut self,
+        text: &str,
+        size_px: f32,
+        line_height_px: f32,
+        max_width_px: f32,
+    ) -> String {
+        let full = self.measure(text, size_px, line_height_px);
+        if full.width <= max_width_px {
+            return text.to_string();
+        }
+        // Binary-search the longest *character* prefix. We binary search
+        // on the character index, not byte index, so we never split a
+        // multi-byte codepoint. Cosmic-text's shaping respects
+        // grapheme-cluster boundaries internally; this binary search
+        // can occasionally land on a non-grapheme break (combining
+        // marks), but the visual artifact is a missing accent at the
+        // truncation point — acceptable for v1.
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut lo = 0usize;
+        let mut hi = chars.len();
+        let mut best = 0usize;
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            let byte_end = chars.get(mid).map(|(b, _)| *b).unwrap_or(text.len());
+            let candidate = format!("{}\u{2026}", &text[..byte_end]);
+            let m = self.measure(&candidate, size_px, line_height_px);
+            if m.width <= max_width_px {
+                best = mid;
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let byte_end = chars.get(best).map(|(b, _)| *b).unwrap_or(text.len());
+        format!("{}\u{2026}", &text[..byte_end])
+    }
+
+    /// Measure `text` constrained to `max_width_px`. If the unconstrained
+    /// measurement fits, returns it; otherwise returns the measurement
+    /// of the truncated `prefix + "…"` form.
+    pub fn measure_constrained(
+        &mut self,
+        text: &str,
+        size_px: f32,
+        line_height_px: f32,
+        max_width_px: f32,
+    ) -> TextMetrics {
+        let s = self.truncated_text(text, size_px, line_height_px, max_width_px);
+        self.measure(&s, size_px, line_height_px)
+    }
+
+    /// Shape `text` constrained to `max_width_px`. Identical to
+    /// [`Self::shape`] when the original fits; otherwise shapes the
+    /// `prefix + "…"` truncation.
+    pub fn shape_constrained(
+        &mut self,
+        text: &str,
+        size_px: f32,
+        line_height_px: f32,
+        max_width_px: f32,
+    ) -> Vec<ShapedGlyph> {
+        let s = self.truncated_text(text, size_px, line_height_px, max_width_px);
+        self.shape(&s, size_px, line_height_px)
+    }
+
     /// Rasterize one glyph. Returns `None` for color-emoji glyphs
     /// (stage-1 atlas is R8 only) or missing glyphs.
     pub fn rasterize(&mut self, key: CacheKey) -> Option<RasterizedGlyph> {
@@ -142,6 +213,16 @@ impl Default for TextResources {
 impl crate::layout::Measurer for TextResources {
     fn measure_text(&mut self, content: &str, font_size: f32, line_height: f32) -> [f32; 2] {
         let m = self.measure(content, font_size, line_height);
+        [m.width, m.height]
+    }
+    fn measure_text_constrained(
+        &mut self,
+        content: &str,
+        font_size: f32,
+        line_height: f32,
+        max_width: f32,
+    ) -> [f32; 2] {
+        let m = self.measure_constrained(content, font_size, line_height, max_width);
         [m.width, m.height]
     }
 }
@@ -261,6 +342,44 @@ mod tests {
         let m2 = t.measure("hello", 16.0, 20.0);
         assert_eq!(m1.width, m2.width);
         assert_eq!(t.measure_cache.len(), 1);
+    }
+
+    #[test]
+    fn truncated_text_returns_original_when_fits() {
+        let mut t = TextResources::new();
+        // Full string fits in 1000 px at 16pt easily.
+        let s = t.truncated_text("hello", 16.0, 20.0, 1000.0);
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn truncated_text_appends_ellipsis_when_too_wide() {
+        let mut t = TextResources::new();
+        let full_w = t.measure("hello world", 16.0, 20.0).width;
+        // Cap at half — must truncate.
+        let s = t.truncated_text("hello world", 16.0, 20.0, full_w * 0.5);
+        assert!(s.ends_with('\u{2026}'), "expected ellipsis suffix: {s:?}");
+        assert!(s.chars().count() < "hello world".chars().count() + 1);
+        let new_w = t.measure(&s, 16.0, 20.0).width;
+        assert!(new_w <= full_w * 0.5 + 0.5, "truncated width {} exceeds cap {}", new_w, full_w * 0.5);
+    }
+
+    #[test]
+    fn measure_constrained_matches_truncated_form() {
+        let mut t = TextResources::new();
+        let full_w = t.measure("a long string", 16.0, 20.0).width;
+        let cap = full_w * 0.3;
+        let constrained = t.measure_constrained("a long string", 16.0, 20.0, cap);
+        assert!(constrained.width <= cap + 0.5);
+    }
+
+    #[test]
+    fn shape_constrained_emits_fewer_glyphs_than_full() {
+        let mut t = TextResources::new();
+        let full = t.shape("the quick brown fox", 16.0, 20.0);
+        let full_w = t.measure("the quick brown fox", 16.0, 20.0).width;
+        let trunc = t.shape_constrained("the quick brown fox", 16.0, 20.0, full_w * 0.4);
+        assert!(trunc.len() < full.len());
     }
 
     #[test]

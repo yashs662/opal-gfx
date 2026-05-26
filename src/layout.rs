@@ -113,6 +113,22 @@ pub struct LayoutStyle {
     /// Per-axis overflow behavior. Default Visible on both axes.
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
+    /// When true on a flow child, absorbs all remaining slack on the
+    /// main axis *before* this child — equivalent to CSS
+    /// `margin-left: auto` on the first such child. Subsequent
+    /// children pack normally after it. Has no effect on absolute
+    /// children, on the first flow child (no slack to absorb), or
+    /// when the parent's `justify` is anything other than
+    /// `Justify::Start` (other justify variants already distribute
+    /// slack, so push_end would double-shift).
+    pub push_end: bool,
+    /// Tab-focus order. `0` (default) means the node is **excluded**
+    /// from keyboard focus cycling. A non-zero value opts the node into
+    /// the Tab order; nodes are visited in ascending `focus_order`,
+    /// ties broken by document (creation) order. Mirrors HTML
+    /// `tabindex` except that `0` here means "skip" rather than
+    /// "natural order". See [`crate::App`] Tab / Shift+Tab handling.
+    pub focus_order: u32,
 }
 
 impl Default for LayoutStyle {
@@ -128,6 +144,8 @@ impl Default for LayoutStyle {
             abs: None,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
+            push_end: false,
+            focus_order: 0,
         }
     }
 }
@@ -147,6 +165,21 @@ impl LayoutStyle {
 pub trait Measurer {
     /// Return `[width, height]` in px for the given shaped text.
     fn measure_text(&mut self, content: &str, font_size: f32, line_height: f32) -> [f32; 2];
+
+    /// Measure `content` constrained to `max_width` (physical px). When
+    /// the unconstrained measurement would exceed the constraint, the
+    /// returned dimensions describe the truncated `prefix + "…"` form.
+    /// Default impl falls back to [`Self::measure_text`] — sufficient
+    /// for measurers without a truncation pass (e.g. `NullMeasurer`).
+    fn measure_text_constrained(
+        &mut self,
+        content: &str,
+        font_size: f32,
+        line_height: f32,
+        _max_width: f32,
+    ) -> [f32; 2] {
+        self.measure_text(content, font_size, line_height)
+    }
 }
 
 /// Null measurer — use when the tree contains no text nodes (e.g.
@@ -192,7 +225,7 @@ fn layout_root<M: Measurer>(
     }
     let style = node.layout.clone();
     let kind_text = node.text.as_ref().map(|t| {
-        (t.content.clone(), t.font_size * scale, t.line_height * scale)
+        (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale))
     });
 
     let w = resolve_main_size(
@@ -269,7 +302,7 @@ fn layout_children<M: Measurer>(
             let text = n
                 .text
                 .as_ref()
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale));
+                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
             (len, text)
         };
         match len {
@@ -351,8 +384,25 @@ fn layout_children<M: Measurer>(
     let mut max_x: f32 = content_x;
     let mut max_y: f32 = content_y;
 
+    // push_end resolution: find the first flow child (after index 0)
+    // with push_end=true. When the parent justify is Start, inject
+    // `slack` into the cursor immediately before that child — CSS
+    // `margin-left: auto`. Other justify variants already distribute
+    // slack; bail to avoid double-shift.
+    let push_end_index = if matches!(style.justify, Justify::Start) {
+        flow.iter().enumerate().skip(1).find_map(|(i, c)| {
+            let n = tree.get(*c)?;
+            if n.layout.push_end { Some(i) } else { None }
+        })
+    } else {
+        None
+    };
+
     let mut cursor = main_start + leading;
     for (i, &c) in flow.iter().enumerate() {
+        if Some(i) == push_end_index {
+            cursor += slack;
+        }
         let m = child_main[i];
         // Cross-axis size.
         let (cross_len, text) = {
@@ -364,7 +414,7 @@ fn layout_children<M: Measurer>(
             let text = n
                 .text
                 .as_ref()
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale));
+                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
             (len, text)
         };
         let cross = resolve_cross_size(
@@ -405,7 +455,7 @@ fn layout_children<M: Measurer>(
             let text = n
                 .text
                 .as_ref()
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale));
+                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
             (n.layout.width, n.layout.height, off, text)
         };
         let w = match width_len {
@@ -435,14 +485,22 @@ fn layout_children<M: Measurer>(
     let content_extent_w = (max_x - parent_rect[0]) + pad_r;
     let content_extent_h = (max_y - parent_rect[1]) + pad_b;
     if let Some(p) = tree.get_mut_raw(parent) {
-        p.content_size = [content_extent_w, content_extent_h];
+        let mut cs = [content_extent_w, content_extent_h];
+        // A lazy list only materializes a small window of rows, so the
+        // measured child extent is NOT the scrollable height. Override the
+        // main axis with the full virtual height (item_count * item_height)
+        // so the scrollbar + bounds reflect the whole list, not the window.
+        if let Some(ll) = p.lazy_list.as_ref() {
+            cs[1] = ll.total_height_logical() * scale;
+        }
+        p.content_size = cs;
         // Re-clamp scroll target if not in overscroll mode and content
         // shrank below current target.
         if let Some(s) = p.scroll.as_mut()
             && !s.overscroll
         {
-            let max_off_x = (content_extent_w - parent_rect[2]).max(0.0);
-            let max_off_y = (content_extent_h - parent_rect[3]).max(0.0);
+            let max_off_x = (cs[0] - parent_rect[2]).max(0.0);
+            let max_off_y = (cs[1] - parent_rect[3]).max(0.0);
             s.target[0] = s.target[0].clamp(0.0, max_off_x);
             s.target[1] = s.target[1].clamp(0.0, max_off_y);
             s.current[0] = s.current[0].clamp(0.0, max_off_x);
@@ -460,7 +518,7 @@ fn resolve_main_size<M: Measurer>(
     measurer: &mut M,
     tree: &NodeTree,
     id: NodeId,
-    text: &Option<(String, f32, f32)>,
+    text: &Option<(String, f32, f32, Option<f32>)>,
     is_width_axis: bool,
     scale: f32,
 ) -> f32 {
@@ -487,7 +545,7 @@ fn intrinsic_main<M: Measurer>(
     id: NodeId,
     probe_axis: Axis,
     cross_avail: f32,
-    text: &Option<(String, f32, f32)>,
+    text: &Option<(String, f32, f32, Option<f32>)>,
     measurer: &mut M,
     scale: f32,
 ) -> f32 {
@@ -495,8 +553,11 @@ fn intrinsic_main<M: Measurer>(
     if !n.visible {
         return 0.0;
     }
-    if let Some((content, size, lh)) = text {
-        let m = measurer.measure_text(content, *size, *lh);
+    if let Some((content, size, lh, max_w)) = text {
+        let m = match max_w {
+            Some(w) => measurer.measure_text_constrained(content, *size, *lh, *w),
+            None => measurer.measure_text(content, *size, *lh),
+        };
         return match probe_axis {
             Axis::Row => m[0],
             Axis::Col => m[1],
@@ -514,13 +575,16 @@ fn intrinsic_main_from_node<M: Measurer>(
     self_axis: Axis,
     probe_axis: Axis,
     cross_avail: f32,
-    self_text: &Option<(String, f32, f32)>,
+    self_text: &Option<(String, f32, f32, Option<f32>)>,
     measurer: &mut M,
     scale: f32,
 ) -> f32 {
     let Some(n) = tree.get(id) else { return 0.0 };
-    if let Some((content, size, lh)) = self_text {
-        let m = measurer.measure_text(content, *size, *lh);
+    if let Some((content, size, lh, max_w)) = self_text {
+        let m = match max_w {
+            Some(w) => measurer.measure_text_constrained(content, *size, *lh, *w),
+            None => measurer.measure_text(content, *size, *lh),
+        };
         return match probe_axis {
             Axis::Row => m[0],
             Axis::Col => m[1],
@@ -562,7 +626,7 @@ fn intrinsic_main_from_node<M: Measurer>(
             let text = tree
                 .get(*c)
                 .and_then(|cn| cn.text.as_ref())
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale));
+                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
             let len = match probe_axis {
                 Axis::Row => tree.get(*c).map(|cn| cn.layout.width).unwrap_or_default(),
                 Axis::Col => tree.get(*c).map(|cn| cn.layout.height).unwrap_or_default(),
@@ -584,7 +648,7 @@ fn intrinsic_main_from_node<M: Measurer>(
             let text = tree
                 .get(*c)
                 .and_then(|cn| cn.text.as_ref())
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale));
+                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
             let len = match probe_axis {
                 Axis::Row => tree.get(*c).map(|cn| cn.layout.width).unwrap_or_default(),
                 Axis::Col => tree.get(*c).map(|cn| cn.layout.height).unwrap_or_default(),
@@ -613,7 +677,7 @@ fn resolve_cross_size<M: Measurer>(
     len: &Len,
     cross_avail: f32,
     align: Align,
-    text: &Option<(String, f32, f32)>,
+    text: &Option<(String, f32, f32, Option<f32>)>,
     measurer: &mut M,
     parent_axis: Axis,
     scale: f32,
@@ -779,6 +843,90 @@ mod tests {
             .collect();
         assert_eq!(kids[0], [0.0, 0.0, 200.0, 30.0]);
         assert_eq!(kids[1], [50.0, 60.0, 40.0, 40.0]);
+    }
+
+    #[test]
+    fn push_end_absorbs_slack_before_marked_child() {
+        // Row with 3 children of 20px each in a 200px container.
+        // Middle child has push_end → slack (200 - 60 = 140) before it.
+        // Expected x positions: 0, 160, 180.
+        let mut tree = NodeTree::new();
+        let root = tree.add_root(
+            Node::rect()
+                .layout_axis(Axis::Row)
+                .layout_width(Len::Px(200.0))
+                .layout_height(Len::Px(40.0))
+                .build(),
+        );
+        for i in 0..3 {
+            let mut b = Node::rect()
+                .layout_width(Len::Px(20.0))
+                .layout_height(Len::Px(40.0));
+            if i == 1 { b = b.push_end(); }
+            tree.add_child(root, b.build());
+        }
+        compute_layout(&mut tree, [1000.0, 1000.0], &mut NullMeasurer, 1.0);
+        let kids = tree.get(root).unwrap().children.clone();
+        assert_eq!(tree.get(kids[0]).unwrap().rect[0], 0.0);
+        assert_eq!(tree.get(kids[1]).unwrap().rect[0], 160.0);
+        assert_eq!(tree.get(kids[2]).unwrap().rect[0], 180.0);
+    }
+
+    #[test]
+    fn push_end_noop_on_first_child() {
+        let mut tree = NodeTree::new();
+        let root = tree.add_root(
+            Node::rect()
+                .layout_axis(Axis::Row)
+                .layout_width(Len::Px(200.0))
+                .layout_height(Len::Px(40.0))
+                .build(),
+        );
+        let c0 = tree.add_child(root, Node::rect().layout_width(Len::Px(20.0)).layout_height(Len::Px(40.0)).push_end().build());
+        let c1 = tree.add_child(root, Node::rect().layout_width(Len::Px(20.0)).layout_height(Len::Px(40.0)).build());
+        compute_layout(&mut tree, [1000.0, 1000.0], &mut NullMeasurer, 1.0);
+        assert_eq!(tree.get(c0).unwrap().rect[0], 0.0);
+        assert_eq!(tree.get(c1).unwrap().rect[0], 20.0);
+    }
+
+    #[test]
+    fn push_end_ignored_when_justify_is_not_start() {
+        let mut tree = NodeTree::new();
+        let root = tree.add_root(
+            Node::rect()
+                .layout_axis(Axis::Row)
+                .layout_width(Len::Px(200.0))
+                .layout_height(Len::Px(40.0))
+                .layout_justify(Justify::Center)
+                .build(),
+        );
+        let c0 = tree.add_child(root, Node::rect().layout_width(Len::Px(20.0)).layout_height(Len::Px(40.0)).build());
+        let c1 = tree.add_child(root, Node::rect().layout_width(Len::Px(20.0)).layout_height(Len::Px(40.0)).push_end().build());
+        compute_layout(&mut tree, [1000.0, 1000.0], &mut NullMeasurer, 1.0);
+        // Center: slack 160, leading 80, children at 80 and 100.
+        assert_eq!(tree.get(c0).unwrap().rect[0], 80.0);
+        assert_eq!(tree.get(c1).unwrap().rect[0], 100.0);
+    }
+
+    #[test]
+    fn center_shortcut_centers_text_child_both_axes() {
+        // NullMeasurer returns [chars * font_size * 0.6, font_size]
+        // for text → "ABC" at 10px = [18, 10]. Parent 100x40, expect
+        // text at x=(100-18)/2=41, y=(40-10)/2=15.
+        let mut tree = NodeTree::new();
+        let root = tree.add_root(
+            Node::rect()
+                .layout_axis(Axis::Row)
+                .layout_width(Len::Px(100.0))
+                .layout_height(Len::Px(40.0))
+                .center()
+                .build(),
+        );
+        let child = tree.add_child(root, Node::text("ABC", 10.0).build());
+        compute_layout(&mut tree, [1000.0, 1000.0], &mut NullMeasurer, 1.0);
+        let r = tree.get(child).unwrap().rect;
+        assert_eq!(r[0], 41.0);
+        assert_eq!(r[1], 15.0);
     }
 
     #[test]
