@@ -1049,6 +1049,26 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
+    /// Force-promote this subtree to its own compositor layer. See
+    /// [`crate::node::Node::layer`].
+    pub fn layer(&mut self) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.layer = true;
+        }
+        self
+    }
+
+    /// Promote to a layer (implies [`Self::layer`]) and drive its composite
+    /// opacity from `signal` each frame — composite-only, no re-raster.
+    /// See [`crate::node::Node::layer_opacity`].
+    pub fn layer_opacity(&mut self, signal: crate::signal::Signal<f32>) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.layer = true;
+            n.layer_opacity = Some(signal);
+        }
+        self
+    }
+
     // --- overflow / scroll ---
 
     /// Set per-axis overflow. Goes through [`NodeTree::set_layout_overflow`]

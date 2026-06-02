@@ -97,6 +97,55 @@ impl HitEntry {
     }
 }
 
+/// A force-promoted subtree (`.layer()`) discovered during flatten,
+/// recorded in declared (painter) order. `events` is the half-open
+/// range of [`FlatEvent`]s the subtree occupies — the app maps it to an
+/// instance range (events expand 1:N for text/images) and hands it to
+/// [`crate::layer::LayerTree`]. Nested promotions are dropped: only the
+/// outermost `.layer()` on any path is kept (see `flatten_into`).
+///
+/// `scroll` is `Some` when the promoted node is a **scroll container**:
+/// its children were emitted **content-local** (scroll offset NOT baked,
+/// self-clip NOT applied — both are done at composite time) into a
+/// content-sized layer texture, and these fields describe the composite
+/// window (where on screen the viewport sits, how tall the content is,
+/// the live scroll offset). `None` = a plain force-promoted layer
+/// (full-surface texture, absolute coords — the P3-foundation path).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerSpan {
+    pub node: NodeId,
+    pub events: std::ops::Range<usize>,
+    pub scroll: Option<ScrollSpan>,
+}
+
+/// Composite-window geometry for a promoted **scroll** layer, in physical
+/// px (flatten already scaled). The layer texture is `[viewport_w,
+/// content_h]`; the composite samples a `viewport`-sized window at
+/// `scroll` and places it at `viewport_origin` on screen, clipped to the
+/// viewport rect.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollSpan {
+    /// Screen-space top-left of the scroll viewport (physical px).
+    pub viewport_origin: [f32; 2],
+    /// Viewport size on screen (physical px).
+    pub viewport: [f32; 2],
+    /// Texture size (physical px) — width tracks the viewport, height is
+    /// the texture's content extent. For a bounded (non-lazy) scroller
+    /// this is the whole content height; for a **lazy list** it's the
+    /// *windowed* extent covering only the materialized rows (the full
+    /// virtual height would be enormous — 2b).
+    pub content: [f32; 2],
+    /// Content-space offset (physical px) of the texture's top — `[0,0]`
+    /// for a bounded scroller (texture origin = content origin); for a
+    /// windowed lazy list, the content-top of the first materialized row,
+    /// so children emit relative to the window top and the composite
+    /// samples at `scroll - tex_origin`.
+    pub tex_origin: [f32; 2],
+    /// Live scroll offset (physical px) — the window's sample origin
+    /// (before subtracting `tex_origin`).
+    pub scroll: [f32; 2],
+}
+
 /// One scrollable container discovered during flatten. Wheel input
 /// finds the topmost ScrollHit under the cursor and walks
 /// `ancestor_chain` for edge-bubble (innermost-first; self is at index
@@ -590,6 +639,21 @@ pub struct Node {
     /// of the glass and can't affect it). Default false: a node is
     /// assumed to be in front of any glass unless it opts in.
     pub blur_source: bool,
+    /// Force-promote this subtree to its own compositor layer (P3). Its
+    /// instances rasterize into a dedicated texture so its composite
+    /// transform / opacity can animate without re-rasterizing siblings,
+    /// and its pixels are reused (raster skipped) on composite-only
+    /// frames. Default false — most nodes stay merged into the root
+    /// layer. See [`crate::layer::LayerTree`].
+    pub layer: bool,
+    /// Optional composite-opacity source for a `.layer()`-promoted
+    /// subtree. When set, the app pushes this signal's value into the
+    /// layer's composite opacity each frame (composite-only — the layer's
+    /// cached texture is reused, no re-raster). Declarative analog of
+    /// [`crate::app::App::bind_layer_opacity`]; the app collects these
+    /// during flush so it survives scene rebuilds without app access from
+    /// the scene closure. Only meaningful with `layer = true`.
+    pub layer_opacity: Option<crate::signal::Signal<f32>>,
     pub children: Vec<NodeId>,
     pub interact: NodeInteract,
     pub text: Option<NodeText>,
@@ -660,6 +724,7 @@ impl std::fmt::Debug for Node {
             .field("content_size", &self.content_size)
             .field("scroll", &self.scroll)
             .field("visible", &self.visible)
+            .field("layer", &self.layer)
             .field("children", &self.children)
             .field("interact", &self.interact)
             .field("text", &self.text)
@@ -692,6 +757,8 @@ impl Node {
                 scroll: None,
                 visible: true,
                 blur_source: false,
+                layer: false,
+                layer_opacity: None,
                 children: Vec::new(),
                 interact: NodeInteract::default(),
                 text: None,
@@ -1006,6 +1073,21 @@ impl NodeBuilder {
     /// changes re-run the blur. See [`Node::blur_source`].
     pub fn blur_source(mut self) -> Self {
         self.node.blur_source = true;
+        self
+    }
+
+    /// Force-promote this subtree to its own compositor layer. See
+    /// [`Node::layer`].
+    pub fn layer(mut self) -> Self {
+        self.node.layer = true;
+        self
+    }
+    /// Promote to a layer (implies [`Self::layer`]) and drive its composite
+    /// opacity from `signal` each frame — composite-only, no re-raster. See
+    /// [`Node::layer_opacity`].
+    pub fn layer_opacity(mut self, signal: crate::signal::Signal<f32>) -> Self {
+        self.node.layer = true;
+        self.node.layer_opacity = Some(signal);
         self
     }
     pub fn kind(mut self, kind: ShapeKind) -> Self {
@@ -2379,12 +2461,14 @@ impl NodeTree {
         let mut hits = Vec::new();
         let mut scroll_hits = Vec::new();
         let mut scroll_bars = Vec::new();
+        let mut spans = Vec::new();
         self.flatten_into_buffers(
             scale,
             &mut events,
             &mut hits,
             &mut scroll_hits,
             &mut scroll_bars,
+            &mut spans,
         );
         (events, hits, scroll_hits, scroll_bars)
     }
@@ -2402,11 +2486,13 @@ impl NodeTree {
         hits: &mut Vec<HitEntry>,
         scroll_hits: &mut Vec<ScrollHit>,
         scroll_bars: &mut Vec<ScrollbarHit>,
+        spans: &mut Vec<LayerSpan>,
     ) {
         events.clear();
         hits.clear();
         scroll_hits.clear();
         scroll_bars.clear();
+        spans.clear();
         let mut scroll_stack: Vec<NodeId> = Vec::new();
         // A drag-follow node is skipped in its normal tree slot (leaving
         // a hole) and re-emitted last below so it paints on top.
@@ -2417,12 +2503,16 @@ impl NodeTree {
                 1.0,
                 NO_CLIP,
                 [0.0; 2],
+                NO_CLIP,
+                [0.0; 2],
                 skip,
                 &mut scroll_stack,
                 events,
                 hits,
                 scroll_hits,
                 scroll_bars,
+                spans,
+                false,
                 scale,
             );
         }
@@ -2436,9 +2526,12 @@ impl NodeTree {
             let mut throwaway_hits = Vec::new();
             let mut throwaway_scroll = Vec::new();
             let mut throwaway_bars = Vec::new();
+            let mut throwaway_spans = Vec::new();
             self.flatten_into(
                 node,
                 1.0,
+                NO_CLIP,
+                [-dx, -dy],
                 NO_CLIP,
                 [-dx, -dy],
                 None,
@@ -2447,6 +2540,9 @@ impl NodeTree {
                 &mut throwaway_hits,
                 &mut throwaway_scroll,
                 &mut throwaway_bars,
+                &mut throwaway_spans,
+                // Suppress promotion in the transient drag ghost.
+                true,
                 scale,
             );
         }
@@ -2465,12 +2561,23 @@ impl NodeTree {
         parent_opacity: f32,
         clip: [f32; 4],
         offset: [f32; 2],
+        // Hit-space clip + offset, used for `HitEntry`/`ScrollHit` bounds
+        // (input lives in screen space). Equal to `clip`/`offset`
+        // everywhere EXCEPT inside a scroll layer: there the *visual*
+        // offset/clip go content-local (into the layer texture) while
+        // hits stay screen-space (scroll baked + viewport-clipped), so the
+        // two diverge at the scroll-layer boundary and the children's hit
+        // boxes still land where they're drawn on screen.
+        hit_clip: [f32; 4],
+        hit_offset: [f32; 2],
         skip: Option<NodeId>,
         scroll_stack: &mut Vec<NodeId>,
         events: &mut Vec<FlatEvent>,
         hits: &mut Vec<HitEntry>,
         scroll_hits: &mut Vec<ScrollHit>,
         scroll_bars: &mut Vec<ScrollbarHit>,
+        spans: &mut Vec<LayerSpan>,
+        in_layer: bool,
         scale: f32,
     ) {
         // Skip the drag-follow node in its normal slot — re-emitted last
@@ -2482,8 +2589,28 @@ impl NodeTree {
         if !node.visible {
             return;
         }
+        // Force-promotion (`.layer()`): record this subtree's event span
+        // unless we're already inside a promoted subtree (nested
+        // promotions collapse into the outermost — P3 supports
+        // non-nested promotion only). The span is closed after the
+        // children + scrollbar emission below.
+        let promote = node.layer && !in_layer;
+        // A promoted **scroll container** rasters its content into a tall
+        // content-sized texture: children emit content-local (scroll NOT
+        // baked, self-clip NOT applied — both happen at composite time),
+        // while the container's own shape + scrollbars stay in the root
+        // layer at screen coords. So the layer span covers the *children*
+        // sub-range, not the whole subtree.
+        let is_scroll_layer = promote && node.scroll.is_some() && node.layout.scrolls();
+        let span_start = events.len();
+        let child_in_layer = in_layer || node.layer;
         let rect = node.rect;
+        // Visual position (→ instances / layer texture). Inside a scroll
+        // layer this is content-local; outside it equals the hit position.
         let abs = [rect[0] - offset[0], rect[1] - offset[1]];
+        // Screen-space position (→ hit-test). Always the real on-screen
+        // rect, so clicks/hover land where the pixels actually are.
+        let hit_abs = [rect[0] - hit_offset[0], rect[1] - hit_offset[1]];
         let size = [rect[2], rect[3]];
         let opacity = parent_opacity * node.style.opacity;
         match node.style.kind {
@@ -2564,8 +2691,8 @@ impl NodeTree {
         {
             hits.push(HitEntry {
                 node_id: id,
-                bounds: [abs[0], abs[1], abs[0] + size[0], abs[1] + size[1]],
-                clip_rect: clip,
+                bounds: [hit_abs[0], hit_abs[1], hit_abs[0] + size[0], hit_abs[1] + size[1]],
+                clip_rect: hit_clip,
             });
         }
         // Emit a ScrollHit for any container whose layout scrolls. The
@@ -2578,8 +2705,8 @@ impl NodeTree {
             chain.extend(scroll_stack.iter().rev().copied());
             scroll_hits.push(ScrollHit {
                 node_id: id,
-                bounds: [abs[0], abs[1], abs[0] + size[0], abs[1] + size[1]],
-                clip_rect: clip,
+                bounds: [hit_abs[0], hit_abs[1], hit_abs[0] + size[0], hit_abs[1] + size[1]],
+                clip_rect: hit_clip,
                 ancestor_chain: chain,
             });
             scroll_stack.push(id);
@@ -2587,24 +2714,90 @@ impl NodeTree {
         } else {
             false
         };
+        // Mark where the children sub-range begins — a scroll layer's
+        // span covers exactly the children (content), not the container
+        // shape emitted above.
+        let children_start = events.len();
         // Children: intersect parent clip with this node's self-clip
         // (axis-aware — only narrow the axes that clip), then add this
         // node's scroll offset to the running offset.
-        let child_clip = if node.layout.clips() {
-            let self_clip = [
-                if node.layout.overflow_x.clips() { abs[0] } else { -1.0e30 },
-                if node.layout.overflow_y.clips() { abs[1] } else { -1.0e30 },
-                if node.layout.overflow_x.clips() { abs[0] + size[0] } else { 1.0e30 },
-                if node.layout.overflow_y.clips() { abs[1] + size[1] } else { 1.0e30 },
-            ];
-            intersect_clip(clip, self_clip)
+        //
+        // For a **scroll layer**, neither happens here: children emit
+        // *content-local* (offset re-based so the content top-left is the
+        // texture origin) and *unclipped* (the composite window clips to
+        // the viewport). The composite samples the scrolled window, so the
+        // scroll offset must NOT be baked into positions.
+        // Texture-origin offset (physical px) for a **lazy** scroll layer:
+        // its texture is windowed to the materialized rows (the full
+        // virtual height is enormous), so the texture top is the content-
+        // top of the first materialized row, not 0. A bounded scroller
+        // keeps `[0, 0]` (texture origin = content origin). Computed here
+        // so both the child re-base below and the `ScrollSpan` agree.
+        let tex_origin: [f32; 2] = if is_scroll_layer {
+            match node.lazy_list.as_ref() {
+                Some(ll) => {
+                    let r0 = ll.range[0];
+                    [0.0, ll.row_top_logical(r0) * scale]
+                }
+                None => [0.0, 0.0],
+            }
         } else {
-            clip
+            [0.0, 0.0]
         };
-        let child_offset = if let Some(s) = node.scroll.as_ref() {
-            [offset[0] + s.current[0], offset[1] + s.current[1]]
+        // Visual child clip + offset (→ instances / layer texture).
+        let (child_clip, child_offset) = if is_scroll_layer {
+            // Content origin = container top-left in screen space (`abs`).
+            // Re-base so a child at the content top lands at texture (0,0):
+            // `child_abs = child_rect - child_offset`, and we want that to
+            // equal `child_rect - container_screen_origin`. The running
+            // `offset` already folds ancestor scroll/clip translation, so
+            // the container's content origin in *layout* space is
+            // `rect.xy`; setting child_offset to that yields content-local.
+            //
+            // For a windowed **lazy** layer the texture top is `tex_origin`
+            // (content-top of the first materialized row), so add it: a row
+            // at content-top `tex_origin` lands at texture y=0.
+            (NO_CLIP, [rect[0] + tex_origin[0], rect[1] + tex_origin[1]])
         } else {
-            offset
+            let cc = if node.layout.clips() {
+                let self_clip = [
+                    if node.layout.overflow_x.clips() { abs[0] } else { -1.0e30 },
+                    if node.layout.overflow_y.clips() { abs[1] } else { -1.0e30 },
+                    if node.layout.overflow_x.clips() { abs[0] + size[0] } else { 1.0e30 },
+                    if node.layout.overflow_y.clips() { abs[1] + size[1] } else { 1.0e30 },
+                ];
+                intersect_clip(clip, self_clip)
+            } else {
+                clip
+            };
+            let co = if let Some(s) = node.scroll.as_ref() {
+                [offset[0] + s.current[0], offset[1] + s.current[1]]
+            } else {
+                offset
+            };
+            (cc, co)
+        };
+        // Hit-space child clip + offset (→ hit-test, always screen-space).
+        // Independent of layer promotion: scroll is baked in and the
+        // container's self-clip narrows to the on-screen viewport, so a row
+        // scrolled out of view is correctly un-hittable and a visible row's
+        // hit box tracks the pixels — even when its visual coords went
+        // content-local into the layer texture above.
+        let child_hit_clip = if node.layout.clips() {
+            let self_clip = [
+                if node.layout.overflow_x.clips() { hit_abs[0] } else { -1.0e30 },
+                if node.layout.overflow_y.clips() { hit_abs[1] } else { -1.0e30 },
+                if node.layout.overflow_x.clips() { hit_abs[0] + size[0] } else { 1.0e30 },
+                if node.layout.overflow_y.clips() { hit_abs[1] + size[1] } else { 1.0e30 },
+            ];
+            intersect_clip(hit_clip, self_clip)
+        } else {
+            hit_clip
+        };
+        let child_hit_offset = if let Some(s) = node.scroll.as_ref() {
+            [hit_offset[0] + s.current[0], hit_offset[1] + s.current[1]]
+        } else {
+            hit_offset
         };
         for &child in &node.children {
             self.flatten_into(
@@ -2612,15 +2805,20 @@ impl NodeTree {
                 opacity,
                 child_clip,
                 child_offset,
+                child_hit_clip,
+                child_hit_offset,
                 skip,
                 scroll_stack,
                 events,
                 hits,
                 scroll_hits,
                 scroll_bars,
+                spans,
+                child_in_layer,
                 scale,
             );
         }
+        let children_end = events.len();
         // Emit scrollbar geometry last so visible bars paint over
         // children. The bar lives at the container's *unscrolled*
         // position (uses `abs`, not `child_offset`) and inherits the
@@ -2638,10 +2836,59 @@ impl NodeTree {
                 scale,
                 events,
                 scroll_bars,
+                // When the container is a scroll layer, promote the moving
+                // **thumb** to its own tiny composite layer: its texture is
+                // a static thumb rect (bytes stable across scroll) blitted
+                // at a moving `dst_origin`, so a pure scroll skips its
+                // raster too — leaving the (static) track + chrome in the
+                // root segment to also skip → pure scroll = raster 0.
+                is_scroll_layer,
+                spans,
             );
         }
         if pushed_scroll {
             scroll_stack.pop();
+        }
+        // Close the promotion span. A scroll layer's span is the
+        // *children* range (content-local), with the composite window
+        // describing where it lands on screen + the scroll offset. A plain
+        // force-promoted layer spans the whole subtree at absolute coords.
+        if is_scroll_layer {
+            if children_end > children_start {
+                let s = node.scroll.as_ref().unwrap();
+                // Texture height: a bounded scroller spans the full content
+                // (≥ viewport). A **lazy** list windows to its materialized
+                // rows — the full virtual height would be enormous — so the
+                // texture covers `[tex_origin.y, materialized_bottom)`, i.e.
+                // the row-extent of the visible window (+ buffer rows).
+                let tex_h = match node.lazy_list.as_ref() {
+                    Some(ll) => {
+                        let r = ll.range;
+                        let top = ll.row_top_logical(r[0]) * scale;
+                        let bottom = ll.row_top_logical(r[1]) * scale;
+                        (bottom - top).max(size[1])
+                    }
+                    None => node.content_size[1].max(size[1]),
+                };
+                spans.push(LayerSpan {
+                    node: id,
+                    events: children_start..children_end,
+                    scroll: Some(ScrollSpan {
+                        viewport_origin: abs,
+                        viewport: size,
+                        // Texture is viewport-wide × `tex_h` tall.
+                        content: [size[0], tex_h],
+                        tex_origin,
+                        scroll: s.current,
+                    }),
+                });
+            }
+        } else if promote && events.len() > span_start {
+            spans.push(LayerSpan {
+                node: id,
+                events: span_start..events.len(),
+                scroll: None,
+            });
         }
     }
 }
@@ -2658,6 +2905,11 @@ fn emit_scrollbars(
     scale: f32,
     events: &mut Vec<FlatEvent>,
     scroll_bars: &mut Vec<ScrollbarHit>,
+    // When the container is a scroll layer, promote the moving thumb to
+    // its own composite layer (static texture, moving `dst_origin`) so a
+    // pure scroll skips its raster.
+    promote_thumb: bool,
+    spans: &mut Vec<LayerSpan>,
 ) {
     let style = &s.style;
     let bar_w = style.thickness * scale;
@@ -2665,32 +2917,7 @@ fn emit_scrollbars(
     let min_thumb = style.min_thumb * scale;
     let bar_alpha = if style.always_visible { 1.0 } else { s.bar_alpha };
     let visual = bar_alpha * opacity;
-
-    let mut emit_quad = |position: [f32; 2], box_size: [f32; 2], rgba: [f32; 4]| {
-        if rgba[3] <= 0.001 || box_size[0] <= 0.0 || box_size[1] <= 0.0 {
-            return;
-        }
-        events.push(FlatEvent::Shape(ShapeInstance {
-            color: rgba,
-            border_color: [0.0; 4],
-            shadow_color: [0.0; 4],
-            // Logical px — `expand_events_into` re-scales it.
-            border_radius: [style.radius; 4],
-            backdrop_uv_rect: [0.0; 4],
-            clip_rect: clip,
-            position,
-            size: box_size,
-            shadow_offset: [0.0; 2],
-            shape_kind: SHAPE_KIND_RECT,
-            roughness: 0.0,
-            border_width: 0.0,
-            shadow_blur: 0.0,
-            shadow_opacity: 0.0,
-            opacity: 1.0,
-            scale: [1.0, 1.0],
-            _pad1: [0.0, 0.0],
-        }));
-    };
+    let radius = style.radius;
 
     // Y bar.
     if node.layout.overflow_y.scrolls() {
@@ -2710,8 +2937,11 @@ fn emit_scrollbars(
                 let thumb_color = pick_thumb_color(style, s.bar_active[1], s.bar_hover[1]);
                 let track_rgba = scale_alpha(style.track_color, visual);
                 let thumb_rgba = scale_alpha(thumb_color, visual);
-                emit_quad([track_x, track_y], [bar_w, track_h], track_rgba);
-                emit_quad([track_x, thumb_y], [bar_w, thumb_h], thumb_rgba);
+                bar_quad(events, [track_x, track_y], [bar_w, track_h], track_rgba, radius, clip);
+                emit_scroll_thumb(
+                    events, spans, node_id, promote_thumb, radius, clip,
+                    [track_x, thumb_y], [bar_w, thumb_h], thumb_rgba,
+                );
                 scroll_bars.push(ScrollbarHit {
                     node_id,
                     axis: ScrollAxis::Y,
@@ -2754,8 +2984,11 @@ fn emit_scrollbars(
                 let thumb_color = pick_thumb_color(style, s.bar_active[0], s.bar_hover[0]);
                 let track_rgba = scale_alpha(style.track_color, visual);
                 let thumb_rgba = scale_alpha(thumb_color, visual);
-                emit_quad([track_x, track_y], [track_w, bar_w], track_rgba);
-                emit_quad([thumb_x, track_y], [thumb_w, bar_w], thumb_rgba);
+                bar_quad(events, [track_x, track_y], [track_w, bar_w], track_rgba, radius, clip);
+                emit_scroll_thumb(
+                    events, spans, node_id, promote_thumb, radius, clip,
+                    [thumb_x, track_y], [thumb_w, bar_w], thumb_rgba,
+                );
                 scroll_bars.push(ScrollbarHit {
                     node_id,
                     axis: ScrollAxis::X,
@@ -2768,6 +3001,110 @@ fn emit_scrollbars(
             }
         }
     }
+}
+
+/// Push a scrollbar rect (track or inline thumb) at screen-space
+/// `position`, inheriting the container's `clip`. `radius` is logical px
+/// (re-scaled by `expand_events_into`).
+fn bar_quad(
+    events: &mut Vec<FlatEvent>,
+    position: [f32; 2],
+    box_size: [f32; 2],
+    rgba: [f32; 4],
+    radius: f32,
+    clip: [f32; 4],
+) {
+    if rgba[3] <= 0.001 || box_size[0] <= 0.0 || box_size[1] <= 0.0 {
+        return;
+    }
+    events.push(FlatEvent::Shape(ShapeInstance {
+        color: rgba,
+        border_color: [0.0; 4],
+        shadow_color: [0.0; 4],
+        border_radius: [radius; 4],
+        backdrop_uv_rect: [0.0; 4],
+        clip_rect: clip,
+        position,
+        size: box_size,
+        shadow_offset: [0.0; 2],
+        shape_kind: SHAPE_KIND_RECT,
+        roughness: 0.0,
+        border_width: 0.0,
+        shadow_blur: 0.0,
+        shadow_opacity: 0.0,
+        opacity: 1.0,
+        scale: [1.0, 1.0],
+        _pad1: [0.0, 0.0],
+    }));
+}
+
+/// Emit a scrollbar **thumb**. Inline (root segment, screen coords) when
+/// `promote_thumb` is false; otherwise as its own tiny composite layer:
+/// the thumb rect is drawn at content-local `[0, 0]` into a thumb-sized
+/// texture, with a [`ScrollSpan`] whose `viewport_origin` is the thumb's
+/// screen position — a 1:1 static blit at a moving origin. The thumb's
+/// instance bytes are stable across scroll (always at `[0,0]`), so its
+/// raster is skipped; only the composite `dst_origin` moves. That leaves
+/// the (static) track + chrome in the root segment to skip too → pure
+/// scroll = raster 0.
+///
+/// `node_id` keys the span. The scroll-content layer keys by the same id,
+/// but they never collide: Frostify scroll layers re-flatten every scroll
+/// (no `LayerTree::set_offset` call that would patch a layer by node id),
+/// and `LayerTree::rebuild` emits one [`crate::layer::Layer`] per span
+/// regardless of id.
+#[allow(clippy::too_many_arguments)]
+fn emit_scroll_thumb(
+    events: &mut Vec<FlatEvent>,
+    spans: &mut Vec<LayerSpan>,
+    node_id: NodeId,
+    promote_thumb: bool,
+    radius: f32,
+    clip: [f32; 4],
+    thumb_pos: [f32; 2],
+    thumb_size: [f32; 2],
+    rgba: [f32; 4],
+) {
+    if rgba[3] <= 0.001 || thumb_size[0] <= 0.0 || thumb_size[1] <= 0.0 {
+        return;
+    }
+    if !promote_thumb {
+        bar_quad(events, thumb_pos, thumb_size, rgba, radius, clip);
+        return;
+    }
+    let span_start = events.len();
+    // Content-local origin — the composite places it on screen at
+    // `thumb_pos`; clip is unbounded (the composite window clips).
+    events.push(FlatEvent::Shape(ShapeInstance {
+        color: rgba,
+        border_color: [0.0; 4],
+        shadow_color: [0.0; 4],
+        border_radius: [radius; 4],
+        backdrop_uv_rect: [0.0; 4],
+        clip_rect: NO_CLIP,
+        position: [0.0, 0.0],
+        size: thumb_size,
+        shadow_offset: [0.0; 2],
+        shape_kind: SHAPE_KIND_RECT,
+        roughness: 0.0,
+        border_width: 0.0,
+        shadow_blur: 0.0,
+        shadow_opacity: 0.0,
+        opacity: 1.0,
+        scale: [1.0, 1.0],
+        _pad1: [0.0, 0.0],
+    }));
+    spans.push(LayerSpan {
+        node: node_id,
+        events: span_start..events.len(),
+        scroll: Some(ScrollSpan {
+            viewport_origin: thumb_pos,
+            viewport: thumb_size,
+            content: thumb_size,
+            tex_origin: [0.0, 0.0],
+            scroll: [0.0, 0.0],
+        }),
+    });
 }
 
 fn pick_thumb_color(style: &ScrollbarStyle, active: bool, hover: bool) -> [f32; 4] {

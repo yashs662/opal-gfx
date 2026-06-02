@@ -32,11 +32,15 @@
 
 pub mod anim;
 pub mod app;
+/// Debug-only scripted-input + screenshot harness (REMOVABLE — see module docs).
+#[cfg(feature = "automation")]
+pub mod automation;
 pub mod debug;
 pub mod editor;
 pub mod event;
 pub mod gpu;
 pub mod input;
+pub mod layer;
 pub mod layout;
 pub mod lazy_list;
 pub mod node;
@@ -67,6 +71,8 @@ macro_rules! deps {
 
 pub use anim::{Curve, Lerp, TickResult, Timeline, Tween};
 pub use app::{App, AppConfig, HeadlessHelper, WakeHandle};
+#[cfg(feature = "automation")]
+pub use automation::{Script, Step};
 pub use editor::{EditOp, EditOutcome, EditorState};
 pub use lazy_list::LazyListState;
 pub use event::{
@@ -77,6 +83,7 @@ pub use gpu::{
     MemoryReport, ShapeInstance,
 };
 pub use input::{InputChange, InputState};
+pub use layer::{Damage, Layer, LayerTree};
 pub use overlay::Overlay;
 pub use layout::{Align, Axis, Justify, LayoutStyle, Len, Measurer, NullMeasurer, Overflow};
 pub use node::{

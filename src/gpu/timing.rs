@@ -274,4 +274,14 @@ pub struct FrameStats {
     pub glass_count: u32,
     pub drawcalls: u32,
     pub dirty_mask: u32,
+    // Compositor (P1) — layer-tree accounting. Single root layer today,
+    // so `layer_count == 1`, `raster_count`/`composite_count` are 0 or 1.
+    /// Live layers in the layer tree.
+    pub layer_count: u32,
+    /// Layers that re-rasterized their texture this frame.
+    pub raster_count: u32,
+    /// Layers composited to the surface this frame.
+    pub composite_count: u32,
+    /// Total bytes the layer textures occupy (projected in P1).
+    pub layer_vram: u64,
 }

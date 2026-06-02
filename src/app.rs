@@ -166,6 +166,14 @@ pub struct App {
     hits: Vec<HitEntry>,
     scroll_hits: Vec<ScrollHit>,
     scroll_bars: Vec<ScrollbarHit>,
+    /// Force-promoted (`.layer()`) subtree spans from the last flatten,
+    /// in painter order (event-index ranges). Mapped to instance ranges
+    /// and fed to the `LayerTree` in `flush_tree`.
+    flat_spans: Vec<crate::node::LayerSpan>,
+    /// Per-event instance-offset prefix from the last `expand_events_into`
+    /// (`event_inst_start`). Reused across frames; maps `flat_spans`
+    /// event ranges to instance ranges.
+    flat_event_inst: Vec<u32>,
     /// Per-axis active drag bookkeeping. While `Some`, pointer-move
     /// updates the captured axis's scroll position 1:1.
     bar_drag: Option<BarDrag>,
@@ -249,6 +257,20 @@ pub struct App {
     /// live render, not the re-encode that `capture_rgba` performs
     /// (which would clear `backdrop_dirty` and lose drawcall counts).
     last_render_stats: Option<FrameStats>,
+    /// Retained layer tree (compositor). Rebuilt beside the node tree in
+    /// `flush_tree`; partitions the instance stream into root segments +
+    /// `.layer()`-promoted layers and owns their persistent composite
+    /// transform/opacity. The GPU reports actual raster/composite/VRAM
+    /// counts into `FrameStats`.
+    layer_tree: crate::layer::LayerTree,
+    /// Layer composite-opacity bindings: `(promoted node, source signal)`.
+    /// Collected each `flush_tree` from `.layer_opacity(sig)` nodes and
+    /// pumped each awake frame after the timeline tick — the signal value
+    /// is pushed into the layer's composite opacity via
+    /// [`Self::set_layer_opacity`] (composite-only, no re-raster). The
+    /// bridge from a `Signal<f32>` (e.g. a crossfade tween) to a layer's
+    /// composite opacity, mirroring how reactive binds drive node props.
+    layer_opacity_binds: Vec<(crate::node::NodeId, crate::signal::Signal<f32>)>,
     /// Stat-dump cadence: continuously log on every render when set.
     /// Toggled by `FROSTIFY_STATS=1` env var or by F1 in interactive mode.
     stats_log: bool,
@@ -340,6 +362,9 @@ pub struct App {
     // Lazy:
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
+    /// Debug-only scripted-input driver (REMOVABLE — `automation` feature).
+    #[cfg(feature = "automation")]
+    automation: Option<crate::automation::AutomationState>,
 }
 
 /// External wake-up token. Clone into any thread that needs to nudge
@@ -401,6 +426,8 @@ impl App {
             hits: Vec::new(),
             scroll_hits: Vec::new(),
             scroll_bars: Vec::new(),
+            flat_spans: Vec::new(),
+            flat_event_inst: Vec::new(),
             bar_drag: None,
             pending_drag_cursor: None,
             drag_origin: None,
@@ -423,6 +450,8 @@ impl App {
             capture_deadline: None,
             pending_screenshot: None,
             last_dirty_mask: 0,
+            layer_tree: crate::layer::LayerTree::single_root(),
+            layer_opacity_binds: Vec::new(),
             last_cpu_ms: 0.0,
             last_render_stats: None,
             stats_log: std::env::var_os("FROSTIFY_STATS").is_some(),
@@ -442,6 +471,8 @@ impl App {
             uploader: crate::uploader::Uploader::new(wake),
             window: None,
             gpu: None,
+            #[cfg(feature = "automation")]
+            automation: None,
         }
     }
 
@@ -744,6 +775,7 @@ impl App {
             &mut self.hits,
             &mut self.scroll_hits,
             &mut self.scroll_bars,
+            &mut self.flat_spans,
         );
         let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
         if let Some(gpu) = self.gpu.as_mut() {
@@ -754,10 +786,108 @@ impl App {
                 gpu,
                 &mut self.ctx.text,
                 self.scale_factor,
+                &mut self.flat_event_inst,
             );
             gpu.set_instances(&self.instances, self.glass_count, backdrop_hint);
         }
+        // Rebuild the layer tree: map the promoted (`.layer()`) subtree
+        // event spans to instance ranges, then partition the stream into
+        // root segments + promoted layers. No promotions → single root
+        // layer (P2 parity). Composite transform/opacity for surviving
+        // promotions persists across this re-flatten.
+        let damage = crate::layer::Damage::classify(mask);
+        let promoted = spans_to_instance_ranges(&self.flat_spans, &self.flat_event_inst);
+        self.layer_tree.rebuild(
+            &promoted,
+            self.instances.len(),
+            [viewport[0] as u32, viewport[1] as u32],
+            damage,
+        );
+        // A full flatten supersedes any pending composite-only change.
+        self.layer_tree.take_composite_dirty();
+        // Re-collect declarative layer-opacity bindings from the freshly
+        // promoted nodes (`.layer_opacity(sig)`). Rebuilt each flush so it
+        // tracks the current tree (promotions can come + go); the per-frame
+        // pump then drives each layer's composite opacity from its signal.
+        self.layer_opacity_binds.clear();
+        for p in &promoted {
+            if let Some(sig) = self
+                .ctx
+                .tree
+                .get(p.node)
+                .and_then(|n| n.layer_opacity.clone())
+            {
+                self.layer_opacity_binds.push((p.node, sig));
+            }
+        }
+        self.pump_layer_opacity_binds();
+        self.push_layer_draws();
         true
+    }
+
+    /// Build the GPU layer draw list from the current `LayerTree` and
+    /// hand it to the renderer. Cheap; called after a flatten and on
+    /// composite-only frames (where the instance stream is untouched but
+    /// a layer's composite transform/opacity changed).
+    fn push_layer_draws(&mut self) {
+        let draws: Vec<crate::gpu::LayerDraw> = self
+            .layer_tree
+            .layers()
+            .iter()
+            .map(layer_to_draw)
+            .collect();
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_layers(&draws);
+        }
+    }
+
+    /// Set a `.layer()`-promoted subtree's composite offset (logical px;
+    /// scaled to physical here). This is a **composite-only** change: no
+    /// re-flatten, no re-raster — the cached layer texture is recomposited
+    /// at the new offset. Drives slide transitions / scroll cheaply.
+    /// Requests a redraw when the value actually changed.
+    pub fn set_layer_offset(&mut self, node: crate::node::NodeId, offset: [f32; 2]) {
+        let phys = [offset[0] * self.scale_factor, offset[1] * self.scale_factor];
+        if self.layer_tree.set_offset(node, phys) {
+            self.push_layer_draws();
+            self.request_redraw();
+        }
+    }
+
+    /// Set a promoted subtree's composite opacity. Composite-only — see
+    /// [`Self::set_layer_offset`].
+    pub fn set_layer_opacity(&mut self, node: crate::node::NodeId, opacity: f32) {
+        if self.layer_tree.set_opacity(node, opacity) {
+            self.push_layer_draws();
+            self.request_redraw();
+        }
+    }
+
+    /// Push every layer-opacity binding's current signal value into its
+    /// layer's composite opacity. Called each awake frame after the
+    /// timeline tick. No-op when no bindings are registered.
+    fn pump_layer_opacity_binds(&mut self) {
+        if self.layer_opacity_binds.is_empty() {
+            return;
+        }
+        // Snapshot to avoid borrowing `self` across `set_layer_opacity`.
+        let pairs: Vec<(crate::node::NodeId, f32)> = self
+            .layer_opacity_binds
+            .iter()
+            .map(|(n, s)| (*n, s.get()))
+            .collect();
+        for (node, op) in pairs {
+            self.set_layer_opacity(node, op);
+        }
+    }
+
+    /// Set a promoted subtree's composite scale. Composite-only — see
+    /// [`Self::set_layer_offset`].
+    pub fn set_layer_scale(&mut self, node: crate::node::NodeId, scale: [f32; 2]) {
+        if self.layer_tree.set_scale(node, scale) {
+            self.push_layer_draws();
+            self.request_redraw();
+        }
     }
 
     fn viewport(&self) -> [f32; 2] {
@@ -864,29 +994,45 @@ impl App {
         h: u32,
         bytes: &[u8],
     ) -> Option<crate::gpu::ImageHandle> {
-        let live = collect_live_image_handles(&self.ctx.tree);
+        // The live-handle set is only needed on the rare evict path, and
+        // computing it walks the whole tree — so pass it lazily (borrow
+        // `ctx.tree`, disjoint from the `gpu` borrow) instead of paying the
+        // walk on every cover that lands during a fast scroll.
+        let tree = &self.ctx.tree;
         let gpu = self.gpu.as_mut()?;
         // Cap atlas growth at the adapter's max 2D texture dimension —
         // 8192² with wgpu default limits, up to 16384² on most desktop
-        // adapters if higher limits are requested.
+        // adapters if higher limits are requested. The atlas is allocated
+        // large up front (see `ImageAtlas::new` in `context.rs`) so growth
+        // — and its eviction fallback — rarely if ever fires; this keeps
+        // every uploaded handle resident (no eviction → no covers that
+        // "never load" from a dangling handle).
         let max = gpu.device.limits().max_texture_dimension_2d;
-        let handle = gpu.image_atlas.upload_rgba_growing(
+        let outcome = gpu.image_atlas.upload_rgba_growing(
             &gpu.device,
             &gpu.queue,
             w,
             h,
             bytes,
-            &live,
+            || collect_live_image_handles(tree),
             max,
         )?;
-        // Force a re-flatten so any node still pointing at a handle
-        // whose UV moved during rebuild rebuilds its instance with
-        // the fresh atlas slot.
-        self.ctx.tree.mark_all_dirty();
+        // Only force a full re-flatten when the atlas **repacked** (grow /
+        // evict moved every existing handle's UV). On the common fast path
+        // (the atlas had room → no UV moved) this is skipped: the node(s)
+        // bound to the new handle are repainted by the reactive image-bind
+        // (`set_image` dirties just those nodes), so a full
+        // `mark_all_dirty` here would needlessly re-flatten + re-raster the
+        // **whole scene** on every cover that lands — which is exactly what
+        // made playlist scrolling lag while hundreds of covers streamed in
+        // (it defeated the per-layer raster-skip). A redraw is enough.
+        if outcome.layout_changed {
+            self.ctx.tree.mark_all_dirty();
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
-        Some(handle)
+        Some(outcome.handle)
     }
 
     /// Runtime SVG upload. Rasterizes `bytes` to `px × px` and forwards
@@ -910,6 +1056,9 @@ impl App {
             .unwrap_or_default();
         s.cpu_ms = self.last_cpu_ms;
         s.dirty_mask = self.last_dirty_mask;
+        // layer_count / raster_count / composite_count / layer_vram are
+        // filled by the GPU (`last_frame_stats`) — it knows what it
+        // actually rastered, composited, and allocated.
         s
     }
 
@@ -1015,8 +1164,7 @@ impl App {
             self.dwell = None;
             return false;
         }
-        let handler = self
-            .ctx
+        let handler = self.ctx
             .tree
             .get(tracker.node)
             .and_then(|n| n.on_hover_dwell.as_ref().map(|(_, h)| h.clone()));
@@ -1159,24 +1307,7 @@ impl App {
     /// pass below. Each list's `ensure_prefix_fresh` is internally
     /// gated on `heights_version` — idle frames cost nothing.
     fn ensure_lazy_list_prefixes(&mut self) {
-        let lazy_ids: Vec<crate::node::NodeId> = self
-            .ctx
-            .tree
-            .iter_ids()
-            .filter(|id| {
-                self.ctx
-                    .tree
-                    .get(*id)
-                    .map(|n| n.lazy_list.is_some())
-                    .unwrap_or(false)
-            })
-            .collect();
-        for id in lazy_ids {
-            if let Some(n) = self.ctx.tree.get_mut_raw(id)
-                && let Some(ll) = n.lazy_list.as_mut() {
-                    ll.ensure_prefix_fresh();
-                }
-        }
+        ensure_lazy_list_prefixes(&mut self.ctx);
     }
 
     /// Walk lazy-list nodes and reconcile their materialized children
@@ -1186,161 +1317,7 @@ impl App {
     /// if any list mutated its children — caller (`flush_tree`) uses
     /// this to decide whether a second layout pass is needed.
     fn materialize_lazy_lists(&mut self) -> bool {
-        let lazy_ids: Vec<crate::node::NodeId> = self
-            .ctx
-            .tree
-            .iter_ids()
-            .filter(|id| {
-                self.ctx
-                    .tree
-                    .get(*id)
-                    .map(|n| n.lazy_list.is_some())
-                    .unwrap_or(false)
-            })
-            .collect();
-        if lazy_ids.is_empty() {
-            return false;
-        }
-
-        let scale = self.scale_factor;
-        let mut any_changed = false;
-
-        for list_id in lazy_ids {
-            // Snapshot per-list state. `render` is an `Rc<dyn Fn>`;
-            // the clone is cheap. Drop the &mut tree borrow before
-            // invoking it (the closure spawns children, re-borrowing
-            // the tree).
-            let (render, prev_range, prev_materialized,
-                 current_version, last_seen_version,
-                 current_heights_version, last_seen_heights_version) = {
-                let Some(n) = self.ctx.tree.get(list_id) else { continue };
-                let Some(ll) = n.lazy_list.as_ref() else { continue };
-                (
-                    ll.render.clone(),
-                    ll.range,
-                    ll.materialized.clone(),
-                    ll.version,
-                    ll.last_seen_version,
-                    ll.heights_version,
-                    ll.last_heights_version,
-                )
-            };
-
-            // The list is its own scroll container; read viewport
-            // size + scroll offset from its rect + ScrollState.
-            let (scroll_top, viewport_h) = {
-                let Some(n) = self.ctx.tree.get(list_id) else { continue };
-                let scroll_top = n.scroll.as_ref().map(|s| s.current[1]).unwrap_or(0.0);
-                let viewport_h = n.rect[3];
-                (scroll_top, viewport_h)
-            };
-
-            let new_range = {
-                let Some(n) = self.ctx.tree.get(list_id) else { continue };
-                let ll = n.lazy_list.as_ref().unwrap();
-                ll.visible_window(scroll_top, viewport_h, scale)
-            };
-
-            // Detect "needs re-position only" (heights changed but
-            // window still covers the same rows). When this is the
-            // case, skip the remove+render cycle and just rewrite
-            // the abs offsets of the existing materialized children.
-            let window_unchanged = new_range == prev_range;
-            let version_changed = current_version != last_seen_version;
-            let heights_changed = current_heights_version != last_seen_heights_version;
-            let _ = last_seen_heights_version;
-            if window_unchanged && !version_changed && !heights_changed {
-                continue;
-            }
-            if window_unchanged && !version_changed && heights_changed {
-                // Reposition existing rows in-place from the fresh
-                // prefix table — much cheaper than full re-render.
-                let mut any_moved = false;
-                for (k, child_id) in prev_materialized.iter().enumerate() {
-                    let i = new_range[0] + k as u32;
-                    let top = self
-                        .ctx
-                        .tree
-                        .get(list_id)
-                        .and_then(|n| n.lazy_list.as_ref())
-                        .map(|ll| ll.row_top_logical(i))
-                        .unwrap_or(0.0);
-                    if let Some(c) = self.ctx.tree.get_mut_raw(*child_id)
-                        && c.layout.abs != Some([0.0, top]) {
-                            c.layout.abs = Some([0.0, top]);
-                            any_moved = true;
-                        }
-                }
-                if let Some(n) = self.ctx.tree.get_mut_raw(list_id)
-                    && let Some(ll) = n.lazy_list.as_mut() {
-                        ll.last_heights_version = current_heights_version;
-                    }
-                if any_moved {
-                    any_changed = true;
-                }
-                continue;
-            }
-
-            // Remove the previous materialized set. Each removal
-            // walks descendant children, tombstones binds, and stops
-            // matching tweens.
-            for child_id in &prev_materialized {
-                let removal = self.ctx.remove_subtree(*child_id);
-                stop_tweens_for_removal(&mut self.timeline, &removal);
-            }
-
-            // Materialize the new window. The render closure runs
-            // under a Scene scope rooted at the list node. Snapshot
-            // children-count before + after each call to identify the
-            // single new child emitted for row `i`; write its
-            // `layout.abs` so layout positions it at the right offset.
-            let mut new_materialized = Vec::with_capacity((new_range[1] - new_range[0]) as usize);
-            for i in new_range[0]..new_range[1] {
-                let prev_count = self
-                    .ctx
-                    .tree
-                    .get(list_id)
-                    .map(|n| n.children.len())
-                    .unwrap_or(0);
-                {
-                    let mut scene = crate::scene::Scene::with_parent(&mut self.ctx, list_id);
-                    render(&mut scene, i);
-                }
-                let next_count = self
-                    .ctx
-                    .tree
-                    .get(list_id)
-                    .map(|n| n.children.len())
-                    .unwrap_or(0);
-                if next_count > prev_count {
-                    let new_child = self.ctx.tree.get(list_id).unwrap().children[prev_count];
-                    let top = self
-                        .ctx
-                        .tree
-                        .get(list_id)
-                        .and_then(|n| n.lazy_list.as_ref())
-                        .map(|ll| ll.row_top_logical(i))
-                        .unwrap_or(0.0);
-                    if let Some(c) = self.ctx.tree.get_mut_raw(new_child) {
-                        c.layout.abs = Some([0.0, top]);
-                    }
-                    new_materialized.push(new_child);
-                }
-            }
-
-            // Commit the new state.
-            if let Some(n) = self.ctx.tree.get_mut_raw(list_id)
-                && let Some(ll) = n.lazy_list.as_mut() {
-                    ll.materialized = new_materialized;
-                    ll.range = new_range;
-                    ll.last_seen_version = current_version;
-                    ll.last_heights_version = current_heights_version;
-                }
-
-            any_changed = true;
-        }
-
-        any_changed
+        materialize_lazy_lists(&mut self.ctx, &mut self.timeline, self.scale_factor)
     }
 
     /// Walk every text-field node and write the right display string
@@ -1349,8 +1326,7 @@ impl App {
     /// nothing on idle frames because `tree.set_text` short-circuits
     /// when content matches.
     fn refresh_text_fields(&mut self) {
-        let editor_ids: Vec<crate::node::NodeId> = self
-            .ctx
+        let editor_ids: Vec<crate::node::NodeId> = self.ctx
             .tree
             .iter_ids()
             .filter(|id| {
@@ -1396,8 +1372,7 @@ impl App {
     fn reposition_carets(&mut self) {
         // Collect node ids first to keep the walk + the mutating
         // updates from aliasing the same &mut tree.
-        let editor_ids: Vec<crate::node::NodeId> = self
-            .ctx
+        let editor_ids: Vec<crate::node::NodeId> = self.ctx
             .tree
             .iter_ids()
             .filter(|id| {
@@ -1449,8 +1424,7 @@ impl App {
             let prefix_w = measure_w(&mut self.ctx.text, cursor);
             let sel_px = sel_range
                 .map(|(lo, hi)| (measure_w(&mut self.ctx.text, lo), measure_w(&mut self.ctx.text, hi)));
-            let text_rect = self
-                .ctx
+            let text_rect = self.ctx
                 .tree
                 .get(text_node)
                 .map(|n| n.rect)
@@ -1515,8 +1489,7 @@ impl App {
     /// clear `input.focused` so subsequent keys don't route. Triggers
     /// a react so the caret repaints invisible.
     fn blur_text_field(&mut self, node_id: crate::node::NodeId) {
-        if let Some(sig) = self
-            .ctx
+        if let Some(sig) = self.ctx
             .tree
             .get(node_id)
             .and_then(|n| n.interact.focused.clone())
@@ -1588,8 +1561,7 @@ impl App {
     fn begin_drag_if_draggable(&mut self) {
         let Some(cap) = self.input.captured else { return };
         let Some(origin) = self.input.cursor else { return };
-        let (has_drag, payload, follow) = self
-            .ctx
+        let (has_drag, payload, follow) = self.ctx
             .tree
             .get(cap)
             .map(|n| (n.on_drag.is_some(), n.drag_payload.clone(), n.drag_follow))
@@ -1834,6 +1806,9 @@ impl App {
         self.dwell = None;
         // Drag bookkeeping references destroyed node ids — drop it.
         self.clear_drag_state();
+        // Layer-opacity bindings hold node ids from the old tree — drop
+        // them; the rebuilt scene re-binds via `bind_layer_opacity`.
+        self.layer_opacity_binds.clear();
         // 3. Re-invoke the stored builder on the now-empty ctx. Take
         //    + put back so the closure can call back into &mut self
         //    via captures without re-borrowing the builder slot.
@@ -2045,10 +2020,18 @@ fn expand_events_into(
     gpu: &mut crate::gpu::GpuContext,
     text: &mut crate::text::TextResources,
     scale: f32,
+    event_inst_start: &mut Vec<u32>,
 ) -> u32 {
     use crate::gpu::{SHAPE_KIND_GLASS, SHAPE_KIND_MASK};
     let mut glass_count: u32 = 0;
+    // Prefix map event index → first instance index it produces, so a
+    // promoted subtree's event range maps to an instance range (events
+    // expand 1:N for text/images). `event_inst_start[events.len()]` is
+    // the total instance count.
+    event_inst_start.clear();
+    event_inst_start.reserve(events.len() + 1);
     for event in events {
+        event_inst_start.push(out.len() as u32);
         match event {
             FlatEvent::Shape(s) => {
                 let mut s = *s;
@@ -2103,7 +2086,71 @@ fn expand_events_into(
             }
         }
     }
+    event_inst_start.push(out.len() as u32);
     glass_count
+}
+
+/// Convert a CPU `Layer` into a GPU `LayerDraw`. A scroll layer (`window`
+/// = `Some`) maps to a [`crate::gpu::ScrollWindow`] (quad at the viewport,
+/// sampling the tall texture at the scroll offset, scissor-clipped to the
+/// viewport); a plain layer uses the full-surface identity path with its
+/// composite offset/scale/opacity.
+fn layer_to_draw(l: &crate::layer::Layer) -> crate::gpu::LayerDraw {
+    let window = l.window.map(|s| crate::gpu::ScrollWindow {
+        dst_origin: s.viewport_origin,
+        dst_size: s.viewport,
+        // Sample origin in *texture* space: scroll offset minus the
+        // texture's content-top. `0` for a bounded scroller (tex_origin
+        // = 0); for a windowed lazy list this lands the visible window at
+        // the right texel since the texture only holds the materialized
+        // rows starting at `tex_origin`.
+        src_origin: [s.scroll[0] - s.tex_origin[0], s.scroll[1] - s.tex_origin[1]],
+        tex_size: s.content,
+        clip_rect: [
+            s.viewport_origin[0],
+            s.viewport_origin[1],
+            s.viewport_origin[0] + s.viewport[0],
+            s.viewport_origin[1] + s.viewport[1],
+        ],
+    });
+    crate::gpu::LayerDraw {
+        instances: (l.instances.start as u32)..(l.instances.end as u32),
+        offset: l.offset,
+        scale: l.scale,
+        opacity: l.opacity,
+        z: l.z,
+        window,
+    }
+}
+
+/// Map promoted-subtree event spans to instance ranges using the
+/// `event_inst_start` prefix produced by [`expand_events_into`]. Carries
+/// the optional scroll-window geometry through unchanged.
+fn spans_to_instance_ranges(
+    spans: &[crate::node::LayerSpan],
+    event_inst_start: &[u32],
+) -> Vec<crate::layer::PromotedRange> {
+    let mut ranges: Vec<crate::layer::PromotedRange> = spans
+        .iter()
+        .filter_map(|s| {
+            let start = *event_inst_start.get(s.events.start)?;
+            let end = *event_inst_start.get(s.events.end)?;
+            (end > start).then_some(crate::layer::PromotedRange {
+                node: s.node,
+                instances: start..end,
+                scroll: s.scroll,
+            })
+        })
+        .collect();
+    // `LayerTree::rebuild` walks a forward cursor, so promoted ranges must
+    // be in ascending instance order. Flatten emits a scroll container's
+    // promoted-thumb span *before* its content span (the thumb's quad is
+    // emitted after the children in the stream, but `emit_scrollbars` runs
+    // before the content-span close), so the two arrive out of order —
+    // sort to restore painter order. Ranges are non-overlapping, so a
+    // start-key sort is total.
+    ranges.sort_by_key(|r| r.instances.start);
+    ranges
 }
 
 /// Numeric-label HUD. One row per metric: "<label> <value>". Uses the
@@ -2128,13 +2175,16 @@ fn build_hud_instances(
     let panel_w = 160.0 * scale;
     let radius = 6.0 * scale;
 
-    let lines: [String; 6] = [
+    let lines: [String; 9] = [
         format!("cpu  {:>5.2} ms", stats.cpu_ms),
         format!("gpu  {:>5.2} ms", stats.gpu_ms),
         format!("opq  {:>5.2} ms", stats.opaque_ms),
         format!("fnl  {:>5.2} ms", stats.final_ms),
         format!("inst {:>5}", stats.instance_count),
         format!("draw {:>5}", stats.drawcalls),
+        format!("lyr  {:>5}", stats.layer_count),
+        format!("rast {:>3} cmp {:>1}", stats.raster_count, stats.composite_count),
+        format!("vram {:>4} KiB", stats.layer_vram / 1024),
     ];
 
     let panel_h = pad * 2.0 + line_h * lines.len() as f32;
@@ -2447,6 +2497,7 @@ pub struct HeadlessHelper<'a> {
     pub hits: &'a mut Vec<HitEntry>,
     pub scroll_hits: &'a mut Vec<crate::node::ScrollHit>,
     pub scroll_bars: &'a mut Vec<ScrollbarHit>,
+    pub layer_tree: &'a mut crate::layer::LayerTree,
     pub capture_dir: &'a Path,
     /// Stats snapshot taken at end of `render()`. `capture()` reads
     /// from here so the sidecar describes the live render frame, not
@@ -2467,11 +2518,16 @@ impl<'a> HeadlessHelper<'a> {
         if mask == 0 {
             return false;
         }
+        let vp = [
+            self.gpu.surface_config.width as f32,
+            self.gpu.surface_config.height as f32,
+        ];
+        // Mirror `App::flush_tree`: refresh lazy prefixes + initial layout,
+        // then materialize the visible window (a scroll can cross a row
+        // boundary), re-laying out if rows changed. Without this a headless
+        // scroll never re-windows a lazy list (the live app does both).
+        ensure_lazy_list_prefixes(self.ctx);
         if mask & (crate::node::dirty::TREE | crate::node::dirty::TRANSFORM) != 0 {
-            let vp = [
-                self.gpu.surface_config.width as f32,
-                self.gpu.surface_config.height as f32,
-            ];
             crate::layout::compute_layout(
                 &mut self.ctx.tree,
                 vp,
@@ -2479,24 +2535,57 @@ impl<'a> HeadlessHelper<'a> {
                 self.scale_factor,
             );
         }
+        if materialize_lazy_lists(self.ctx, self.timeline, self.scale_factor) {
+            crate::layout::compute_layout(
+                &mut self.ctx.tree,
+                vp,
+                &mut self.ctx.text,
+                self.scale_factor,
+            );
+        }
+        let mut spans = Vec::new();
         self.ctx.tree.flatten_into_buffers(
             self.scale_factor,
             self.flat_events,
             self.hits,
             self.scroll_hits,
             self.scroll_bars,
+            &mut spans,
         );
         self.instances.clear();
+        let mut event_inst = Vec::new();
         *self.glass_count = expand_events_into(
             self.flat_events,
             self.instances,
             self.gpu,
             &mut self.ctx.text,
             self.scale_factor,
+            &mut event_inst,
         );
         let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
         self.gpu
             .set_instances(self.instances, *self.glass_count, backdrop_hint);
+        // Drive the renderer's layer tree from the promoted spans so
+        // headless captures exercise the same raster/composite path as
+        // the live app. No promotions → single root layer.
+        let promoted = spans_to_instance_ranges(&spans, &event_inst);
+        self.layer_tree.rebuild(
+            &promoted,
+            self.instances.len(),
+            [
+                self.gpu.surface_config.width,
+                self.gpu.surface_config.height,
+            ],
+            crate::layer::Damage::classify(mask),
+        );
+        self.layer_tree.take_composite_dirty();
+        let draws: Vec<crate::gpu::LayerDraw> = self
+            .layer_tree
+            .layers()
+            .iter()
+            .map(layer_to_draw)
+            .collect();
+        self.gpu.set_layers(&draws);
         true
     }
 
@@ -2763,6 +2852,7 @@ impl ApplicationHandler for App {
                 hits: &mut self.hits,
                 scroll_hits: &mut self.scroll_hits,
                 scroll_bars: &mut self.scroll_bars,
+                layer_tree: &mut self.layer_tree,
                 capture_dir: &self.config.capture_dir,
                 last_render_stats: &mut self.last_render_stats,
                 scale_factor: self.scale_factor,
@@ -3104,8 +3194,7 @@ impl ApplicationHandler for App {
                 // borrow of the node drops before we re-borrow `&mut
                 // tree` for the EventCtx.
                 if let Some(target) = change.click_target {
-                    let handler = self
-                        .ctx
+                    let handler = self.ctx
                         .tree
                         .get(target)
                         .and_then(|n| n.on_click.clone());
@@ -3137,8 +3226,7 @@ impl ApplicationHandler for App {
                     }
                 };
                 if let Some(target) = change.right_click_target {
-                    let handler = self
-                        .ctx
+                    let handler = self.ctx
                         .tree
                         .get(target)
                         .and_then(|n| n.on_right_click.clone());
@@ -3176,8 +3264,7 @@ impl ApplicationHandler for App {
                     // fall through to the hotkey + scroll handlers so
                     // F2 screenshot etc. still work mid-edit.
                     if let Some(focused) = self.input.focused {
-                        let has_editor = self
-                            .ctx
+                        let has_editor = self.ctx
                             .tree
                             .get(focused)
                             .map(|n| n.editor.is_some())
@@ -3401,6 +3488,14 @@ impl ApplicationHandler for App {
                 self.request_redraw();
             }
         }
+        // Debug-only scripted-input driver (REMOVABLE — `automation`
+        // feature). Executes any due step (synthetic move/click/scroll +
+        // screenshots) and returns its next scheduled wake so the loop
+        // stays alive + doesn't park past it.
+        #[cfg(feature = "automation")]
+        let auto_deadline = self.automation_tick(event_loop, now);
+        #[cfg(not(feature = "automation"))]
+        let auto_deadline: Option<Instant> = None;
         // Animation + scroll pump. If both are idle, park on `Wait` so
         // the loop is 0% CPU. Otherwise: advance both, push interpolated
         // values through the bind registry, flush, redraw, and schedule
@@ -3467,7 +3562,13 @@ impl ApplicationHandler for App {
         if pumped {
             scroll_active = true;
         }
-        if !timeline_active && !scroll_active && !drag_moved && !dwell_pending && !dwell_fired {
+        if !timeline_active
+            && !scroll_active
+            && !drag_moved
+            && !dwell_pending
+            && !dwell_fired
+            && auto_deadline.is_none()
+        {
             self.last_scroll_tick = None;
             event_loop.set_control_flow(ControlFlow::Wait);
             log::debug!("[loop] parking on Wait (idle)");
@@ -3514,6 +3615,13 @@ impl ApplicationHandler for App {
         // then pumped below.
         if res.updated || hook_active {
             self.process_binds(now);
+        }
+        // Push layer-opacity bindings (e.g. a crossfade tween driving a
+        // promoted layer's composite opacity) every frame the timeline
+        // advanced. Composite-only — recomposites without re-rastering the
+        // layer; `set_layer_opacity` requests its own redraw on change.
+        if res.updated {
+            self.pump_layer_opacity_binds();
         }
         if res.updated || scroll_moved || drag_moved || hook_active || dwell_fired {
             if res.updated {
@@ -3566,6 +3674,13 @@ impl ApplicationHandler for App {
             (None, Some(b)) => Some(b),
             (None, None) => None,
         };
+        // Merge the scripted-input driver's next wake (REMOVABLE).
+        let combined = match (combined, auto_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
         match combined {
             Some(deadline) => {
                 let dt = deadline.saturating_duration_since(Instant::now());
@@ -3576,6 +3691,341 @@ impl ApplicationHandler for App {
                 log::debug!("[loop] no deadline; parking on Wait");
                 event_loop.set_control_flow(ControlFlow::Wait)
             }
+        }
+    }
+}
+
+// ============================================================================
+// Debug-only scripted-input + screenshot harness (REMOVABLE).
+// Everything below is gated behind the `automation` feature. Deleting the
+// feature + this block + `src/automation.rs` fully removes it. Synthetic
+// input is routed through the same `input::*` handlers + `on_click` firing
+// as real winit events, so the scripted path is the real path.
+// ============================================================================
+#[cfg(feature = "automation")]
+impl App {
+    /// Attach a scripted-input run. The driver ticks from `about_to_wait`,
+    /// injecting synthetic input + capturing screenshots, then exits the
+    /// app when the script ends.
+    pub fn automation(mut self, script: crate::automation::Script) -> Self {
+        self.automation = Some(crate::automation::AutomationState::new(script));
+        self
+    }
+
+    /// Run the scripted-input driver: execute any due step, return the
+    /// next scheduled wake (so the loop doesn't park past it). Exits the
+    /// app once the script is exhausted.
+    fn automation_tick(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        now: Instant,
+    ) -> Option<Instant> {
+        let Some(mut state) = self.automation.take() else {
+            return None;
+        };
+        if state.finished() {
+            self.flush_pending_screenshot();
+            log::info!("[automation] script finished — exiting");
+            event_loop.exit();
+            return None;
+        }
+        if state.due(now)
+            && let Some(step) = state.current()
+        {
+            use crate::automation::Step;
+            log::info!("[automation] step {:?}", step);
+            match step {
+                Step::Wait(d) => state.advance_after(now, d),
+                Step::Hover(p, d) => {
+                    self.inject_cursor_moved(p[0], p[1]);
+                    state.advance_after(now, d);
+                }
+                Step::MoveMouse(p) => {
+                    self.inject_cursor_moved(p[0], p[1]);
+                    state.advance_now(now);
+                }
+                Step::Click(p) => {
+                    self.inject_cursor_moved(p[0], p[1]);
+                    self.inject_left(true);
+                    self.inject_left(false);
+                    state.advance_now(now);
+                }
+                Step::Scroll(p, d) => {
+                    self.inject_cursor_moved(p[0], p[1]);
+                    self.inject_wheel(d[0], d[1]);
+                    state.advance_now(now);
+                }
+                Step::Drag(a, b) => {
+                    self.inject_cursor_moved(a[0], a[1]);
+                    self.inject_left(true);
+                    self.inject_cursor_moved(b[0], b[1]);
+                    self.inject_left(false);
+                    state.advance_now(now);
+                }
+                Step::Screenshot(path) => {
+                    self.render_once();
+                    self.capture_to(path);
+                    state.advance_now(now);
+                }
+            }
+        }
+        let next = state.next_at();
+        self.automation = Some(state);
+        next
+    }
+
+    /// Mirror of the `WindowEvent::CursorMoved` non-drag path.
+    fn inject_cursor_moved(&mut self, x: f32, y: f32) {
+        self.input.cursor = Some([x, y]);
+        let bar_changed = crate::input::update_scrollbar_hover(
+            Some([x, y]),
+            &self.scroll_bars,
+            &mut self.ctx.tree,
+        );
+        let change = self.input.on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
+        self.refresh_cursor(x, y);
+        if change.hovered_changed {
+            self.refresh_dwell(Instant::now());
+        }
+        if change.any() || bar_changed {
+            self.react();
+        }
+    }
+
+    /// Mirror of the left `MouseInput` arm's core: press/release through
+    /// `input`, fire `on_click` on the released target, drain any rebuild
+    /// the handler requested. Skips edge-resize + window-action paths
+    /// (irrelevant to scripted button targets).
+    fn inject_left(&mut self, pressed: bool) {
+        let change = if pressed {
+            let c = self.input.on_left_pressed(&self.hits, &self.ctx.tree);
+            self.begin_drag_if_draggable();
+            self.maybe_fire_unhandled_press();
+            c
+        } else {
+            let c = self.input.on_left_released(&self.hits, &self.ctx.tree);
+            self.finish_drag_on_release();
+            c
+        };
+        if change.hovered_changed {
+            self.refresh_dwell(Instant::now());
+        }
+        if let Some(target) = change.click_target {
+            let handler = self.ctx.tree.get(target).and_then(|n| n.on_click.clone());
+            if let Some(h) = handler {
+                let mut ectx = crate::event::EventCtx {
+                    tree: &mut self.ctx.tree,
+                    timeline: &mut self.timeline,
+                    node: target,
+                    now: Instant::now(),
+                };
+                h(&mut ectx);
+            }
+        }
+        // A nav/click handler may have flipped the rebuild token — apply
+        // it now so the new view is live before the next step/screenshot.
+        if self.rebuild_request.replace(false) {
+            self.rebuild_scene();
+        }
+        if change.any() {
+            self.react();
+        }
+    }
+
+    /// Mirror of the `WindowEvent::MouseWheel` arm (line deltas).
+    fn inject_wheel(&mut self, dx: f32, dy: f32) {
+        let Some([cx, cy]) = self.input.cursor else {
+            return;
+        };
+        let line = 50.0 * self.scale_factor;
+        let px = [-dx * line, -dy * line];
+        let shift = self.modifiers.state().shift_key();
+        if crate::input::on_wheel([cx, cy], px, &self.scroll_hits, &mut self.ctx.tree, shift) {
+            self.react();
+        }
+    }
+
+    /// Render + write a PNG to an explicit path (the scripted analog of
+    /// `save_screenshot`, which auto-names into the capture dir).
+    fn capture_to(&mut self, path: std::path::PathBuf) {
+        self.flush_pending_screenshot();
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        let (rgba, w, h) = gpu.capture_rgba();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        log::info!("[automation] screenshot → {}", path.display());
+        self.pending_screenshot = Some(debug::save_png_async(path, rgba, w, h));
+    }
+}
+
+/// Reconcile every lazy-list's materialized children with its current
+/// visible window. Free fn so both `App::flush_tree` and
+/// `HeadlessHelper::flush` drive the same path. Returns true if any
+/// list mutated its children (caller may need a second layout pass).
+fn materialize_lazy_lists(
+    ctx: &mut SceneCtx,
+    timeline: &mut Timeline,
+    scale: f32,
+) -> bool {
+    let lazy_ids: Vec<crate::node::NodeId> = ctx
+        .tree
+        .iter_ids()
+        .filter(|id| ctx.tree.get(*id).map(|n| n.lazy_list.is_some()).unwrap_or(false))
+        .collect();
+    if lazy_ids.is_empty() {
+        return false;
+    }
+    let mut any_changed = false;
+    for list_id in lazy_ids {
+        // Snapshot per-list state. `render` is an `Rc<dyn Fn>`;
+        // the clone is cheap. Drop the &mut tree borrow before
+        // invoking it (the closure spawns children, re-borrowing
+        // the tree).
+        let (render, prev_range, prev_materialized,
+             current_version, last_seen_version,
+             current_heights_version, last_seen_heights_version) = {
+            let Some(n) = ctx.tree.get(list_id) else { continue };
+            let Some(ll) = n.lazy_list.as_ref() else { continue };
+            (
+                ll.render.clone(),
+                ll.range,
+                ll.materialized.clone(),
+                ll.version,
+                ll.last_seen_version,
+                ll.heights_version,
+                ll.last_heights_version,
+            )
+        };
+
+        // The list is its own scroll container; read viewport
+        // size + scroll offset from its rect + ScrollState.
+        let (scroll_top, viewport_h) = {
+            let Some(n) = ctx.tree.get(list_id) else { continue };
+            let scroll_top = n.scroll.as_ref().map(|s| s.current[1]).unwrap_or(0.0);
+            let viewport_h = n.rect[3];
+            (scroll_top, viewport_h)
+        };
+
+        let new_range = {
+            let Some(n) = ctx.tree.get(list_id) else { continue };
+            let ll = n.lazy_list.as_ref().unwrap();
+            ll.visible_window(scroll_top, viewport_h, scale)
+        };
+
+        // Detect "needs re-position only" (heights changed but
+        // window still covers the same rows). When this is the
+        // case, skip the remove+render cycle and just rewrite
+        // the abs offsets of the existing materialized children.
+        let window_unchanged = new_range == prev_range;
+        let version_changed = current_version != last_seen_version;
+        let heights_changed = current_heights_version != last_seen_heights_version;
+        let _ = last_seen_heights_version;
+        if window_unchanged && !version_changed && !heights_changed {
+            continue;
+        }
+        if window_unchanged && !version_changed && heights_changed {
+            // Reposition existing rows in-place from the fresh
+            // prefix table — much cheaper than full re-render.
+            let mut any_moved = false;
+            for (k, child_id) in prev_materialized.iter().enumerate() {
+                let i = new_range[0] + k as u32;
+                let top = ctx
+                    .tree
+                    .get(list_id)
+                    .and_then(|n| n.lazy_list.as_ref())
+                    .map(|ll| ll.row_top_logical(i))
+                    .unwrap_or(0.0);
+                if let Some(c) = ctx.tree.get_mut_raw(*child_id)
+                    && c.layout.abs != Some([0.0, top]) {
+                        c.layout.abs = Some([0.0, top]);
+                        any_moved = true;
+                    }
+            }
+            if let Some(n) = ctx.tree.get_mut_raw(list_id)
+                && let Some(ll) = n.lazy_list.as_mut() {
+                    ll.last_heights_version = current_heights_version;
+                }
+            if any_moved {
+                any_changed = true;
+            }
+            continue;
+        }
+
+        // Remove the previous materialized set. Each removal
+        // walks descendant children, tombstones binds, and stops
+        // matching tweens.
+        for child_id in &prev_materialized {
+            let removal = ctx.remove_subtree(*child_id);
+            stop_tweens_for_removal(timeline, &removal);
+        }
+
+        // Materialize the new window. The render closure runs
+        // under a Scene scope rooted at the list node. Snapshot
+        // children-count before + after each call to identify the
+        // single new child emitted for row `i`; write its
+        // `layout.abs` so layout positions it at the right offset.
+        let mut new_materialized = Vec::with_capacity((new_range[1] - new_range[0]) as usize);
+        for i in new_range[0]..new_range[1] {
+            let prev_count = ctx
+                .tree
+                .get(list_id)
+                .map(|n| n.children.len())
+                .unwrap_or(0);
+            {
+                let mut scene = crate::scene::Scene::with_parent(ctx, list_id);
+                render(&mut scene, i);
+            }
+            let next_count = ctx
+                .tree
+                .get(list_id)
+                .map(|n| n.children.len())
+                .unwrap_or(0);
+            if next_count > prev_count {
+                let new_child = ctx.tree.get(list_id).unwrap().children[prev_count];
+                let top = ctx
+                    .tree
+                    .get(list_id)
+                    .and_then(|n| n.lazy_list.as_ref())
+                    .map(|ll| ll.row_top_logical(i))
+                    .unwrap_or(0.0);
+                if let Some(c) = ctx.tree.get_mut_raw(new_child) {
+                    c.layout.abs = Some([0.0, top]);
+                }
+                new_materialized.push(new_child);
+            }
+        }
+
+        // Commit the new state.
+        if let Some(n) = ctx.tree.get_mut_raw(list_id)
+            && let Some(ll) = n.lazy_list.as_mut() {
+                ll.materialized = new_materialized;
+                ll.range = new_range;
+                ll.last_seen_version = current_version;
+                ll.last_heights_version = current_heights_version;
+            }
+
+        any_changed = true;
+    }
+
+    any_changed
+}
+
+/// Refresh every lazy-list prefix-sum table (variable-height mode).
+/// Free fn shared by `App` + `HeadlessHelper`.
+fn ensure_lazy_list_prefixes(ctx: &mut SceneCtx) {
+    let lazy_ids: Vec<crate::node::NodeId> = ctx
+        .tree
+        .iter_ids()
+        .filter(|id| ctx.tree.get(*id).map(|n| n.lazy_list.is_some()).unwrap_or(false))
+        .collect();
+    for id in lazy_ids {
+        if let Some(n) = ctx.tree.get_mut_raw(id)
+            && let Some(ll) = n.lazy_list.as_mut()
+        {
+            ll.ensure_prefix_fresh();
         }
     }
 }

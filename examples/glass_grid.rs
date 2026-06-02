@@ -120,6 +120,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new("frostify-gfx — glass grid", W, H);
     let (iw, ih, bytes) = make_checker_image();
     let art = app.stage_image_rgba(iw, ih, bytes);
-    let app = app.scene(move |s| build_scene(s, art));
+    // `FROSTIFY_AUTOCAPTURE=1` writes one frame to `debug_captures/` and
+    // exits — the deterministic root-layer-parity capture gate. Without
+    // it the example runs interactively for eyeballing glass params.
+    let app = app.scene(move |s| build_scene(s, art)).capture_from_env();
     app.run()
 }

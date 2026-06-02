@@ -26,6 +26,18 @@ pub const SHAPE_KIND_IMAGE: u32 = 3;
 /// outside; with the sentinel, nothing is ever discarded.
 pub const NO_CLIP: [f32; 4] = [-1.0e30, -1.0e30, 1.0e30, 1.0e30];
 
+/// Painter-order index of the first glass shape, or `instances.len()`
+/// when there is none. The backdrop pass draws only `0..first_glass` so
+/// shapes painted *in front of* the glass (drawn after it) can't bleed
+/// into the blur the glass samples — they're simply not in the backdrop.
+pub(crate) fn first_glass_index(instances: &[ShapeInstance]) -> u32 {
+    instances
+        .iter()
+        .position(|s| s.shape_kind & SHAPE_KIND_MASK == SHAPE_KIND_GLASS)
+        .map(|i| i as u32)
+        .unwrap_or(instances.len() as u32)
+}
+
 /// GPU shape instance. Layout must match `ShapeInstance` in `shape.wgsl`.
 /// std430-compatible. **160 bytes, 16-aligned.** WGSL
 /// `array<ShapeInstance>` stride = roundUp(16, last_offset + last_size).
@@ -72,6 +84,45 @@ pub struct ShapeInstance {
     pub scale: [f32; 2],
     /// Padding to align Rust `size_of` with WGSL array stride (160).
     pub _pad1: [f32; 2],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inst(kind: u32) -> ShapeInstance {
+        let mut s = ShapeInstance::zeroed();
+        s.shape_kind = kind;
+        s
+    }
+
+    #[test]
+    fn first_glass_picks_earliest_glass_in_painter_order() {
+        // [rect, image, glass, rect] → first glass at index 2, so only
+        // indices 0..2 (the behind-glass backdrop) feed the blur.
+        let list = [
+            inst(SHAPE_KIND_RECT),
+            inst(SHAPE_KIND_IMAGE),
+            inst(SHAPE_KIND_GLASS),
+            inst(SHAPE_KIND_RECT),
+        ];
+        assert_eq!(first_glass_index(&list), 2);
+    }
+
+    #[test]
+    fn first_glass_honours_kind_mask() {
+        // Glass with upper bits set (e.g. border-side mask) still counts.
+        let glassy = inst(SHAPE_KIND_GLASS | (0b1111 << 8));
+        let list = [inst(SHAPE_KIND_RECT), glassy];
+        assert_eq!(first_glass_index(&list), 1);
+    }
+
+    #[test]
+    fn no_glass_yields_full_length() {
+        let list = [inst(SHAPE_KIND_RECT), inst(SHAPE_KIND_IMAGE)];
+        assert_eq!(first_glass_index(&list), 2);
+        assert_eq!(first_glass_index(&[]), 0);
+    }
 }
 
 const _: () = assert!(std::mem::size_of::<ShapeInstance>() == 160);

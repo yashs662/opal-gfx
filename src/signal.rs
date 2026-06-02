@@ -6,6 +6,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-wide monotonic source for [`Signal::id`]. Each `Signal::new`
+/// takes the next value; clones share it (it lives on the Rc'd inner).
+/// Used to derive a stable timeline tween key from a signal's identity
+/// (see `Timeline::animate`) so callers don't hand-author tween keys.
+static NEXT_SIGNAL_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Signal<T: Copy + PartialEq> {
     inner: Rc<SignalInner<T>>,
@@ -14,6 +21,7 @@ pub struct Signal<T: Copy + PartialEq> {
 struct SignalInner<T> {
     value: Cell<T>,
     version: Cell<u64>,
+    id: u64,
 }
 
 impl<T: Copy + PartialEq> Signal<T> {
@@ -22,12 +30,19 @@ impl<T: Copy + PartialEq> Signal<T> {
             inner: Rc::new(SignalInner {
                 value: Cell::new(value),
                 version: Cell::new(0),
+                id: NEXT_SIGNAL_ID.fetch_add(1, Ordering::Relaxed),
             }),
         }
     }
 
     pub fn get(&self) -> T {
         self.inner.value.get()
+    }
+
+    /// Stable, process-unique identity (shared across clones). Drives
+    /// identity-keyed tweens — see `Timeline::animate`.
+    pub fn id(&self) -> u64 {
+        self.inner.id
     }
 
     /// Returns true if the value actually changed.

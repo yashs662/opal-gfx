@@ -31,6 +31,17 @@ use etagere::{size2, AtlasAllocator};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ImageHandle(pub u32);
 
+/// Result of [`ImageAtlas::upload_rgba_growing`]: the new handle plus
+/// whether the upload **repacked** the atlas (grow / evict), which moves
+/// every existing handle's UV. When `false`, only the node(s) bound to
+/// `handle` need repainting; when `true`, the caller must re-flatten so
+/// every image instance picks up its shifted UV.
+#[derive(Copy, Clone, Debug)]
+pub struct UploadOutcome {
+    pub handle: ImageHandle,
+    pub layout_changed: bool,
+}
+
 /// UV + pixel size for an uploaded image.
 #[derive(Copy, Clone, Debug)]
 pub struct ImageEntry {
@@ -261,29 +272,39 @@ impl ImageAtlas {
         w: u32,
         h: u32,
         rgba: &[u8],
-        live: &HashSet<ImageHandle>,
+        // Lazy: computing the live set walks the whole node tree, and the
+        // overwhelmingly common path (atlas has room) never needs it. Only
+        // the last-resort evict calls this — so a burst of uploads pays the
+        // tree walk at most once, not per upload.
+        live: impl FnOnce() -> HashSet<ImageHandle>,
         max_size: u32,
-    ) -> Option<ImageHandle> {
+    ) -> Option<UploadOutcome> {
+        // Fast path: the atlas has room. The new handle gets a fresh slot
+        // and **no existing UV moves**, so the caller only needs to repaint
+        // the node(s) bound to this one handle — not re-flatten the scene.
         if let Some(handle) = self.upload_rgba(queue, w, h, rgba) {
-            return Some(handle);
+            return Some(UploadOutcome { handle, layout_changed: false });
         }
         // Try growing first — preserves every cached source, so an in-
         // flight burst of uploads stays intact regardless of how stale
-        // the caller's `live` snapshot is.
+        // the caller's `live` snapshot is. Grow/evict both **repack** the
+        // atlas → every surviving handle's UV moves → `layout_changed`.
         while self.size < max_size {
             let next = (self.size * 2).min(max_size);
             if !self.grow(device, queue, next) {
                 break;
             }
             if let Some(handle) = self.upload_rgba(queue, w, h, rgba) {
-                return Some(handle);
+                return Some(UploadOutcome { handle, layout_changed: true });
             }
         }
         // Last resort at max texture dimension: evict non-live + retry.
         // At this point we know `live` is the best signal we have, and
-        // dropping anything not in it is the only way to make room.
-        self.rebuild_keeping(queue, live);
+        // dropping anything not in it is the only way to make room. This
+        // is the only path that needs the live set, so compute it now.
+        self.rebuild_keeping(queue, &live());
         self.upload_rgba(queue, w, h, rgba)
+            .map(|handle| UploadOutcome { handle, layout_changed: true })
     }
 
     /// Replace the underlying GPU texture with one of `new_size` and
@@ -685,10 +706,11 @@ mod tests {
                     28,
                     28,
                     &solid_rgba(28, 28, [i as u8 + 1; 4]),
-                    &empty_live,
+                    || empty_live.clone(),
                     1024,
                 )
-                .expect("burst upload must succeed via grow");
+                .expect("burst upload must succeed via grow")
+                .handle;
             handles.push(h);
         }
         // Every handle from the burst remains live in the atlas.
@@ -718,10 +740,12 @@ mod tests {
                 28,
                 28,
                 &solid_rgba(28, 28, [2; 4]),
-                &live,
+                || live.clone(),
                 256,
             )
             .expect("growing path should succeed");
+        assert!(h2.layout_changed, "grow path must report a repack");
+        let h2 = h2.handle;
         assert!(atlas.size() > 32, "atlas must have grown");
         assert!(atlas.get(h2).is_some());
         assert!(atlas.get(live_h).is_some(), "live handle preserved across grow");

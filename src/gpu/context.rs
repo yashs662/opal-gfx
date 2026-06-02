@@ -5,7 +5,10 @@ use winit::window::Window;
 use super::blur::BlurResources;
 use super::glyph_atlas::GlyphAtlas;
 use super::image_atlas::{ImageAtlas, ImageHandle};
-use super::instance::{FrameUniform, ShapeInstance, SHAPE_KIND_GLYPH, SHAPE_KIND_IMAGE};
+use super::instance::{
+    FrameUniform, ShapeInstance, SHAPE_KIND_GLASS, SHAPE_KIND_GLYPH, SHAPE_KIND_IMAGE,
+    SHAPE_KIND_MASK,
+};
 use super::overdraw::OverdrawResources;
 use super::pipeline::ShapePipeline;
 use crate::node::{ImageRef, TextRef};
@@ -30,6 +33,14 @@ pub struct GpuContext {
     pub shape: ShapePipeline,
     pub blur: BlurResources,
     pub overdraw: OverdrawResources,
+    /// Offscreen layer textures + the composite pipeline (compositor
+    /// P2). Each layer rasterizes its instance sub-range here, then the
+    /// composite pass blits all layers to the surface in z-order.
+    pub layers: super::layer::LayerResources,
+    /// Per-frame layer draw list set by `set_layers` (from the CPU
+    /// `LayerTree`). Single root layer today → one entry covering the
+    /// whole instance stream at identity transform.
+    layer_draws: Vec<super::layer::LayerDraw>,
     pub glyph_atlas: GlyphAtlas,
     pub image_atlas: ImageAtlas,
     overdraw_mode: bool,
@@ -67,6 +78,12 @@ pub struct GpuContext {
     timing: Option<Timing>,
     /// Render-pass + compute drawcall counter for the most recent frame.
     last_drawcalls: u32,
+    /// Compositor accounting for the most recent `encode_frame`: live
+    /// layers, layers actually re-rastered (the rest reused their cached
+    /// texture), and layers composited. Fed into `FrameStats`.
+    last_layer_count: u32,
+    last_raster_count: u32,
+    last_composite_count: u32,
     /// Cached frame timing read at the end of the last render. `None`
     /// when timing isn't available or hasn't been read yet.
     last_timing: Option<FrameTiming>,
@@ -154,12 +171,21 @@ impl GpuContext {
         );
 
         let glyph_atlas = GlyphAtlas::new(&device, 1024);
-        // Start small (16 MiB). [`ImageAtlas::upload_rgba_growing`] —
-        // the path `App::upload_image_rgba` uses — auto-grows the
-        // texture (doubling, capped at the adapter's max 2D dimension)
-        // when consumer uploads outgrow the initial cap. Consumers
-        // never have to tune this.
-        let image_atlas = ImageAtlas::new(&device, 2048);
+        // Allocate the image atlas **large up front**. Growing re-uploads
+        // every cached source into the new (bigger) texture synchronously
+        // on the UI thread — a multi-100ms hitch for a large list whose
+        // covers stream in. Starting at the adapter's max 2D dimension
+        // (clamped to 8192² = 256 MiB) means growth — and the eviction
+        // fallback that growth would otherwise reach at the ceiling —
+        // effectively never fires: every uploaded cover stays resident, so
+        // none "never load" from a dangling/evicted handle. VRAM is the
+        // cheap axis here (the compositor doctrine); 256 MiB holds ~1700
+        // 300 px covers, far past any real playlist's working set.
+        let atlas_size = device
+            .limits()
+            .max_texture_dimension_2d
+            .min(8192);
+        let image_atlas = ImageAtlas::new(&device, atlas_size);
         let shape = ShapePipeline::new(
             &device,
             format,
@@ -184,6 +210,16 @@ impl GpuContext {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Layer resources need the instance SSBO for the per-layer raster
+        // bind groups (scroll-layer content-local path), so build after it.
+        let layers = super::layer::LayerResources::new(
+            &device,
+            format,
+            width,
+            height,
+            &shape.shape_bgl,
+            &instance_buffer,
+        );
 
         let shape_bg = make_shape_bg(&device, &shape, &instance_buffer);
         let glass_bg = make_glass_bg(&device, &shape, &blur);
@@ -218,6 +254,8 @@ impl GpuContext {
             shape,
             blur,
             overdraw,
+            layers,
+            layer_draws: Vec::new(),
             glyph_atlas,
             image_atlas,
             overdraw_mode: false,
@@ -235,6 +273,9 @@ impl GpuContext {
             backdrop_dirty: true,
             timing,
             last_drawcalls: 0,
+            last_layer_count: 1,
+            last_raster_count: 0,
+            last_composite_count: 0,
             last_timing: None,
             window_corner_radius: 0.0,
         }
@@ -265,7 +306,96 @@ impl GpuContext {
             self.surface_config.width,
             self.surface_config.height,
         );
+        // Layer textures are physical-px sized — drop cached textures so
+        // the next frame re-allocates them at the new size from the live
+        // draw list (identity = surface, scroll = its content size).
+        self.layers
+            .resize(self.surface_config.width, self.surface_config.height);
         self.backdrop_dirty = true;
+    }
+
+    /// Set the per-frame layer draw list (from the CPU `LayerTree`).
+    /// `encode_frame` rasters each layer's instance sub-range into its
+    /// texture, then composites them to the surface in z-order. An empty
+    /// list falls back to a single root layer spanning every instance.
+    pub fn set_layers(&mut self, draws: &[super::layer::LayerDraw]) {
+        // Generic glass (P4) sources its backdrop from the composite of the
+        // layers *below* it. Those layers can change composite-only (a
+        // scroll window moving, a `set_layer_offset`) without touching any
+        // instance bytes — which wouldn't otherwise re-run the backdrop
+        // pass (gated on `dirty::BACKDROP`). So when a glass-bearing layer
+        // has content below it AND any layer's composite params differ from
+        // the last draw list, force a re-blur. Same-list frames cost
+        // nothing; this only fires for glass-over-a-moving-layer (which
+        // Frostify's z-order — glass above its scrollers — never hits, but
+        // the engine must stay correct for it).
+        if !self.backdrop_dirty {
+            let first_glass = draws.iter().enumerate().find_map(|(i, d)| {
+                let (_, g) = self.layer_signature(&d.instances);
+                g.then_some(i)
+            });
+            // `i > 0` ⇒ at least one layer is below the (first) glass layer
+            // in the draw order; only then can a below-composite change.
+            if let Some(gi) = first_glass
+                && gi > 0
+                && self.below_glass_composite_changed(draws, gi)
+            {
+                self.backdrop_dirty = true;
+            }
+        }
+        self.layer_draws.clear();
+        self.layer_draws.extend_from_slice(draws);
+    }
+
+    /// True if any of `draws[..gi]` (layers below the glass layer at index
+    /// `gi`) has a composite param (offset/scale/opacity/window) different
+    /// from the corresponding entry in the previous draw list
+    /// (`self.layer_draws`), or the layer count below changed. Used to
+    /// re-trigger the backdrop blur on a composite-only below-glass change.
+    fn below_glass_composite_changed(
+        &self,
+        draws: &[super::layer::LayerDraw],
+        gi: usize,
+    ) -> bool {
+        for i in 0..gi {
+            match (draws.get(i), self.layer_draws.get(i)) {
+                (Some(new), Some(old)) => {
+                    if new.offset != old.offset
+                        || new.scale != old.scale
+                        || new.opacity != old.opacity
+                        || new.window != old.window
+                    {
+                        return true;
+                    }
+                }
+                // Count below the glass changed → backdrop content changed.
+                _ => return true,
+            }
+        }
+        false
+    }
+
+    /// Content signature of a layer's instance sub-range + whether it
+    /// contains glass. The signature (FNV-1a over the instance bytes in
+    /// `prev_instances`, the CPU shadow of the uploaded buffer) is the
+    /// raster-skip key: identical bytes ⇒ identical rasterized pixels ⇒
+    /// reuse the cached texture. `has_glass` lets the caller force a
+    /// re-raster when the backdrop pyramid changed (glass samples it).
+    fn layer_signature(&self, range: &std::ops::Range<u32>) -> (u64, bool) {
+        let start = (range.start as usize).min(self.prev_instances.len());
+        let end = (range.end as usize).min(self.prev_instances.len());
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut has_glass = false;
+        for inst in &self.prev_instances[start..end] {
+            for &b in bytemuck::bytes_of(inst) {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+            if inst.shape_kind & SHAPE_KIND_MASK == SHAPE_KIND_GLASS {
+                has_glass = true;
+            }
+        }
+        (hash, has_glass)
     }
 
     pub fn overdraw_mode(&self) -> bool {
@@ -327,6 +457,11 @@ impl GpuContext {
             });
             self.instance_capacity = new_cap;
             self.shape_bg = make_shape_bg(&self.device, &self.shape, &self.instance_buffer);
+            // The per-layer raster bind groups (scroll-layer content-local
+            // path) reference the instance SSBO too — repoint them at the
+            // freshly-grown buffer or they'd sample the dropped one.
+            self.layers
+                .rebuild_raster_bgs(&self.device, &self.instance_buffer);
         }
 
         // Full upload on buffer grow or on any slot-count change (new
@@ -369,6 +504,9 @@ impl GpuContext {
 
         self.instance_count = instances.len() as u32;
         self.glass_count = glass_count.min(self.instance_count);
+        // Per-glass split is computed per-layer in `encode_frame` (P4
+        // generic glass) from `prev_instances`, so no global first-glass
+        // index is cached here anymore.
         if backdrop_hint {
             self.backdrop_dirty = true;
         }
@@ -522,12 +660,85 @@ impl GpuContext {
         self.image_atlas.upload_png(&self.queue, bytes)
     }
 
+    /// Rasterize one layer's instance sub-range into its offscreen texture
+    /// (`fs_main`, cleared transparent). Honors raster-skip: returns
+    /// `false` (no pass encoded) when the slot's content signature is
+    /// unchanged and `force` is false. `ts_pair` is the optional
+    /// timestamp write-index pair (used only by the root layer's
+    /// PASS_FINAL slot); the query set is read from `self.timing` here so
+    /// the caller doesn't hold a `&self.timing` borrow across this
+    /// `&mut self` call.
+    ///
+    /// Split out of the old single raster loop so P4 can raster the
+    /// below-glass layers **before** the backdrop build (which composites
+    /// them) and the rest after.
+    fn raster_layer(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        i: usize,
+        draw: &super::layer::LayerDraw,
+        force: bool,
+        ts_pair: Option<(u32, u32)>,
+    ) -> bool {
+        let (sig, _) = self.layer_signature(&draw.instances);
+        if draw.instances.is_empty() || !self.layers.needs_raster(i, sig, force) {
+            return false;
+        }
+        {
+            let ts = match (self.timing.as_ref(), ts_pair) {
+                (Some(t), Some((b, e))) => Some(wgpu::RenderPassTimestampWrites {
+                    query_set: &t.query_set,
+                    beginning_of_pass_write_index: Some(b),
+                    end_of_pass_write_index: Some(e),
+                }),
+                _ => None,
+            };
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frostify.layer raster"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.layers.raster_view(i),
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: ts,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(&self.shape.final_pipeline);
+            // Identity layers raster in absolute screen coords against the
+            // global shape BG (frame = surface); scroll layers raster
+            // content-local against their per-layer BG. Group 1 (glass
+            // backdrop) is always bound; scroll layers never sample it.
+            let group0 = match draw.window {
+                Some(_) => self.layers.raster_bg(i),
+                None => &self.shape_bg,
+            };
+            rpass.set_bind_group(0, group0, &[]);
+            rpass.set_bind_group(1, &self.glass_bg, &[]);
+            rpass.set_bind_group(2, self.glyph_atlas.bind_group(), &[]);
+            rpass.set_bind_group(3, self.image_atlas.bind_group(), &[]);
+            rpass.draw(0..6, draw.instances.clone());
+        }
+        self.layers.mark_rastered(i, sig);
+        true
+    }
+
     /// Encode the opaque pass, downsample dispatches (if needed), and
     /// final pass into `encoder`. `final_view` is the render target for
     /// the surface pass.
     fn encode_frame(&mut self, encoder: &mut wgpu::CommandEncoder, final_view: &wgpu::TextureView) {
         let mut drawcalls: u32 = 0;
-        let timing_qs = self.timing.as_ref().map(|t| &t.query_set);
+        // Whether GPU timestamp timing is active. Used only for the dense
+        // query-pair allocation below; each pass reads `self.timing`
+        // locally when building its `RenderPassTimestampWrites` so no
+        // long-lived `&self.timing` borrow spans the `&mut self`
+        // `raster_layer` calls (P4 split the raster into two phases).
+        let has_timing = self.timing.is_some();
         let mut alloc = PassAlloc::new();
         // The opaque pass exists only to populate `backdrop_tex` mip 0
         // (and the rest of the pyramid via downsample) for glass shapes
@@ -539,43 +750,127 @@ impl GpuContext {
         // Pre-allocate query pairs for every pass that will run this
         // frame. The pair indices are dense so `resolve_query_set` can
         // cover a contiguous prefix.
-        let (opaque_begin, opaque_end) = match (timing_qs, run_backdrop) {
-            (Some(_), true) => {
-                let (b, e) = alloc.alloc(PASS_OPAQUE);
-                (Some(b), Some(e))
-            }
-            _ => (None, None),
+        let (opaque_begin, opaque_end) = if has_timing && run_backdrop {
+            let (b, e) = alloc.alloc(PASS_OPAQUE);
+            (Some(b), Some(e))
+        } else {
+            (None, None)
         };
-        let (final_begin, final_end) = match timing_qs {
-            Some(_) => {
-                let (b, e) = alloc.alloc(PASS_FINAL);
-                (Some(b), Some(e))
-            }
-            None => (None, None),
+        let (final_begin, final_end) = if has_timing {
+            let (b, e) = alloc.alloc(PASS_FINAL);
+            (Some(b), Some(e))
+        } else {
+            (None, None)
         };
-        let (od_count_begin, od_count_end) = match (timing_qs, self.overdraw_mode) {
-            (Some(_), true) => {
-                let (b, e) = alloc.alloc(PASS_OD_COUNT);
-                (Some(b), Some(e))
-            }
-            _ => (None, None),
+        let (od_count_begin, od_count_end) = if has_timing && self.overdraw_mode {
+            let (b, e) = alloc.alloc(PASS_OD_COUNT);
+            (Some(b), Some(e))
+        } else {
+            (None, None)
         };
-        let (od_compose_begin, od_compose_end) = match (timing_qs, self.overdraw_mode) {
-            (Some(_), true) => {
-                let (b, e) = alloc.alloc(PASS_OD_COMPOSE);
-                (Some(b), Some(e))
-            }
-            _ => (None, None),
+        let (od_compose_begin, od_compose_end) = if has_timing && self.overdraw_mode {
+            let (b, e) = alloc.alloc(PASS_OD_COMPOSE);
+            (Some(b), Some(e))
+        } else {
+            (None, None)
         };
 
-        // ---- Pass A: opaque-class shapes → backdrop_tex ------------------
-        // Draws the full instance list — `fs_opaque` discards glass
-        // instances so they stay out of the blur input. Painter's
-        // order is preserved so layered text/images appear in the
-        // backdrop in the same order they appear on the surface.
-        // Skipped when no glass exists (nothing samples backdrop_tex)
-        // or when the prior submit's backdrop is still valid.
+        // Effective draw list + per-layer texture sizing/uniforms, hoisted
+        // **above** the backdrop pass (P4): generic glass sources its
+        // backdrop from the composite of layers below it, so the layer
+        // textures + composite uniforms must be ready before the backdrop
+        // step runs. With a single root layer (no layers below a mid-stream
+        // glass) the backdrop step still falls back to the raw pre-glass
+        // draw below → byte-identical to the pre-P4 path.
+        let screen = [
+            self.surface_config.width as f32,
+            self.surface_config.height as f32,
+        ];
+        let draws: Vec<super::layer::LayerDraw> = if self.layer_draws.is_empty() {
+            vec![super::layer::LayerDraw {
+                instances: 0..self.instance_count,
+                ..Default::default()
+            }]
+        } else {
+            self.layer_draws.clone()
+        };
+        let surface_px = [self.surface_config.width, self.surface_config.height];
+        let sizes: Vec<[u32; 2]> = draws.iter().map(|d| d.texture_size(surface_px)).collect();
+        self.layers
+            .ensure(&self.device, &sizes, &self.instance_buffer);
+        let max_lod = self.blur.mip_count().saturating_sub(1) as f32;
+        for (i, d) in draws.iter().enumerate() {
+            self.layers.write_uniform(&self.queue, i, d, screen);
+            if let Some(w) = d.window.as_ref() {
+                self.layers.write_frame(&self.queue, i, w.tex_size, max_lod);
+            }
+        }
+
+        // ---- Backdrop build (P4 generic glass) → backdrop_tex -----------
+        // The backdrop a glass samples = composite of every layer painted
+        // *below* it + that layer's own instances *before* the glass
+        // (`fs_opaque` discards any glass in that pre-range). Skipped when
+        // no glass exists or the prior submit's backdrop is still valid.
+        // Index of the first glass-bearing layer in paint order, and the
+        // within-layer instance offset of its first glass shape. The
+        // backdrop a glass samples = composite of every layer painted
+        // *below* it + that layer's own instances *before* the glass.
+        let order_paint: Vec<usize> = {
+            let mut o: Vec<usize> = (0..draws.len()).collect();
+            o.sort_by_key(|&i| draws[i].z);
+            o
+        };
+        let first_glass_layer = order_paint.iter().position(|&i| {
+            let (_, has_glass) = self.layer_signature(&draws[i].instances);
+            has_glass
+        });
+        let glass_pp = first_glass_layer.unwrap_or(order_paint.len());
+
+        // ---- Phase-1 raster: layers painted BELOW the first glass layer.
+        // They must be rastered before the backdrop build composites them.
+        // None of these contain glass (glass_pp is the first glass layer),
+        // so `force=false`. Single-root → glass_pp=0 → this is empty, and
+        // the whole raster runs in phase 2 exactly as before.
+        let mut raster_count = 0u32;
+        for &li in &order_paint[..glass_pp.min(order_paint.len())] {
+            let ts = if li == 0 {
+                final_begin.zip(final_end)
+            } else {
+                None
+            };
+            let d = draws[li].clone();
+            if self.raster_layer(encoder, li, &d, false, ts) {
+                drawcalls += 1;
+                raster_count += 1;
+            }
+        }
+
         if run_backdrop {
+            // Build the backdrop into `backdrop_tex` mip0 (linear). For a
+            // glass layer at paint-position `p`, the backdrop is: composite
+            // layers `order_paint[0..p]` (premultiplied-over, linear
+            // target) then raw-draw that layer's pre-glass instances on
+            // top. Single-root (glass in layer 0, nothing below) → the
+            // composite loop is empty and only the raw pre-glass draw runs
+            // → byte-identical to the pre-P4 opaque pass.
+            let glass_layer = order_paint.get(glass_pp).copied().unwrap_or(0);
+            // Within-layer first-glass offset (absolute instance index).
+            let gstart = draws[glass_layer].instances.start as usize;
+            let gend = draws[glass_layer].instances.end as usize;
+            let pre_glass_end = {
+                let s = gstart.min(self.prev_instances.len());
+                let e = gend.min(self.prev_instances.len());
+                let rel = crate::gpu::instance::first_glass_index(&self.prev_instances[s..e]);
+                gstart as u32 + rel
+            };
+            let backdrop_ts = match (self.timing.as_ref(), opaque_begin.zip(opaque_end)) {
+                (Some(t), Some((b, e))) => Some(wgpu::RenderPassTimestampWrites {
+                    query_set: &t.query_set,
+                    beginning_of_pass_write_index: Some(b),
+                    end_of_pass_write_index: Some(e),
+                }),
+                _ => None,
+            };
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frostify.backdrop pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -588,20 +883,33 @@ impl GpuContext {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: timing_qs.map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: opaque_begin,
-                    end_of_pass_write_index: opaque_end,
-                }),
+                timestamp_writes: backdrop_ts,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if self.instance_count > 0 {
+            // Composite layers painted below the glass layer into the
+            // linear backdrop. Their textures were rastered just above.
+            // (Empty for single-root.)
+            if first_glass_layer.is_some() && glass_pp > 0 {
+                rpass.set_pipeline(self.layers.backdrop_pipeline());
+                for &li in &order_paint[..glass_pp] {
+                    if draws[li].instances.is_empty() {
+                        continue;
+                    }
+                    rpass.set_bind_group(0, self.layers.bind_group(li), &[]);
+                    rpass.draw(0..6, 0..1);
+                    drawcalls += 1;
+                }
+            }
+            // Raw-draw the glass layer's pre-glass instances on top
+            // (`fs_opaque` discards any glass in range). This is the
+            // backdrop content living in the same layer as the glass.
+            if pre_glass_end > gstart as u32 {
                 rpass.set_pipeline(&self.shape.opaque_pipeline);
                 rpass.set_bind_group(0, &self.shape_bg, &[]);
                 rpass.set_bind_group(2, self.glyph_atlas.bind_group(), &[]);
                 rpass.set_bind_group(3, self.image_atlas.bind_group(), &[]);
-                rpass.draw(0..6, 0..self.instance_count);
+                rpass.draw(0..6, (gstart as u32)..pre_glass_end);
                 drawcalls += 1;
             }
         }
@@ -614,10 +922,42 @@ impl GpuContext {
             self.backdrop_dirty = false;
         }
 
-        // ---- Pass C: final surface ------------------------------------
+        // ---- Pass C: rasterize each layer into its offscreen texture --
+        // then composite them to the surface in z-order. With a single
+        // root layer this is exactly the old final pass redirected to an
+        // offscreen target plus a 1:1 identity blit → byte-identical
+        // output. The compositor win (skipping the raster on
+        // composite-only frames) is gated in P3. (`draws`, layer sizing,
+        // and composite uniforms were hoisted above the backdrop pass for
+        // P4 — see there.)
+
+        // ---- Phase-2 raster: the glass layer + everything above it (the
+        // layers NOT already rastered in phase 1). The glass layer samples
+        // the backdrop just built, so it's forced to re-raster whenever the
+        // backdrop pyramid re-ran. Single-root → phase 1 was empty → this
+        // rasters every layer exactly as the pre-P4 single loop did.
+        for &i in &order_paint[glass_pp.min(order_paint.len())..] {
+            let (_, has_glass) = self.layer_signature(&draws[i].instances);
+            let force = run_backdrop && has_glass;
+            let ts = if i == 0 {
+                final_begin.zip(final_end)
+            } else {
+                None
+            };
+            let d = draws[i].clone();
+            if self.raster_layer(encoder, i, &d, force, ts) {
+                drawcalls += 1;
+                raster_count += 1;
+            }
+        }
+
+        // Composite: blit each layer to the surface back-to-front, then
+        // draw the debug overlay (HUD) on top.
+        let mut order: Vec<usize> = (0..draws.len()).collect();
+        order.sort_by_key(|&i| draws[i].z);
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frostify.final pass"),
+                label: Some("frostify.composite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: final_view,
                     resolve_target: None,
@@ -628,21 +968,14 @@ impl GpuContext {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: timing_qs.map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: final_begin,
-                    end_of_pass_write_index: final_end,
-                }),
+                timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if self.instance_count > 0 {
-                rpass.set_pipeline(&self.shape.final_pipeline);
-                rpass.set_bind_group(0, &self.shape_bg, &[]);
-                rpass.set_bind_group(1, &self.glass_bg, &[]);
-                rpass.set_bind_group(2, self.glyph_atlas.bind_group(), &[]);
-                rpass.set_bind_group(3, self.image_atlas.bind_group(), &[]);
-                rpass.draw(0..6, 0..self.instance_count);
+            rpass.set_pipeline(self.layers.pipeline());
+            for &i in &order {
+                rpass.set_bind_group(0, self.layers.bind_group(i), &[]);
+                rpass.draw(0..6, 0..1);
                 drawcalls += 1;
             }
             if self.overlay_count > 0 {
@@ -655,6 +988,9 @@ impl GpuContext {
                 drawcalls += 1;
             }
         }
+        self.last_layer_count = draws.len() as u32;
+        self.last_raster_count = raster_count;
+        self.last_composite_count = order.len() as u32;
 
         // ---- Pass D (optional): overdraw count + compose --------------
         // When toggled on, count shape coverage into an Rgba16Float
@@ -663,6 +999,14 @@ impl GpuContext {
         // compose pass overwrites it with the heatmap (LoadOp::Clear).
         if self.overdraw_mode {
             {
+                let od_count_ts = match (self.timing.as_ref(), od_count_begin.zip(od_count_end)) {
+                    (Some(t), Some((b, e))) => Some(wgpu::RenderPassTimestampWrites {
+                        query_set: &t.query_set,
+                        beginning_of_pass_write_index: Some(b),
+                        end_of_pass_write_index: Some(e),
+                    }),
+                    _ => None,
+                };
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("frostify.overdraw count"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -675,11 +1019,7 @@ impl GpuContext {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: timing_qs.map(|qs| wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: od_count_begin,
-                        end_of_pass_write_index: od_count_end,
-                    }),
+                    timestamp_writes: od_count_ts,
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -691,6 +1031,14 @@ impl GpuContext {
                 }
             }
             {
+                let od_compose_ts = match (self.timing.as_ref(), od_compose_begin.zip(od_compose_end)) {
+                    (Some(t), Some((b, e))) => Some(wgpu::RenderPassTimestampWrites {
+                        query_set: &t.query_set,
+                        beginning_of_pass_write_index: Some(b),
+                        end_of_pass_write_index: Some(e),
+                    }),
+                    _ => None,
+                };
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("frostify.overdraw compose"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -703,11 +1051,7 @@ impl GpuContext {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: timing_qs.map(|qs| wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: od_compose_begin,
-                        end_of_pass_write_index: od_compose_end,
-                    }),
+                    timestamp_writes: od_compose_ts,
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -793,6 +1137,12 @@ impl GpuContext {
             glass_count: self.glass_count,
             drawcalls: self.last_drawcalls,
             dirty_mask: 0,
+            // Compositor metrics — the GPU is authoritative (it decides
+            // what to actually raster/composite and what it allocated).
+            layer_count: self.last_layer_count,
+            raster_count: self.last_raster_count,
+            composite_count: self.last_composite_count,
+            layer_vram: self.layers.memory_bytes(),
         }
     }
 
@@ -825,6 +1175,7 @@ impl GpuContext {
             prev_instances_cpu: (self.prev_instances.capacity() as u64) * stride,
             blur_textures,
             overdraw_textures,
+            layer_textures: self.layers.memory_bytes(),
             timing,
             params_buffers,
             glyph_atlas: self.glyph_atlas.memory_bytes(),
@@ -950,6 +1301,9 @@ pub struct MemoryReport {
     pub prev_instances_cpu: u64,
     pub blur_textures: u64,
     pub overdraw_textures: u64,
+    /// Offscreen compositor layer textures (4 B/texel × surface size ×
+    /// layer count). One full-surface root layer in P2.
+    pub layer_textures: u64,
     pub timing: u64,
     pub params_buffers: u64,
     pub glyph_atlas: u64,
@@ -967,6 +1321,7 @@ impl MemoryReport {
             + self.prev_instances_cpu
             + self.blur_textures
             + self.overdraw_textures
+            + self.layer_textures
             + self.timing
             + self.params_buffers
             + self.glyph_atlas

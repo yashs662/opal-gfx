@@ -5,6 +5,12 @@ edition = "2024"
 description = "Reactive GPU UI rendering library"
 license = "MIT OR Apache-2.0"
 
+[features]
+# Debug-only scripted-input + screenshot harness (REMOVABLE before ship).
+# Pulls in `src/automation.rs` + the `#[cfg(feature = "automation")]`
+# blocks in `app.rs`. Off by default — never compiled into a normal build.
+automation = []
+
 [dependencies]
 wgpu = { version = "29.0.1", features = ["noop"] }
 winit = "0.30.13"

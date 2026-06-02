@@ -245,6 +245,18 @@ impl<T: Lerp> TweenDyn for Tween<T> {
     }
 }
 
+/// Reserved tween-key window for identity-keyed [`Timeline::animate`].
+/// Sits below the bind (`0xC000_0000`), drag (`0xD000_0000`), and widget
+/// (`0xF000_0000`) ranges so it never collides with them. The low 30 bits
+/// are a signal's truncated id; a collision needs >2^30 concurrently-live
+/// signals sharing the same low 30 bits — never in practice.
+const SIGNAL_TWEEN_BASE: u32 = 0x8000_0000;
+const SIGNAL_TWEEN_MASK: u32 = 0x3FFF_FFFF;
+
+fn signal_tween_key(id: u64) -> u32 {
+    SIGNAL_TWEEN_BASE | (id as u32 & SIGNAL_TWEEN_MASK)
+}
+
 /// Result of one `Timeline::tick`.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TickResult {
@@ -320,6 +332,29 @@ impl Timeline {
 
     pub fn stop(&mut self, key: u32) {
         self.tweens.retain(|t| t.key() != key);
+    }
+
+    /// Animate `signal` toward `to` **without a hand-authored key** — the
+    /// tween key is derived from the signal's identity (`Signal::id`), so
+    /// a second `animate` on the same signal smoothly interrupts the first
+    /// (reads the live value as the new `from`). This is the ergonomic
+    /// default; the explicit-key [`Self::start`] remains the escape hatch
+    /// for the rare case of multiple concurrent tweens on one signal.
+    pub fn animate<T: Lerp>(
+        &mut self,
+        signal: &Signal<T>,
+        to: T,
+        curve: Curve,
+        duration: Duration,
+        now: Instant,
+    ) {
+        self.start(signal_tween_key(signal.id()), signal.clone(), to, curve, duration, now);
+    }
+
+    /// Stop the identity-keyed animation for `signal` (if any). The `stop`
+    /// counterpart to [`Self::animate`].
+    pub fn stop_for<T: Lerp>(&mut self, signal: &Signal<T>) {
+        self.stop(signal_tween_key(signal.id()));
     }
 
     pub fn clear(&mut self) {
@@ -443,6 +478,43 @@ mod tests {
         let after = s.get();
         let expected = mid_val * 0.5;
         assert!((after - expected).abs() < 0.05, "after={after} expected~{expected}");
+    }
+
+    #[test]
+    fn animate_keys_on_signal_identity() {
+        // Two `animate` calls on the *same* signal share a key (one tween,
+        // smooth interrupt); a different signal gets its own.
+        let a = Signal::new(0.0f32);
+        let b = Signal::new(0.0f32);
+        let mut tl = Timeline::new();
+        let now = Instant::now();
+        tl.animate(&a, 1.0, Curve::Linear, Duration::from_millis(100), now);
+        tl.animate(&a, 2.0, Curve::Linear, Duration::from_millis(100), now);
+        assert_eq!(tl.len(), 1, "same signal → one tween (interrupt)");
+        tl.animate(&b, 1.0, Curve::Linear, Duration::from_millis(100), now);
+        assert_eq!(tl.len(), 2, "distinct signal → distinct tween");
+        // A clone keys identically to its source.
+        tl.animate(&a.clone(), 3.0, Curve::Linear, Duration::from_millis(100), now);
+        assert_eq!(tl.len(), 2, "clone shares identity → still interrupts a");
+        // stop_for removes only that signal's tween.
+        tl.stop_for(&a);
+        assert_eq!(tl.len(), 1);
+    }
+
+    #[test]
+    fn animate_interrupt_reads_live_value() {
+        let s = Signal::new(0.0f32);
+        let mut tl = Timeline::new();
+        let now = Instant::now();
+        tl.animate(&s, 1.0, Curve::Linear, Duration::from_millis(100), now);
+        tl.tick(now + Duration::from_millis(40));
+        let mid = s.get();
+        assert!(mid > 0.3 && mid < 0.5);
+        tl.animate(&s, 0.0, Curve::Linear, Duration::from_millis(100), now + Duration::from_millis(40));
+        assert_eq!(tl.len(), 1);
+        tl.tick(now + Duration::from_millis(90));
+        // Halfway through the reverse from `mid` → ~mid/2.
+        assert!((s.get() - mid * 0.5).abs() < 0.05);
     }
 
     #[test]

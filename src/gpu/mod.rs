@@ -3,6 +3,7 @@ pub mod context;
 pub mod glyph_atlas;
 pub mod image_atlas;
 pub mod instance;
+pub mod layer;
 pub mod overdraw;
 pub mod pipeline;
 pub mod timing;
@@ -15,6 +16,7 @@ pub use instance::{
     FrameUniform, NO_CLIP, ShapeInstance, SHAPE_KIND_GLASS, SHAPE_KIND_GLYPH, SHAPE_KIND_IMAGE,
     SHAPE_KIND_MASK, SHAPE_KIND_RECT,
 };
+pub use layer::{LayerDraw, LayerResources, ScrollWindow};
 pub use overdraw::{OverdrawResources, OVERDRAW_FORMAT};
 pub use pipeline::ShapePipeline;
 pub use timing::{FrameStats, FrameTiming, Timing};
