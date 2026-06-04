@@ -38,6 +38,7 @@ pub mod automation;
 pub mod debug;
 pub mod editor;
 pub mod event;
+pub mod frame_sink;
 pub mod gpu;
 pub mod input;
 pub mod layer;
@@ -83,7 +84,7 @@ pub use gpu::{
     MemoryReport, ShapeInstance,
 };
 pub use input::{InputChange, InputState};
-pub use layer::{Damage, Layer, LayerTree};
+pub use layer::{Damage, ExternalRect, Layer, LayerTree};
 pub use overlay::Overlay;
 pub use layout::{Align, Axis, Justify, LayoutStyle, Len, Measurer, NullMeasurer, Overflow};
 pub use node::{
@@ -101,4 +102,5 @@ pub use signal::{Signal, TextSignal};
 pub use winit::window::CursorIcon;
 pub use svg::{rasterize_svg, rasterize_svg_to};
 pub use text::{RasterizedGlyph, ShapedGlyph, TextMetrics, TextResources};
+pub use frame_sink::FrameSink;
 pub use uploader::Uploader;

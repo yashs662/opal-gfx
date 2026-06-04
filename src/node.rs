@@ -67,6 +67,13 @@ pub struct ImageRef {
     pub handle: ImageHandle,
     /// Scissor rect propagated from the nearest Scroll/Hidden ancestor.
     pub clip_rect: [f32; 4],
+    /// `true` → scale the image to **cover** the node rect (preserve aspect,
+    /// crop overflow) instead of stretching it to fill. The visible region
+    /// is a centred crop of the source matching the node's aspect.
+    pub cover: bool,
+    /// Corner radius (physical px) of the rounded clip rect, when an
+    /// overflow container with a radius clips this image. 0 = square clip.
+    pub clip_radius: f32,
 }
 
 /// One interactive rect in the hit-test cache. Produced by
@@ -116,6 +123,16 @@ pub struct LayerSpan {
     pub node: NodeId,
     pub events: std::ops::Range<usize>,
     pub scroll: Option<ScrollSpan>,
+    /// `Some` → **external-texture layer** (P6): `events` is empty (the
+    /// node emits no instances); the app maps this to a zero-instance
+    /// layer whose pixels come from the registered external texture,
+    /// composited at `events.start`'s paint cursor (for z) into this
+    /// screen rect.
+    pub external: Option<crate::layer::ExternalRect>,
+    /// Composite-time edge fade `[top, right, bottom, left]` (0..1) + a
+    /// falloff exponent, from the promoted node. All-0 = no fade.
+    pub edge_fade: [f32; 4],
+    pub edge_fade_falloff: f32,
 }
 
 /// Composite-window geometry for a promoted **scroll** layer, in physical
@@ -445,16 +462,38 @@ pub struct NodeInteract {
 /// on the first sugar call; subsequent calls mutate-in-place so the
 /// resulting `Computed` covers every wired state in one slot.
 ///
-/// `base` snapshots `style.color` at the moment the first sugar method
-/// fired — so sugar pairs with `.rgba(...)` *before* the sugar call.
-/// Authoring a reactive `Signal<Color>` base and then layering sugar on
-/// top isn't supported (the sugar can't follow a live source); build a
-/// hand-rolled `Computed` instead.
+/// `base` is the node's resting colour *bind* — a live source, so sugar
+/// follows a reactive base (e.g. a `Signal` accent) instead of freezing
+/// its value. It's taken from the node's last `.color(...)` call (falling
+/// back to a `Value` of the current `style.color`), so order between
+/// `.color(...)` and the sugar call no longer matters.
 #[derive(Clone, Debug)]
 pub struct InteractColors {
-    pub base: [f32; 4],
-    pub hover: Option<[f32; 4]>,
-    pub press: Option<[f32; 4]>,
+    pub base: crate::reactive::Bind<[f32; 4]>,
+    pub hover: Option<ColorMod>,
+    pub press: Option<ColorMod>,
+}
+
+/// How an interaction state (hover/press) derives its colour from the
+/// live base. `Fixed` swaps to a constant; `AlphaScale` keeps the base
+/// rgb and scales its alpha (the `*_opacity` sugar) — evaluated against
+/// the *current* base each frame so it tracks a reactive accent.
+#[derive(Clone, Copy, Debug)]
+pub enum ColorMod {
+    Fixed([f32; 4]),
+    AlphaScale(f32),
+}
+
+impl ColorMod {
+    /// Resolve the state colour against a concrete base value.
+    pub fn apply(self, base: [f32; 4]) -> [f32; 4] {
+        match self {
+            ColorMod::Fixed(c) => c,
+            ColorMod::AlphaScale(f) => {
+                [base[0], base[1], base[2], (base[3] * f).clamp(0.0, 1.0)]
+            }
+        }
+    }
 }
 
 impl NodeInteract {
@@ -649,11 +688,30 @@ pub struct Node {
     /// Optional composite-opacity source for a `.layer()`-promoted
     /// subtree. When set, the app pushes this signal's value into the
     /// layer's composite opacity each frame (composite-only — the layer's
-    /// cached texture is reused, no re-raster). Declarative analog of
-    /// [`crate::app::App::bind_layer_opacity`]; the app collects these
+    /// cached texture is reused, no re-raster). The app collects these
     /// during flush so it survives scene rebuilds without app access from
     /// the scene closure. Only meaningful with `layer = true`.
     pub layer_opacity: Option<crate::signal::Signal<f32>>,
+    /// **External-texture layer** (P6): this node owns no instances; its
+    /// pixels come from a caller-supplied `wgpu::Texture` registered with
+    /// [`crate::app::App::set_external_texture`] (keyed by this node's id).
+    /// Flatten emits a zero-instance external span at this node's layout
+    /// rect; the compositor blits the texture there (composite-only, no
+    /// raster). For video / Spotify Canvas. The node's own shape (if any)
+    /// still draws normally underneath as a placeholder.
+    pub external: bool,
+    /// Image nodes: scale the texture to **cover** the rect (preserve
+    /// aspect, crop) instead of stretching. See [`ImageRef::cover`].
+    pub image_cover: bool,
+    /// Composite-time **edge fade** for a promoted layer (`.layer()`,
+    /// scroll, or `.external()`): fade the layer's alpha to 0 over the
+    /// `[top, right, bottom, left]` fraction (0..1 of the rect extent on
+    /// that axis) nearest each edge, so content dissolves into its
+    /// background instead of ending on a hard edge. All 0 = no fade.
+    pub edge_fade: [f32; 4],
+    /// Falloff exponent applied to each edge ramp (1 = linear, >1 stays
+    /// opaque longer then drops off, <1 drops fast then tapers). 0 → 1.
+    pub edge_fade_falloff: f32,
     pub children: Vec<NodeId>,
     pub interact: NodeInteract,
     pub text: Option<NodeText>,
@@ -675,6 +733,10 @@ pub struct Node {
     /// `.hover_color(...)` or `.press_color(...)`; the actual bind slot
     /// lives in `BindRegistry.color` like any other reactive color.
     pub interact_colors: Option<InteractColors>,
+    /// The bind passed to this node's last `.color(...)` call, remembered
+    /// so interaction-colour sugar can use it as a live (reactive) base
+    /// regardless of call order. `None` until `.color(...)` runs.
+    pub color_bind: Option<crate::reactive::Bind<[f32; 4]>>,
     /// Editable-text state. Present on nodes spawned via
     /// `Scene::text_field`. Boxed so a `Node` without an editor stays
     /// pointer-sized for the field.
@@ -759,6 +821,10 @@ impl Node {
                 blur_source: false,
                 layer: false,
                 layer_opacity: None,
+                external: false,
+                image_cover: false,
+                edge_fade: [0.0; 4],
+                edge_fade_falloff: 1.0,
                 children: Vec::new(),
                 interact: NodeInteract::default(),
                 text: None,
@@ -768,6 +834,7 @@ impl Node {
                 on_right_click: None,
                 on_hover_dwell: None,
                 interact_colors: None,
+                color_bind: None,
                 editor: None,
                 lazy_list: None,
                 dismiss_transparent: false,
@@ -1089,6 +1156,43 @@ impl NodeBuilder {
         self.node.layer = true;
         self.node.layer_opacity = Some(signal);
         self
+    }
+    /// Mark this node as an **external-texture layer** (P6) — its pixels
+    /// come from a texture registered via
+    /// [`crate::app::App::set_external_texture`] keyed by this node's id.
+    /// See [`Node::external`].
+    pub fn external(mut self) -> Self {
+        self.node.external = true;
+        self
+    }
+    /// Image nodes: scale the texture to **cover** the rect (preserve
+    /// aspect, crop overflow) instead of stretching. See [`Node::image_cover`].
+    pub fn image_cover(mut self) -> Self {
+        self.node.image_cover = true;
+        self
+    }
+    /// Set the composite-time **edge fade** per side: `[top, right,
+    /// bottom, left]` fractions (0..1) of the rect over which the layer's
+    /// alpha fades to 0. Applies to any promoted layer. See
+    /// [`Node::edge_fade`].
+    pub fn fade_edges(mut self, top: f32, right: f32, bottom: f32, left: f32) -> Self {
+        self.node.edge_fade = [
+            top.clamp(0.0, 1.0),
+            right.clamp(0.0, 1.0),
+            bottom.clamp(0.0, 1.0),
+            left.clamp(0.0, 1.0),
+        ];
+        self
+    }
+    /// Falloff exponent for the edge fade (1 = linear). See
+    /// [`Node::edge_fade_falloff`].
+    pub fn fade_falloff(mut self, exp: f32) -> Self {
+        self.node.edge_fade_falloff = exp.max(0.0);
+        self
+    }
+    /// Convenience: fade only the bottom edge over `frac` of the rect.
+    pub fn fade_bottom(self, frac: f32) -> Self {
+        self.fade_edges(0.0, 0.0, frac, 0.0)
     }
     pub fn kind(mut self, kind: ShapeKind) -> Self {
         self.node.style.kind = kind;
@@ -2502,6 +2606,7 @@ impl NodeTree {
                 *root,
                 1.0,
                 NO_CLIP,
+                0.0,
                 [0.0; 2],
                 NO_CLIP,
                 [0.0; 2],
@@ -2531,6 +2636,7 @@ impl NodeTree {
                 node,
                 1.0,
                 NO_CLIP,
+                0.0,
                 [-dx, -dy],
                 NO_CLIP,
                 [-dx, -dy],
@@ -2560,6 +2666,10 @@ impl NodeTree {
         id: NodeId,
         parent_opacity: f32,
         clip: [f32; 4],
+        // Corner radius (physical px) of the rounded `clip` rect — set when
+        // an ancestor overflow container has a corner radius, so children
+        // clip to its rounded shape (not a square scissor). 0 = square clip.
+        clip_radius: f32,
         offset: [f32; 2],
         // Hit-space clip + offset, used for `HitEntry`/`ScrollHit` bounds
         // (input lives in screen space). Equal to `clip`/`offset`
@@ -2615,10 +2725,22 @@ impl NodeTree {
         let opacity = parent_opacity * node.style.opacity;
         match node.style.kind {
             ShapeKind::Rect | ShapeKind::Glass => {
+                let is_glass = matches!(node.style.kind, ShapeKind::Glass);
+                // Skip emitting a fully-transparent plain rect (no fill, no
+                // border, no shadow, or fully faded out): it renders nothing,
+                // so its instance — and any compositor layer / root segment
+                // it would otherwise anchor — is pure waste (e.g. a layout
+                // container or a covered backdrop base). Glass always emits
+                // (it samples the backdrop even with a transparent tint).
+                let st = &node.style;
+                let no_fill = st.color[3] <= 0.0;
+                let no_border = st.border_width <= 0.0 || st.border_color[3] <= 0.0;
+                let no_shadow = st.shadow_opacity <= 0.0 || st.shadow_color[3] <= 0.0;
+                let invisible = !is_glass && (opacity <= 0.0 || (no_fill && no_border && no_shadow));
                 // For glass, repurpose backdrop_uv_rect.xy to carry bevel
                 // params (the field is ignored by the glass branch's UV
                 // sampling since glass uses screen-space UVs).
-                let extras = if matches!(node.style.kind, ShapeKind::Glass) {
+                let extras = if is_glass {
                     [
                         node.style.blur_amount,
                         node.style.refraction,
@@ -2628,6 +2750,9 @@ impl NodeTree {
                 } else {
                     [0.0; 4]
                 };
+                if invisible {
+                    // no-op: nothing to paint
+                } else {
                 events.push(FlatEvent::Shape(ShapeInstance {
                     color: node.style.color,
                     border_color: node.style.border_color,
@@ -2646,8 +2771,10 @@ impl NodeTree {
                     shadow_opacity: node.style.shadow_opacity,
                     opacity,
                     scale: node.style.scale,
-                    _pad1: [0.0, 0.0],
+                    clip_radius,
+                    _pad1: 0.0,
                 }));
+                }
             }
             ShapeKind::Text => {
                 if let Some(t) = node.text.as_ref() {
@@ -2673,6 +2800,8 @@ impl NodeTree {
                         border_radius: node.style.border_radius,
                         handle,
                         clip_rect: clip,
+                        cover: node.image_cover,
+                        clip_radius,
                     }));
                 }
             }
@@ -2799,11 +2928,24 @@ impl NodeTree {
         } else {
             hit_offset
         };
+        // Corner radius of the clip rect handed to children: when *this*
+        // node clips its overflow AND has a corner radius, children clip to
+        // its rounded rect (using the node's own radius). Scroll layers clip
+        // at composite time (children unclipped here), so they reset it.
+        // Otherwise inherit the ancestor clip radius unchanged.
+        let child_clip_radius = if is_scroll_layer {
+            0.0
+        } else if node.layout.clips() && node.style.border_radius[0] > 0.0 {
+            node.style.border_radius[0]
+        } else {
+            clip_radius
+        };
         for &child in &node.children {
             self.flatten_into(
                 child,
                 opacity,
                 child_clip,
+                child_clip_radius,
                 child_offset,
                 child_hit_clip,
                 child_hit_offset,
@@ -2881,6 +3023,9 @@ impl NodeTree {
                         tex_origin,
                         scroll: s.current,
                     }),
+                    external: None,
+                    edge_fade: node.edge_fade,
+                    edge_fade_falloff: node.edge_fade_falloff,
                 });
             }
         } else if promote && events.len() > span_start {
@@ -2888,6 +3033,34 @@ impl NodeTree {
                 node: id,
                 events: span_start..events.len(),
                 scroll: None,
+                external: None,
+                edge_fade: node.edge_fade,
+                edge_fade_falloff: node.edge_fade_falloff,
+            });
+        }
+        // External-texture layer (P6): emit a zero-instance span at this
+        // node's screen rect. `events` is empty at the current paint
+        // cursor (`span_start`) so the app slots it at the right z without
+        // consuming instances; the node's own shape (drawn above into the
+        // stream) stays as an underneath placeholder. Independent of the
+        // `.layer()` promote path — an `.external()` node need not be
+        // `.layer()`.
+        if node.external {
+            spans.push(LayerSpan {
+                node: id,
+                events: span_start..span_start,
+                scroll: None,
+                external: Some(crate::layer::ExternalRect {
+                    origin: abs,
+                    size,
+                    // Clip the video to its ancestor overflow rect (it's a
+                    // separate composite layer, so the parent's clip isn't
+                    // applied for free), rounded by the node's own radius.
+                    clip,
+                    radius: node.style.border_radius[0] * scale,
+                }),
+                edge_fade: node.edge_fade,
+                edge_fade_falloff: node.edge_fade_falloff,
             });
         }
     }
@@ -3034,7 +3207,8 @@ fn bar_quad(
         shadow_opacity: 0.0,
         opacity: 1.0,
         scale: [1.0, 1.0],
-        _pad1: [0.0, 0.0],
+        clip_radius: 0.0,
+        _pad1: 0.0,
     }));
 }
 
@@ -3092,7 +3266,8 @@ fn emit_scroll_thumb(
         shadow_opacity: 0.0,
         opacity: 1.0,
         scale: [1.0, 1.0],
-        _pad1: [0.0, 0.0],
+        clip_radius: 0.0,
+        _pad1: 0.0,
     }));
     spans.push(LayerSpan {
         node: node_id,
@@ -3104,6 +3279,9 @@ fn emit_scroll_thumb(
             tex_origin: [0.0, 0.0],
             scroll: [0.0, 0.0],
         }),
+        external: None,
+        edge_fade: [0.0; 4],
+        edge_fade_falloff: 1.0,
     });
 }
 
@@ -3329,6 +3507,9 @@ mod tests {
         let mut t = NodeTree::new();
         let a = t.add_root(Node::rect().build());
         let b = t.add_root(Node::rect().build());
+        // Opaque so the transparency skip keeps the instances.
+        t.get_mut_raw(a).unwrap().style.color = [1.0; 4];
+        t.get_mut_raw(b).unwrap().style.color = [1.0; 4];
         t.get_mut_raw(a).unwrap().rect = [0.0, 0.0, 10.0, 10.0];
         t.get_mut_raw(b).unwrap().rect = [0.0, 20.0, 10.0, 10.0];
         // Without follow: painter order is A then B.
@@ -3345,6 +3526,9 @@ mod tests {
         let mut t = NodeTree::new();
         let parent = t.add_root(Node::rect().build());
         let child = t.add_child(parent, Node::rect().build());
+        // Opaque so the transparency skip keeps the instances.
+        t.get_mut_raw(parent).unwrap().style.color = [1.0; 4];
+        t.get_mut_raw(child).unwrap().style.color = [1.0; 4];
         t.get_mut_raw(parent).unwrap().rect = [10.0, 10.0, 40.0, 40.0];
         t.get_mut_raw(child).unwrap().rect = [15.0, 15.0, 10.0, 10.0];
         t.set_drag_follow(Some((parent, [100.0, 0.0])));

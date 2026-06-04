@@ -359,6 +359,10 @@ pub struct App {
     /// Shares the `wake` handle so an enqueue from a worker thread also
     /// wakes the parked event loop.
     uploader: Arc<crate::uploader::Uploader>,
+    /// Cross-thread external-frame (video) submission queue. Drained on
+    /// `about_to_wait`. Shares the `wake` handle so a decoder thread's
+    /// frame submission also wakes the parked event loop.
+    frame_sink: Arc<crate::frame_sink::FrameSink>,
     // Lazy:
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
@@ -468,7 +472,8 @@ impl App {
             rebuild_request: std::rc::Rc::new(std::cell::Cell::new(false)),
             dwell: None,
             wake: wake.clone(),
-            uploader: crate::uploader::Uploader::new(wake),
+            uploader: crate::uploader::Uploader::new(wake.clone()),
+            frame_sink: crate::frame_sink::FrameSink::new(wake),
             window: None,
             gpu: None,
             #[cfg(feature = "automation")]
@@ -508,6 +513,16 @@ impl App {
     /// [`crate::Uploader`] for the threading model.
     pub fn uploader(&self) -> Arc<crate::uploader::Uploader> {
         self.uploader.clone()
+    }
+
+    /// Get a clone of the cross-thread external-frame (video) submission
+    /// token. Pass to a decoder thread that produces frames for an
+    /// [`.external()`](crate::node::NodeBuilder::external) node; each
+    /// [`FrameSink::submit`](crate::frame_sink::FrameSink::submit) ships a
+    /// frame onto that node's external texture (latest-wins). See
+    /// [`crate::FrameSink`] for the threading model.
+    pub fn frame_sink(&self) -> Arc<crate::frame_sink::FrameSink> {
+        self.frame_sink.clone()
     }
 
     /// Stage a PNG byte slice for upload to the image atlas. Returns
@@ -881,6 +896,48 @@ impl App {
         }
     }
 
+    /// Register/replace the **external texture** for an `.external()` node
+    /// (P6) — its layer composites this view (a video / Spotify Canvas
+    /// decoder frame) instead of a rastered texture. Call each time the
+    /// decoder produces a new frame, then `request_redraw` (or the next
+    /// awake frame) recomposites. No-op until the GPU is initialised.
+    pub fn set_external_texture(
+        &mut self,
+        node: crate::node::NodeId,
+        view: wgpu::TextureView,
+    ) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_external_texture(node, view);
+            self.request_redraw();
+        }
+    }
+
+    /// Upload a decoder frame (tightly-packed `width * height * 4` RGBA8,
+    /// sRGB-encoded) as `node`'s external texture and recomposite. The
+    /// engine owns + reuses the backing texture across frames, so calling
+    /// this every video tick is cheap. Prefer this over building a
+    /// `wgpu::Texture` yourself + [`Self::set_external_texture`] unless you
+    /// already have a GPU texture in hand. No-op until the GPU is up.
+    pub fn set_external_frame(
+        &mut self,
+        node: crate::node::NodeId,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.upload_external_frame(node, rgba, width, height);
+            self.request_redraw();
+        }
+    }
+
+    /// Drop a node's external texture. See [`Self::set_external_texture`].
+    pub fn clear_external_texture(&mut self, node: crate::node::NodeId) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.clear_external_texture(node);
+        }
+    }
+
     /// Set a promoted subtree's composite scale. Composite-only — see
     /// [`Self::set_layer_offset`].
     pub fn set_layer_scale(&mut self, node: crate::node::NodeId, scale: [f32; 2]) {
@@ -973,6 +1030,34 @@ impl App {
             let handle = self.upload_image_rgba(p.w, p.h, &p.bytes);
             (p.cb)(handle);
         }
+    }
+
+    /// Drain queued external (video) frames, uploading each onto its
+    /// node's external texture. Latest-wins per node — see
+    /// [`crate::FrameSink`]. Triggers a recomposite when any frame lands.
+    /// Drain queued external (video) frames onto their nodes' textures.
+    /// Returns `true` if anything was drained — the caller renders directly
+    /// rather than via `request_redraw`, because a redraw requested while
+    /// the loop is about to park on `Wait` isn't reliably honoured (the
+    /// video would freeze the moment no timeline keeps the loop awake).
+    /// Uploads straight to the GPU here (no per-frame `request_redraw`).
+    fn drain_external_frames(&mut self) -> bool {
+        let pending = self.frame_sink.drain();
+        if pending.is_empty() {
+            return false;
+        }
+        let Some(gpu) = self.gpu.as_mut() else {
+            return false;
+        };
+        for (node, msg) in pending {
+            match msg {
+                crate::frame_sink::FrameMsg::Frame(f) => {
+                    gpu.upload_external_frame(node, &f.rgba, f.width, f.height);
+                }
+                crate::frame_sink::FrameMsg::Clear => gpu.clear_external_texture(node),
+            }
+        }
+        true
     }
 
     /// Runtime image upload (post-GPU-init). Unlike [`stage_image_*`]
@@ -2113,6 +2198,22 @@ fn layer_to_draw(l: &crate::layer::Layer) -> crate::gpu::LayerDraw {
             s.viewport_origin[1] + s.viewport[1],
         ],
     });
+    // External-texture layer: composite the caller's texture into the
+    // node's screen rect (a full 1:1 blit, no clip). `window` carries the
+    // rect; `external` carries the registry key (`root` node).
+    let (window, external, corner_radius) = match l.external {
+        Some(ext) => {
+            let w = crate::gpu::ScrollWindow {
+                dst_origin: ext.origin,
+                dst_size: ext.size,
+                src_origin: [0.0, 0.0],
+                tex_size: ext.size,
+                clip_rect: ext.clip,
+            };
+            (Some(w), l.root, ext.radius)
+        }
+        None => (window, None, 0.0),
+    };
     crate::gpu::LayerDraw {
         instances: (l.instances.start as u32)..(l.instances.end as u32),
         offset: l.offset,
@@ -2120,6 +2221,10 @@ fn layer_to_draw(l: &crate::layer::Layer) -> crate::gpu::LayerDraw {
         opacity: l.opacity,
         z: l.z,
         window,
+        external,
+        corner_radius,
+        edge_fade: l.edge_fade,
+        edge_fade_falloff: if l.edge_fade_falloff > 0.0 { l.edge_fade_falloff } else { 1.0 },
     }
 }
 
@@ -2134,11 +2239,28 @@ fn spans_to_instance_ranges(
         .iter()
         .filter_map(|s| {
             let start = *event_inst_start.get(s.events.start)?;
+            // External layers own no instances: a zero-width range at the
+            // paint cursor `start` fixes their z without consuming the
+            // stream. (`events` is empty, so the `end > start` guard below
+            // would otherwise drop them.)
+            if let Some(ext) = s.external {
+                return Some(crate::layer::PromotedRange {
+                    node: s.node,
+                    instances: start..start,
+                    scroll: None,
+                    external: Some(ext),
+                    edge_fade: s.edge_fade,
+                    edge_fade_falloff: s.edge_fade_falloff,
+                });
+            }
             let end = *event_inst_start.get(s.events.end)?;
             (end > start).then_some(crate::layer::PromotedRange {
                 node: s.node,
                 instances: start..end,
                 scroll: s.scroll,
+                external: None,
+                edge_fade: s.edge_fade,
+                edge_fade_falloff: s.edge_fade_falloff,
             })
         })
         .collect();
@@ -2244,7 +2366,6 @@ fn process_color_binds(
             log::debug!("[binds] color slot {idx}: animated tween started target={target:?}");
         } else {
             tree.set_color(slot.node_id, target);
-            log::debug!("[binds] color slot {idx}: snap target={target:?}");
         }
     }
 }
@@ -3456,6 +3577,13 @@ impl ApplicationHandler for App {
         // `wake()` in the same instant resolves the handle before the
         // on-frame hook fires and reads it.
         self.drain_image_uploads();
+        // Drain queued external (video) frames + render them immediately.
+        // Rendering directly (not via request_redraw) is required: the
+        // decode thread's wake lands when the loop is otherwise idle and
+        // about to park on `Wait`, where a requested redraw isn't honoured.
+        if self.drain_external_frames() {
+            self.render_once();
+        }
         let now = Instant::now();
         // External wake (worker delivered a response on a channel the
         // `on_frame` hook drains, etc.). Fire `on_frame` even when no

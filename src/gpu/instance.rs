@@ -82,8 +82,13 @@ pub struct ShapeInstance {
     /// shader rescales SDF coords so border + radius scale together.
     /// Layout + hit-test are unaffected (style-level transform only).
     pub scale: [f32; 2],
+    /// Corner radius (physical px) of the [`Self::clip_rect`] — when an
+    /// overflow container with a corner radius clips this instance, the
+    /// fragment shader rounds the scissor by this radius (rounded overflow
+    /// clipping). 0 = square clip. Set by the flatten pass.
+    pub clip_radius: f32,
     /// Padding to align Rust `size_of` with WGSL array stride (160).
-    pub _pad1: [f32; 2],
+    pub _pad1: f32,
 }
 
 #[cfg(test)]
@@ -146,7 +151,8 @@ impl Default for ShapeInstance {
             shadow_opacity: 0.0,
             opacity: 1.0,
             scale: [1.0, 1.0],
-            _pad1: [0.0, 0.0],
+            clip_radius: 0.0,
+            _pad1: 0.0,
         }
     }
 }

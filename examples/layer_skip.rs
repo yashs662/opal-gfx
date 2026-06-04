@@ -57,6 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         opacity: l.opacity,
                         z: l.z,
                         window: None,
+                        external: None,
+                        corner_radius: 0.0,
+                        edge_fade: [0.0; 4],
+                        edge_fade_falloff: 1.0,
                     })
                     .collect();
                 h.gpu.set_layers(&draws);

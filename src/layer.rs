@@ -95,6 +95,32 @@ pub struct Layer {
     /// of it at the scroll offset, clipped to the viewport. `None` →
     /// full-surface identity / composite-move layer (offset/scale/opacity).
     pub window: Option<ScrollSpan>,
+    /// `Some` → this is an **external-texture layer** (P6): it owns no
+    /// instances; its pixels come from a caller-supplied `wgpu::Texture`
+    /// (a video/Canvas decoder's output, keyed by `root` node in the GPU
+    /// external registry). The raster pass skips it; the composite pass
+    /// blits the external texture into this screen rect. `instances` is
+    /// zero-width (it only fixes the layer's paint-order z).
+    pub external: Option<ExternalRect>,
+    /// Composite-time edge fade `[top, right, bottom, left]` (0..1) + a
+    /// falloff exponent. All-0 = no fade.
+    pub edge_fade: [f32; 4],
+    pub edge_fade_falloff: f32,
+}
+
+/// Screen placement (physical px) of an external-texture layer's
+/// composite quad: top-left `origin` + `size`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExternalRect {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    /// Ancestor clip rect (physical px) the composite scissors to — an
+    /// `.external()` node otherwise ignores ancestor `overflow` clipping
+    /// (it's a separate composite layer, not rastered into the parent).
+    pub clip: [f32; 4],
+    /// Corner radius (physical px) to round the clipped region by, so the
+    /// video honours a rounded-rect container. 0 = square.
+    pub radius: f32,
 }
 
 /// Persistent composite state for one promoted layer, keyed by its
@@ -131,6 +157,9 @@ fn root_segment(instances: std::ops::Range<usize>, viewport: [u32; 2], z: i32, e
         content_epoch: epoch,
         size_px: viewport,
         window: None,
+        external: None,
+        edge_fade: [0.0; 4],
+        edge_fade_falloff: 1.0,
     }
 }
 
@@ -143,6 +172,13 @@ pub struct PromotedRange {
     pub node: NodeId,
     pub instances: Range<u32>,
     pub scroll: Option<ScrollSpan>,
+    /// `Some` → external-texture layer (P6): zero-width `instances` (the
+    /// node's paint cursor, for z), pixels from the GPU external registry.
+    pub external: Option<ExternalRect>,
+    /// Composite-time edge fade `[top, right, bottom, left]` (0..1) + a
+    /// falloff exponent.
+    pub edge_fade: [f32; 4],
+    pub edge_fade_falloff: f32,
 }
 
 /// Layer tree built beside the node tree. With **no** `.layer()`
@@ -282,11 +318,13 @@ impl LayerTree {
                 z += 1;
             }
             let st = *self.state.entry(p.node).or_default();
-            // A scroll layer's texture is content-sized (viewport-wide ×
-            // content-tall); a plain promotion is viewport-sized.
-            let size_px = match p.scroll {
-                Some(s) => [s.content[0].ceil() as u32, s.content[1].ceil() as u32],
-                None => viewport,
+            // Texture size: scroll layer = content-sized (viewport-wide ×
+            // content-tall); external layer = its screen rect (the caller's
+            // texture is that size); plain promotion = viewport-sized.
+            let size_px = match (p.scroll, p.external) {
+                (Some(s), _) => [s.content[0].ceil() as u32, s.content[1].ceil() as u32],
+                (_, Some(e)) => [e.size[0].ceil() as u32, e.size[1].ceil() as u32],
+                _ => viewport,
             };
             self.layers.push(Layer {
                 root: Some(p.node),
@@ -298,8 +336,13 @@ impl LayerTree {
                 content_epoch: st.content_epoch,
                 size_px,
                 window: p.scroll,
+                external: p.external,
+                edge_fade: p.edge_fade,
+                edge_fade_falloff: p.edge_fade_falloff,
             });
             z += 1;
+            // External layers are zero-width — `cursor` stays put so the
+            // surrounding root segments still cover the full stream.
             cursor = r.end;
         }
         // Trailing root segment (also the sole layer when no promotions).
@@ -349,7 +392,14 @@ mod tests {
     /// One plain (non-scroll) promoted range — the shape `rebuild`
     /// tests use.
     fn pr(node: NodeId, instances: Range<u32>) -> Vec<PromotedRange> {
-        vec![PromotedRange { node, instances, scroll: None }]
+        vec![PromotedRange {
+            node,
+            instances,
+            scroll: None,
+            external: None,
+            edge_fade: [0.0; 4],
+            edge_fade_falloff: 1.0,
+        }]
     }
 
     fn node(i: u32) -> NodeId {

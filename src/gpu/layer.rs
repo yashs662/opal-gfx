@@ -34,10 +34,10 @@ use std::ops::Range;
 
 use super::instance::{FrameUniform, NO_CLIP};
 
-/// Per-layer composite parameters uploaded to `composite.wgsl`. 80 B,
+/// Per-layer composite parameters uploaded to `composite.wgsl`. 96 B,
 /// 16-aligned (the six leading `vec2`s fill 0..48 so the `vec4`
-/// `clip_rect` lands on its 16-byte boundary; the trailing f32 pads
-/// close the stride). Assert in tests.
+/// `clip_rect` lands on its 16-byte boundary; a 16-byte scalar row, then
+/// the trailing `vec4` `edge_fade`). Assert in tests.
 ///
 /// The quad covers screen rect `dst_origin .. dst_origin + dst_size`
 /// and samples the texture window `src_origin .. src_origin + src_extent`
@@ -57,7 +57,15 @@ struct CompositeUniform {
     surface_size: [f32; 2],
     clip_rect: [f32; 4],
     opacity: f32,
-    _pad: [f32; 3],
+    /// Rounds the clip rect's corners (physical px) — external video
+    /// layers honouring a rounded container. 0 = square (every other layer).
+    corner_radius: f32,
+    /// Edge-fade falloff exponent (1 = linear).
+    edge_fade_falloff: f32,
+    _pad: f32,
+    /// Per-edge fade fractions `[top, right, bottom, left]` (0..1 of the
+    /// dst rect extent). Fade alpha to 0 near each edge. All-0 = no fade.
+    edge_fade: [f32; 4],
 }
 
 /// Composite-time window for a **scroll layer**: place the quad at a
@@ -102,6 +110,22 @@ pub struct LayerDraw {
     /// `None` → full-surface identity using `offset`/`scale` (parity
     /// path), rastered in absolute screen coords via the global shape BG.
     pub window: Option<ScrollWindow>,
+    /// `Some(node)` → **external-texture layer** (P6): no raster; the
+    /// composite samples the caller's texture registered under `node`
+    /// (via `GpuContext::set_external_texture`) instead of this slot's own
+    /// raster texture. The composite quad still uses `window` for its
+    /// screen rect. `None` for every normal layer.
+    pub external: Option<crate::node::NodeId>,
+    /// Corner radius (physical px) the composite rounds the clipped region
+    /// by — lets an external (video) layer honour a rounded container. 0 =
+    /// square. Only consulted for external layers.
+    pub corner_radius: f32,
+    /// Composite-time edge fade `[top, right, bottom, left]` (0..1 of the
+    /// rect extent on each axis) — fade alpha to 0 near those edges. Any
+    /// promoted layer. All-0 = no fade.
+    pub edge_fade: [f32; 4],
+    /// Falloff exponent for the edge fade (1 = linear).
+    pub edge_fade_falloff: f32,
 }
 
 impl Default for LayerDraw {
@@ -113,6 +137,10 @@ impl Default for LayerDraw {
             opacity: 1.0,
             z: 0,
             window: None,
+            external: None,
+            corner_radius: 0.0,
+            edge_fade: [0.0; 4],
+            edge_fade_falloff: 1.0,
         }
     }
 }
@@ -467,7 +495,10 @@ impl LayerResources {
                 surface_size,
                 clip_rect: w.clip_rect,
                 opacity: draw.opacity,
-                _pad: [0.0; 3],
+                corner_radius: draw.corner_radius,
+                edge_fade_falloff: draw.edge_fade_falloff,
+                _pad: 0.0,
+                edge_fade: draw.edge_fade,
             },
             // Full-surface identity (P2/P3 parity): quad = offset +
             // corner*surface*scale, uv = corner (whole texture). The
@@ -481,7 +512,10 @@ impl LayerResources {
                 surface_size,
                 clip_rect: NO_CLIP,
                 opacity: draw.opacity,
-                _pad: [0.0; 3],
+                corner_radius: 0.0,
+                edge_fade_falloff: draw.edge_fade_falloff,
+                _pad: 0.0,
+                edge_fade: draw.edge_fade,
             },
         };
         queue.write_buffer(&self.textures[i].uniform, 0, bytemuck::bytes_of(&u));
@@ -517,6 +551,38 @@ impl LayerResources {
     /// Composite bind group for layer `i` (sampled in the composite pass).
     pub fn bind_group(&self, i: usize) -> &wgpu::BindGroup {
         &self.textures[i].bind_group
+    }
+
+    /// Build an ad-hoc composite bind group pairing slot `i`'s composite
+    /// uniform (this frame's offset/window) with an **external** texture
+    /// view + the composite sampler. P6: an external-texture layer
+    /// composites the caller's view (a video frame) through the slot's
+    /// uniform, instead of the slot's own raster texture. Built per-frame
+    /// (the external view changes as the decoder swaps frames).
+    pub fn external_bind_group(
+        &self,
+        device: &wgpu::Device,
+        i: usize,
+        external_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frostify.composite bg (external)"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.textures[i].uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(external_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        })
     }
 
     pub fn pipeline(&self) -> &wgpu::RenderPipeline {
@@ -568,11 +634,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn composite_uniform_is_80_bytes() {
+    fn composite_uniform_is_96_bytes() {
         // WGSL `Composite` struct must equal the Rust size (M2-style
         // stride landmine). Six leading vec2 (0..48) + vec4 clip_rect
-        // (48..64) + opacity + 3 f32 pad = 80 B, 16-aligned.
-        assert_eq!(std::mem::size_of::<CompositeUniform>(), 80);
+        // (48..64) + (opacity, corner_radius, edge_fade_falloff, pad)
+        // (64..80) + vec4 edge_fade (80..96) = 96 B, 16-aligned.
+        assert_eq!(std::mem::size_of::<CompositeUniform>(), 96);
     }
 
     #[test]

@@ -50,7 +50,20 @@ struct ShapeInstance {
     /// purely a vertex/fragment-side transform), so hover-grow effects
     /// don't shift click boxes.
     scale: vec2<f32>,
-    _pad1: vec2<f32>,
+    /// Corner radius (px) of the clip rect — rounds the scissor (rounded
+    /// overflow clipping). 0 = square clip.
+    clip_radius: f32,
+    _pad1: f32,
+}
+
+// Signed distance to a rounded rect with min `lo`, max `hi`, corner
+// radius `r`. <0 inside, >0 outside. Used for rounded scissor clipping.
+fn rounded_clip_sd(p: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>, r: f32) -> f32 {
+    let center = (lo + hi) * 0.5;
+    let half = (hi - lo) * 0.5;
+    let rr = min(r, min(half.x, half.y));
+    let q = abs(p - center) - (half - vec2<f32>(rr));
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - rr;
 }
 
 struct Frame {
@@ -292,7 +305,11 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
         discard;
     }
     let px = in.world_pos;
-    if (px.x < inst.clip_rect.x || px.y < inst.clip_rect.y ||
+    if (inst.clip_radius > 0.0) {
+        if (rounded_clip_sd(px, inst.clip_rect.xy, inst.clip_rect.zw, inst.clip_radius) > 0.5) {
+            discard;
+        }
+    } else if (px.x < inst.clip_rect.x || px.y < inst.clip_rect.y ||
         px.x > inst.clip_rect.z || px.y > inst.clip_rect.w) {
         discard;
     }
@@ -368,7 +385,15 @@ fn window_corner_coverage(px: vec2<f32>) -> f32 {
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let inst = instances[in.inst_idx];
     let px = in.world_pos;
-    if (px.x < inst.clip_rect.x || px.y < inst.clip_rect.y ||
+    // Scissor clip — rounded (overflow container with a radius) or square.
+    var clip_cov = 1.0;
+    if (inst.clip_radius > 0.0) {
+        let sd = rounded_clip_sd(px, inst.clip_rect.xy, inst.clip_rect.zw, inst.clip_radius);
+        if (sd > 0.5) {
+            discard;
+        }
+        clip_cov = clamp(0.5 - sd, 0.0, 1.0); // 1px feather
+    } else if (px.x < inst.clip_rect.x || px.y < inst.clip_rect.y ||
         px.x > inst.clip_rect.z || px.y > inst.clip_rect.w) {
         discard;
     }
@@ -376,8 +401,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // multiplies its final output by `win_cov` so glyphs, images, and
     // glass all respect the rounded boundary — the original
     // implementation only clipped the generic rect path, which left
-    // the album-art image visible in the corners.
-    let win_cov = window_corner_coverage(px);
+    // the album-art image visible in the corners. Fold the rounded-clip
+    // coverage in here so it rides the same multiply for free.
+    let win_cov = window_corner_coverage(px) * clip_cov;
 
     if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLYPH) {
         // `backdrop_uv_rect` = (u0, v0, w, h) into the R8 glyph atlas.

@@ -41,6 +41,16 @@ pub struct GpuContext {
     /// `LayerTree`). Single root layer today → one entry covering the
     /// whole instance stream at identity transform.
     layer_draws: Vec<super::layer::LayerDraw>,
+    /// External-texture registry (P6): caller-owned textures (video /
+    /// Canvas decoder output) keyed by the `.external()` node id. The
+    /// composite pass samples these for external layers instead of the
+    /// slot's own raster texture. We keep the view (composite sampling)
+    /// alongside the texture (keeps it alive).
+    external_textures: std::collections::HashMap<crate::node::NodeId, wgpu::TextureView>,
+    /// Engine-owned frame textures backing [`Self::upload_external_frame`].
+    /// Reused across frames (re-created only when the frame size changes)
+    /// so a 30fps video doesn't re-allocate a texture every frame.
+    external_owned: std::collections::HashMap<crate::node::NodeId, wgpu::Texture>,
     pub glyph_atlas: GlyphAtlas,
     pub image_atlas: ImageAtlas,
     overdraw_mode: bool,
@@ -256,6 +266,8 @@ impl GpuContext {
             overdraw,
             layers,
             layer_draws: Vec::new(),
+            external_textures: std::collections::HashMap::new(),
+            external_owned: std::collections::HashMap::new(),
             glyph_atlas,
             image_atlas,
             overdraw_mode: false,
@@ -318,6 +330,80 @@ impl GpuContext {
     /// `encode_frame` rasters each layer's instance sub-range into its
     /// texture, then composites them to the surface in z-order. An empty
     /// list falls back to a single root layer spanning every instance.
+    /// Register (or replace) the external texture for an `.external()`
+    /// node (P6). The composite pass samples it for that node's layer
+    /// instead of a rastered slot texture. Pass a `TextureView` over the
+    /// caller's decoder output; call again each frame the video advances
+    /// (and request a redraw to recomposite). Unregistered external nodes
+    /// composite empty until set.
+    pub fn set_external_texture(&mut self, node: crate::node::NodeId, view: wgpu::TextureView) {
+        self.external_textures.insert(node, view);
+    }
+
+    /// Drop a node's external texture (e.g. video stopped / node gone).
+    pub fn clear_external_texture(&mut self, node: crate::node::NodeId) {
+        self.external_textures.remove(&node);
+        self.external_owned.remove(&node);
+    }
+
+    /// Upload tightly-packed `width * height * 4` RGBA8 pixels (a decoder
+    /// frame) as `node`'s external texture, then register its view. The
+    /// backing texture is engine-owned and reused across calls — only
+    /// re-created when `width`/`height` change — so a video that pushes a
+    /// new frame each tick doesn't churn allocations. Bytes are treated as
+    /// sRGB-encoded (the texture is `Rgba8UnormSrgb`), matching the surface
+    /// so no channel swizzle or colour-space fixup is needed. The caller
+    /// still requests a redraw to recomposite.
+    pub fn upload_external_frame(
+        &mut self,
+        node: crate::node::NodeId,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        debug_assert_eq!(rgba.len(), (width * height * 4) as usize);
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        // Reuse the existing texture unless the frame size changed.
+        let tex = match self.external_owned.get(&node) {
+            Some(t) if t.width() == width && t.height() == height => t,
+            _ => {
+                let t = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("external frame"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                self.external_owned.insert(node, t);
+                self.external_owned.get(&node).unwrap()
+            }
+        };
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        self.external_textures.insert(node, view);
+    }
+
     pub fn set_layers(&mut self, draws: &[super::layer::LayerDraw]) {
         // Generic glass (P4) sources its backdrop from the composite of the
         // layers *below* it. Those layers can change composite-only (a
@@ -569,7 +655,8 @@ impl GpuContext {
                     shadow_opacity: 0.0,
                     opacity: r.opacity,
                     scale: [1.0, 1.0],
-                    _pad1: [0.0, 0.0],
+                    clip_radius: 0.0,
+                    _pad1: 0.0,
                 });
             }
         }
@@ -589,14 +676,34 @@ impl GpuContext {
             let Some(entry) = self.image_atlas.get(r.handle) else {
                 continue;
             };
-            let uv_w = entry.uv[2] - entry.uv[0];
-            let uv_h = entry.uv[3] - entry.uv[1];
+            let (mut u0, mut v0) = (entry.uv[0], entry.uv[1]);
+            let (mut uv_w, mut uv_h) = (entry.uv[2] - entry.uv[0], entry.uv[3] - entry.uv[1]);
+            // Cover fit: crop a centred sub-region of the source whose
+            // aspect matches the node rect, so the image fills without
+            // stretching (overflow is cropped, not squished). Images are
+            // packed at native resolution, so the atlas region's `uv_w/uv_h`
+            // ratio is the source pixel aspect.
+            if r.cover && uv_w > 0.0 && uv_h > 0.0 && r.size[0] > 0.0 && r.size[1] > 0.0 {
+                let img_aspect = uv_w / uv_h;
+                let node_aspect = r.size[0] / r.size[1];
+                if node_aspect > img_aspect {
+                    // Node wider than image → keep full width, crop height.
+                    let nh = uv_h * (img_aspect / node_aspect);
+                    v0 += (uv_h - nh) * 0.5;
+                    uv_h = nh;
+                } else {
+                    // Node taller/narrower → keep full height, crop width.
+                    let nw = uv_w * (node_aspect / img_aspect);
+                    u0 += (uv_w - nw) * 0.5;
+                    uv_w = nw;
+                }
+            }
             out.push(ShapeInstance {
                 color: r.color,
                 border_color: [0.0; 4],
                 shadow_color: [0.0; 4],
                 border_radius: r.border_radius,
-                backdrop_uv_rect: [entry.uv[0], entry.uv[1], uv_w, uv_h],
+                backdrop_uv_rect: [u0, v0, uv_w, uv_h],
                 clip_rect: r.clip_rect,
                 position: r.position,
                 size: r.size,
@@ -608,7 +715,8 @@ impl GpuContext {
                 shadow_opacity: 0.0,
                 opacity: r.opacity,
                 scale: [1.0, 1.0],
-                _pad1: [0.0, 0.0],
+                clip_radius: r.clip_radius,
+                _pad1: 0.0,
             });
         }
         out
@@ -955,6 +1063,25 @@ impl GpuContext {
         // draw the debug overlay (HUD) on top.
         let mut order: Vec<usize> = (0..draws.len()).collect();
         order.sort_by_key(|&i| draws[i].z);
+        // Per-layer composite bind groups. External-texture layers (P6)
+        // get an ad-hoc bg pairing the slot uniform with the caller's view;
+        // every other layer uses its stored slot bg. Built before the pass
+        // so the owned externals outlive `rpass`.
+        let composite_bgs: Vec<CompositeBg> = draws
+            .iter()
+            .enumerate()
+            .map(|(i, d)| match d.external {
+                Some(node) => match self.external_textures.get(&node) {
+                    Some(view) => {
+                        CompositeBg::Owned(self.layers.external_bind_group(&self.device, i, view))
+                    }
+                    // No texture registered yet → composite the (empty)
+                    // slot texture so the layer reads transparent.
+                    None => CompositeBg::Slot(i),
+                },
+                None => CompositeBg::Slot(i),
+            })
+            .collect();
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frostify.composite pass"),
@@ -974,7 +1101,11 @@ impl GpuContext {
             });
             rpass.set_pipeline(self.layers.pipeline());
             for &i in &order {
-                rpass.set_bind_group(0, self.layers.bind_group(i), &[]);
+                let bg = match &composite_bgs[i] {
+                    CompositeBg::Owned(b) => b,
+                    CompositeBg::Slot(s) => self.layers.bind_group(*s),
+                };
+                rpass.set_bind_group(0, bg, &[]);
                 rpass.draw(0..6, 0..1);
                 drawcalls += 1;
             }
@@ -1328,6 +1459,15 @@ impl MemoryReport {
             + self.image_atlas
             + self.image_sources_cpu
     }
+}
+
+/// Per-layer composite bind-group selection for one frame (P6). Most
+/// layers reuse their stored slot bind group (`Slot`); external-texture
+/// layers get a freshly-built one over the caller's view (`Owned`), held
+/// here so it outlives the composite render pass.
+enum CompositeBg {
+    Slot(usize),
+    Owned(wgpu::BindGroup),
 }
 
 fn make_shape_bg(

@@ -71,6 +71,19 @@ impl<T: Copy + PartialEq + 'static> Source for Computed<T> {
     }
 }
 
+// A `Bind` is itself a reactive source, so it can be a `Computed` dep —
+// this lets interaction-colour sugar follow a live base bind (a `Signal`
+// accent, say) instead of snapshotting its value.
+impl<T: Lerp> Source for Bind<T> {
+    type Value = T;
+    fn version(&self) -> u64 {
+        Bind::version(self)
+    }
+    fn read(&self) -> T {
+        Bind::read(self)
+    }
+}
+
 /// Tuple of dependencies passed to `Computed::new`. Implemented for
 /// tuples of arity 1..=8 by the macro below. `versions` returns one
 /// `u64` per dep, in tuple order.
@@ -268,6 +281,29 @@ impl<T: Lerp + std::fmt::Debug> std::fmt::Debug for Bind<T> {
             Bind::Signal(s) => f.debug_tuple("Signal").field(s).finish(),
             Bind::Computed(c) => f.debug_tuple("Computed").field(c).finish(),
             Bind::Animated(a) => f.debug_tuple("Animated").field(a).finish(),
+        }
+    }
+}
+
+// Cheap clone (reactive variants are refcounted) so a base bind can be
+// stashed on the node and handed to interaction-colour sugar.
+impl<T: Lerp> Clone for Bind<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Bind::Value(v) => Bind::Value(*v),
+            Bind::Signal(s) => Bind::Signal(s.clone()),
+            Bind::Computed(c) => Bind::Computed(c.clone()),
+            Bind::Animated(a) => Bind::Animated(a.clone()),
+        }
+    }
+}
+
+impl<T: Lerp> Clone for AnimatedBind<T> {
+    fn clone(&self) -> Self {
+        AnimatedBind {
+            source: self.source.clone(),
+            curve: self.curve,
+            duration: self.duration,
         }
     }
 }

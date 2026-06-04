@@ -1069,6 +1069,52 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
+    /// Mark this node as an **external-texture layer** (P6). See
+    /// [`crate::node::Node::external`].
+    pub fn external(&mut self) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.external = true;
+        }
+        self
+    }
+
+    /// Image nodes: scale the texture to **cover** the rect (preserve
+    /// aspect, crop) instead of stretching. See
+    /// [`crate::node::NodeBuilder::image_cover`].
+    pub fn image_cover(&mut self) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.image_cover = true;
+        }
+        self
+    }
+
+    /// Composite-time **edge fade** per side `[top, right, bottom, left]`
+    /// (0..1). Applies to any promoted layer. See
+    /// [`crate::node::NodeBuilder::fade_edges`].
+    pub fn fade_edges(&mut self, top: f32, right: f32, bottom: f32, left: f32) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.edge_fade = [
+                top.clamp(0.0, 1.0),
+                right.clamp(0.0, 1.0),
+                bottom.clamp(0.0, 1.0),
+                left.clamp(0.0, 1.0),
+            ];
+        }
+        self
+    }
+    /// Falloff exponent for the edge fade (1 = linear). See
+    /// [`crate::node::NodeBuilder::fade_falloff`].
+    pub fn fade_falloff(&mut self, exp: f32) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.edge_fade_falloff = exp.max(0.0);
+        }
+        self
+    }
+    /// Convenience: fade only the bottom edge over `frac` of the rect.
+    pub fn fade_bottom(&mut self, frac: f32) -> &mut Self {
+        self.fade_edges(0.0, 0.0, frac, 0.0)
+    }
+
     // --- overflow / scroll ---
 
     /// Set per-axis overflow. Goes through [`NodeTree::set_layout_overflow`]
@@ -1205,10 +1251,38 @@ impl<'a> NodeBuilderRef<'a> {
     pub fn color(&mut self, color: impl Into<Bind<[f32; 4]>>) -> &mut Self {
         let bind = color.into();
         let initial = bind.read();
-        let initial_version = bind.version();
-        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+        // Remember the colour bind as the node's reactive base and, if
+        // interaction sugar is already wired, refresh its base so it keeps
+        // following the live source (call order no longer matters).
+        let has_sugar = if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
             n.style.color = initial;
+            n.color_bind = Some(bind.clone());
+            if let Some(ic) = n.interact_colors.as_mut() {
+                ic.base = bind.clone();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // With sugar present the colour flows through its `Computed`;
+        // rebuild that against the new base rather than registering a
+        // competing slot (which would race the sugar slot).
+        if has_sugar {
+            self.rebuild_color_sugar();
+        } else {
+            self.register_color_slot(bind);
         }
+        self
+    }
+
+    /// Register a colour bind slot directly (no sugar interaction). Used
+    /// by [`Self::color`] for the plain case and by
+    /// [`Self::rebuild_color_sugar`] to install the sugar `Computed`.
+    fn register_color_slot(&mut self, bind: Bind<[f32; 4]>) {
+        let initial = bind.read();
+        let initial_version = bind.version();
         let is_reactive = !matches!(bind, Bind::Value(_));
         let is_animated = bind.animation().is_some();
         if is_reactive || is_animated {
@@ -1228,7 +1302,6 @@ impl<'a> NodeBuilderRef<'a> {
                 },
             );
         }
-        self
     }
 
     pub fn rgb(&mut self, r: f32, g: f32, b: f32) -> &mut Self {
@@ -1424,7 +1497,7 @@ impl<'a> NodeBuilderRef<'a> {
     /// then layering sugar drops the signal (the sugar can't follow a
     /// live source — build a hand-rolled `Computed` for that case).
     pub fn hover_color(&mut self, c: [f32; 4]) -> &mut Self {
-        self.update_interact_colors(|ic| ic.hover = Some(c));
+        self.update_interact_colors(|ic| ic.hover = Some(crate::node::ColorMod::Fixed(c)));
         self.rebuild_color_sugar();
         self
     }
@@ -1434,7 +1507,7 @@ impl<'a> NodeBuilderRef<'a> {
     /// matching OS button feel). See [`Self::hover_color`] for chaining
     /// semantics and base-color caveats.
     pub fn press_color(&mut self, c: [f32; 4]) -> &mut Self {
-        self.update_interact_colors(|ic| ic.press = Some(c));
+        self.update_interact_colors(|ic| ic.press = Some(crate::node::ColorMod::Fixed(c)));
         self.rebuild_color_sugar();
         self
     }
@@ -1450,14 +1523,7 @@ impl<'a> NodeBuilderRef<'a> {
     /// fade-the-whole-subtree effect, animate `style.opacity` via a
     /// hand-rolled tween in an `on_hover` handler.
     pub fn hover_opacity(&mut self, factor: f32) -> &mut Self {
-        let base = self
-            .ctx
-            .tree
-            .get(self.id)
-            .map(|n| n.style.color)
-            .unwrap_or([0.0; 4]);
-        let hover = [base[0], base[1], base[2], (base[3] * factor).clamp(0.0, 1.0)];
-        self.update_interact_colors(|ic| ic.hover = Some(hover));
+        self.update_interact_colors(|ic| ic.hover = Some(crate::node::ColorMod::AlphaScale(factor)));
         self.rebuild_color_sugar();
         self
     }
@@ -1466,14 +1532,7 @@ impl<'a> NodeBuilderRef<'a> {
     /// node's alpha by `factor` while pressed. Same scope (own fill,
     /// not subtree) and same chaining semantics as `press_color`.
     pub fn press_opacity(&mut self, factor: f32) -> &mut Self {
-        let base = self
-            .ctx
-            .tree
-            .get(self.id)
-            .map(|n| n.style.color)
-            .unwrap_or([0.0; 4]);
-        let press = [base[0], base[1], base[2], (base[3] * factor).clamp(0.0, 1.0)];
-        self.update_interact_colors(|ic| ic.press = Some(press));
+        self.update_interact_colors(|ic| ic.press = Some(crate::node::ColorMod::AlphaScale(factor)));
         self.rebuild_color_sugar();
         self
     }
@@ -1482,7 +1541,12 @@ impl<'a> NodeBuilderRef<'a> {
     /// ting the current `style.color` as the base on first allocation.
     fn update_interact_colors(&mut self, f: impl FnOnce(&mut crate::node::InteractColors)) {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
-            let base = n.style.color;
+            // Live base: the node's last `.color(...)` bind if any,
+            // otherwise a constant snapshot of the resting fill.
+            let base = n
+                .color_bind
+                .clone()
+                .unwrap_or(Bind::Value(n.style.color));
             let ic = n.interact_colors.get_or_insert(crate::node::InteractColors {
                 base,
                 hover: None,
@@ -1551,44 +1615,49 @@ impl<'a> NodeBuilderRef<'a> {
             }
         }
 
+        // The base is a live bind (added as a dep), so the sugar `Computed`
+        // re-evaluates whenever the resting colour moves — a reactive accent
+        // now flows through hover/press states instead of being frozen at
+        // build time. `ColorMod::apply` resolves each state against the
+        // current base value (so `*_opacity` scales the live alpha).
         let base = ic.base;
         let computed = match (ic.hover, ic.press) {
-            (Some(hc), Some(pc)) => {
+            (Some(hm), Some(pm)) => {
                 let h = self.ensure_hover_signal();
                 let p = self.ensure_press_signal();
-                crate::reactive::Computed::new(crate::deps!(h, p), move |(h, p)| {
+                crate::reactive::Computed::new(crate::deps!(base, h, p), move |(b, h, p)| {
                     if p {
-                        pc
+                        pm.apply(b)
                     } else if h {
-                        hc
+                        hm.apply(b)
                     } else {
-                        base
+                        b
                     }
                 })
             }
-            (Some(hc), None) => {
+            (Some(hm), None) => {
                 let h = self.ensure_hover_signal();
-                crate::reactive::Computed::new(crate::deps!(h), move |(h,)| {
+                crate::reactive::Computed::new(crate::deps!(base, h), move |(b, h)| {
                     if h {
-                        hc
+                        hm.apply(b)
                     } else {
-                        base
+                        b
                     }
                 })
             }
-            (None, Some(pc)) => {
+            (None, Some(pm)) => {
                 let p = self.ensure_press_signal();
-                crate::reactive::Computed::new(crate::deps!(p), move |(p,)| {
+                crate::reactive::Computed::new(crate::deps!(base, p), move |(b, p)| {
                     if p {
-                        pc
+                        pm.apply(b)
                     } else {
-                        base
+                        b
                     }
                 })
             }
             (None, None) => return,
         };
-        self.color(computed);
+        self.register_color_slot(computed.into());
     }
 
     /// Install a click callback. Fires on left-button release when the
@@ -1779,8 +1848,8 @@ mod tests {
         };
         let n = ctx.tree.get(id).unwrap();
         let ic = n.interact_colors.as_ref().expect("interact_colors not allocated");
-        assert_eq!(ic.base, BASE);
-        let hover = ic.hover.expect("hover color not set");
+        assert_eq!(ic.base.read(), BASE);
+        let hover = ic.hover.expect("hover color not set").apply(BASE);
         assert_eq!(hover[0..3], BASE[0..3]);
         assert!((hover[3] - 0.4).abs() < 1e-5);
     }
@@ -1972,7 +2041,7 @@ mod tests {
         let n = ctx.tree.get(id).unwrap();
         assert!(n.interact.hover.is_some(), "hover signal should be allocated");
         assert!(n.interact_colors.is_some());
-        assert_eq!(n.interact_colors.as_ref().unwrap().base, BASE);
+        assert_eq!(n.interact_colors.as_ref().unwrap().base.read(), BASE);
         assert_eq!(ctx.binds.color.len(), 1);
         // Initial value (hover=false) = base.
         assert_eq!(n.style.color, BASE);
