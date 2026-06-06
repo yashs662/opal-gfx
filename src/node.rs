@@ -692,6 +692,12 @@ pub struct Node {
     /// during flush so it survives scene rebuilds without app access from
     /// the scene closure. Only meaningful with `layer = true`.
     pub layer_opacity: Option<crate::signal::Signal<f32>>,
+    /// Optional composite-X-offset source for a `.layer()`-promoted subtree.
+    /// When set, the app pushes this signal's value (logical px) into the
+    /// layer's composite offset each frame — composite-only, no re-flatten,
+    /// no relayout. Lets an overlay (e.g. a seek tooltip) track the cursor
+    /// without touching the layout tree. Only meaningful with `layer = true`.
+    pub layer_offset_x: Option<crate::signal::Signal<f32>>,
     /// **External-texture layer** (P6): this node owns no instances; its
     /// pixels come from a caller-supplied `wgpu::Texture` registered with
     /// [`crate::app::App::set_external_texture`] (keyed by this node's id).
@@ -756,6 +762,15 @@ pub struct Node {
     /// left-press is captured on this node. Drives sliders / scrubbers.
     /// See [`crate::event::DragCtx`].
     pub on_drag: Option<crate::event::DragHandler>,
+    /// Hover-move callback. Fires on every cursor move while the
+    /// **un-pressed** cursor is over this node (the hover analogue of
+    /// `on_drag`). Drives hover previews. See [`crate::event::HoverCtx`].
+    pub on_hover_move: Option<crate::event::HoverHandler>,
+    /// Drag-end callback. Fires once when a press captured on this node is
+    /// released — **regardless of where the cursor ended up** (unlike
+    /// `on_click`, which needs release-inside). Completes the slider/scrub
+    /// API: `on_drag` during, `on_drag_end` to commit on release.
+    pub on_drag_end: Option<crate::event::EventHandler>,
     /// Drag-and-drop payload. When a press starts on a node with a
     /// payload, the lib latches a clone as the in-flight drag payload;
     /// releasing over a node with `on_drop` delivers it. Type-erased
@@ -821,6 +836,7 @@ impl Node {
                 blur_source: false,
                 layer: false,
                 layer_opacity: None,
+                layer_offset_x: None,
                 external: false,
                 image_cover: false,
                 edge_fade: [0.0; 4],
@@ -839,6 +855,8 @@ impl Node {
                 lazy_list: None,
                 dismiss_transparent: false,
                 on_drag: None,
+                on_hover_move: None,
+                on_drag_end: None,
                 drag_payload: None,
                 on_drop: None,
                 drag_follow: false,
@@ -1266,6 +1284,28 @@ impl NodeBuilder {
         F: for<'a> Fn(&mut crate::event::DragCtx<'a>) + 'static,
     {
         self.node.on_drag = Some(std::rc::Rc::new(f));
+        self
+    }
+
+    /// Install a hover-move callback — fires on every cursor move while the
+    /// un-pressed cursor is over this node (the hover analogue of
+    /// [`on_drag`](Self::on_drag)). See [`crate::event::HoverCtx`].
+    pub fn on_hover_move<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&mut crate::event::HoverCtx<'a>) + 'static,
+    {
+        self.node.on_hover_move = Some(std::rc::Rc::new(f));
+        self
+    }
+
+    /// Install a drag-end callback — fires once when a press captured on
+    /// this node releases, regardless of cursor position. Pairs with
+    /// [`on_drag`](Self::on_drag) for commit-on-release sliders/scrubbers.
+    pub fn on_drag_end<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&mut crate::event::EventCtx<'a>) + 'static,
+    {
+        self.node.on_drag_end = Some(std::rc::Rc::new(f));
         self
     }
 

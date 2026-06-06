@@ -21,6 +21,17 @@ use super::timing::{
     PASS_OPAQUE,
 };
 
+/// A node's resident Canvas frames: every frame of the loop uploaded once
+/// into its own VRAM texture, replayed by re-binding one of `views`. The
+/// `textures` are kept alongside their `views` to keep them alive.
+#[derive(Default)]
+struct ExternalFrameSet {
+    textures: Vec<wgpu::Texture>,
+    views: Vec<wgpu::TextureView>,
+    /// Sum of frame sizes (bytes) for the memory report.
+    bytes: u64,
+}
+
 /// Owns every wgpu handle the renderer touches.
 pub struct GpuContext {
     pub instance: wgpu::Instance,
@@ -51,6 +62,12 @@ pub struct GpuContext {
     /// Reused across frames (re-created only when the frame size changes)
     /// so a 30fps video doesn't re-allocate a texture every frame.
     external_owned: std::collections::HashMap<crate::node::NodeId, wgpu::Texture>,
+    /// Resident per-node frame sets (P6, looping Canvas): the whole clip
+    /// uploaded once into VRAM, replayed by re-binding `external_textures`
+    /// to one of these views — no per-frame CPU→GPU transfer. Keyed by the
+    /// `.external()` node id; migrated across rebuilds, dropped on clear.
+    external_frame_sets:
+        std::collections::HashMap<crate::node::NodeId, ExternalFrameSet>,
     pub glyph_atlas: GlyphAtlas,
     pub image_atlas: ImageAtlas,
     overdraw_mode: bool,
@@ -268,6 +285,7 @@ impl GpuContext {
             layer_draws: Vec::new(),
             external_textures: std::collections::HashMap::new(),
             external_owned: std::collections::HashMap::new(),
+            external_frame_sets: std::collections::HashMap::new(),
             glyph_atlas,
             image_atlas,
             overdraw_mode: false,
@@ -340,10 +358,94 @@ impl GpuContext {
         self.external_textures.insert(node, view);
     }
 
-    /// Drop a node's external texture (e.g. video stopped / node gone).
+    /// Drop a node's external texture + any resident frame set (e.g. video
+    /// stopped / node gone), freeing the VRAM.
     pub fn clear_external_texture(&mut self, node: crate::node::NodeId) {
         self.external_textures.remove(&node);
         self.external_owned.remove(&node);
+        self.external_frame_sets.remove(&node);
+    }
+
+    /// Append one decoded frame to `node`'s resident frame set, uploading it
+    /// to a new VRAM texture **once**, and bind it as the shown texture
+    /// (first-pass live build). The set is created on the first push. Bytes
+    /// are sRGB-encoded (`Rgba8UnormSrgb`), matching the surface.
+    pub fn push_external_frame(
+        &mut self,
+        node: crate::node::NodeId,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        debug_assert_eq!(rgba.len(), (width * height * 4) as usize);
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("canvas frame"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let set = self.external_frame_sets.entry(node).or_default();
+        set.bytes += (width as u64) * (height as u64) * 4;
+        set.views.push(view.clone());
+        set.textures.push(tex);
+        // Show the just-uploaded frame.
+        self.external_textures.insert(node, view);
+    }
+
+    /// Bind `node`'s shown texture to frame `index` of its resident set.
+    /// Cheap — re-binds a cached view, no pixel transfer. No-op if the node
+    /// has no set or the index is out of range.
+    pub fn select_external_frame(&mut self, node: crate::node::NodeId, index: usize) {
+        if let Some(set) = self.external_frame_sets.get(&node)
+            && let Some(view) = set.views.get(index)
+        {
+            self.external_textures.insert(node, view.clone());
+        }
+    }
+
+    /// Move a resident frame set from `old` to `new` (a rebuild reassigned
+    /// the `.external()` node id). No re-upload; rebinds the shown texture to
+    /// the migrated set's last frame (the next `select` corrects the index).
+    pub fn migrate_external_frames(
+        &mut self,
+        old: crate::node::NodeId,
+        new: crate::node::NodeId,
+    ) {
+        if old == new {
+            return;
+        }
+        if let Some(set) = self.external_frame_sets.remove(&old) {
+            self.external_textures.remove(&old);
+            if let Some(view) = set.views.last() {
+                self.external_textures.insert(new, view.clone());
+            }
+            self.external_frame_sets.insert(new, set);
+        }
     }
 
     /// Upload tightly-packed `width * height * 4` RGBA8 pixels (a decoder
@@ -634,8 +736,12 @@ impl GpuContext {
                 if entry.width == 0 || entry.height == 0 {
                     continue;
                 }
-                let px = r.position[0] + g.x as f32 + entry.left as f32;
-                let py = r.position[1] + g.y as f32 - entry.top as f32;
+                // Snap each glyph to the physical pixel grid. The atlas
+                // bitmap is rastered at integer size; if the destination is
+                // sub-pixel, linear filtering smears the coverage across two
+                // rows/cols (blurry text). Rounding keeps 1 texel ≈ 1 pixel.
+                let px = (r.position[0] + g.x as f32 + entry.left as f32).round();
+                let py = (r.position[1] + g.y as f32 - entry.top as f32).round();
                 let uv_w = entry.width as f32 / atlas_size;
                 let uv_h = entry.height as f32 / atlas_size;
                 out.push(ShapeInstance {
@@ -757,7 +863,7 @@ impl GpuContext {
     /// are tied to a specific size, new ones won't match. The next
     /// `build_glyph_instances` call refills lazily.
     pub fn reset_glyph_atlas(&mut self) {
-        self.glyph_atlas.reset();
+        self.glyph_atlas.reset(&self.queue);
     }
 
     /// Decode a PNG and upload it into the image atlas. Returns a
@@ -1312,6 +1418,7 @@ impl GpuContext {
             glyph_atlas: self.glyph_atlas.memory_bytes(),
             image_atlas: self.image_atlas.memory_bytes(),
             image_sources_cpu: self.image_atlas.source_bytes(),
+            external_frames: self.external_frame_sets.values().map(|s| s.bytes).sum(),
         }
     }
 
@@ -1443,6 +1550,9 @@ pub struct MemoryReport {
     /// (`ImageAtlas::source_bytes()`). Required so the eviction path
     /// can re-pack survivors when the atlas fills.
     pub image_sources_cpu: u64,
+    /// Resident Canvas frame sets in VRAM (whole loops uploaded once,
+    /// replayed by view re-bind). 4 B/px × every cached frame.
+    pub external_frames: u64,
 }
 
 impl MemoryReport {
@@ -1458,6 +1568,7 @@ impl MemoryReport {
             + self.glyph_atlas
             + self.image_atlas
             + self.image_sources_cpu
+            + self.external_frames
     }
 }
 

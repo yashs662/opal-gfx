@@ -77,7 +77,8 @@ pub use automation::{Script, Step};
 pub use editor::{EditOp, EditOutcome, EditorState};
 pub use lazy_list::LazyListState;
 pub use event::{
-    handler, DragCtx, DragHandler, DropCtx, DropHandler, EventCtx, EventHandler,
+    handler, DragCtx, DragHandler, DropCtx, DropHandler, EventCtx, EventHandler, HoverCtx,
+    HoverHandler,
 };
 pub use gpu::{
     FrameStats, FrameTiming, FrameUniform, GpuContext, ImageAtlas, ImageEntry, ImageHandle,

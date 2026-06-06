@@ -178,6 +178,23 @@ impl InputState {
         change
     }
 
+    /// Cancel all in-flight pointer interaction — drop capture and clear
+    /// every `pressed`/`hover` signal + the cursor. Used on cursor-leave /
+    /// focus-loss so a press or drag whose release we'll never see (the
+    /// button came up outside our window) doesn't latch a node "down" or
+    /// "hovered" forever.
+    pub fn cancel(&mut self, hits: &[HitEntry], tree: &NodeTree) -> InputChange {
+        self.captured = None;
+        self.cursor = None;
+        let mut change = InputChange::default();
+        change.pressed_changed = sync_bool_signals(hits, tree, None, |n| &n.interact.pressed);
+        if self.hovered.is_some() {
+            self.hovered = None;
+            change.hovered_changed = sync_bool_signals(hits, tree, None, |n| &n.interact.hover);
+        }
+        change
+    }
+
     /// Right-button press: latches `captured_right` to the currently
     /// hovered node. No signal mutation — right-click never advances
     /// `pressed` (Spotify/macOS/Windows menu UX is release-only).

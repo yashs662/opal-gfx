@@ -50,18 +50,46 @@ where
 /// cursor move while a left-press is captured on the node. `start` is the
 /// cursor position (physical px) at press; `current` is now; `delta` is
 /// `current - last_fire` (per-event step, **not** total from start — sum
-/// it yourself if you need the cumulative offset). Drives sliders +
-/// scrubbers.
+/// it yourself if you need the cumulative offset). `rect` is the node's
+/// absolute hit rect `[x, y, w, h]` in the same coordinate space as
+/// `current`, so a scrubber can map the cursor to a fraction along itself
+/// without worrying about DPI/layout units. Drives sliders + scrubbers.
 pub struct DragCtx<'a> {
     pub tree: &'a mut NodeTree,
     pub node: NodeId,
     pub start: [f32; 2],
     pub current: [f32; 2],
     pub delta: [f32; 2],
+    pub rect: [f32; 4],
+    /// Display scale factor (physical px per logical px). `current`/`rect`
+    /// are physical; divide by this to get logical px (e.g. when feeding a
+    /// composite offset, which is specified in logical units). Fractions
+    /// along `rect` are scale-invariant and need no conversion.
+    pub scale: f32,
 }
 
 /// A node-bound drag callback. See [`DragCtx`].
 pub type DragHandler = Rc<dyn for<'a> Fn(&mut DragCtx<'a>) + 'static>;
+
+/// Context handed to an `on_hover_move` callback — the hover analogue of
+/// [`DragCtx`]. Fires on every cursor move while the **un-pressed** cursor
+/// is over the node. `pos` is the cursor (physical px); `rect` is the
+/// node's absolute hit rect `[x, y, w, h]` in the same space, so a handler
+/// maps the cursor to a fraction along the node without DPI guesswork.
+/// Drives hover previews (e.g. a seek-bar target-timestamp tooltip).
+pub struct HoverCtx<'a> {
+    pub tree: &'a mut NodeTree,
+    pub node: NodeId,
+    pub pos: [f32; 2],
+    pub rect: [f32; 4],
+    /// Display scale factor (physical px per logical px). `pos`/`rect` are
+    /// physical; divide by this for logical px (e.g. a composite offset).
+    /// Fractions along `rect` are scale-invariant.
+    pub scale: f32,
+}
+
+/// A node-bound hover-move callback. See [`HoverCtx`].
+pub type HoverHandler = Rc<dyn for<'a> Fn(&mut HoverCtx<'a>) + 'static>;
 
 /// Context handed to a [`DropHandler`]. Fires when a left-press release
 /// lands over this drop-target node while a drag payload is in flight.

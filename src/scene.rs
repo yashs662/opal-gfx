@@ -1069,6 +1069,19 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
+    /// Promote to a layer (implies [`Self::layer`]) and drive its composite
+    /// **X offset** (logical px) from `signal` each frame — composite-only,
+    /// no re-flatten and no relayout. Lets an overlay (e.g. the seek-bar
+    /// timestamp tooltip) follow the cursor without dirtying the layout tree.
+    /// See [`crate::node::Node::layer_offset_x`].
+    pub fn layer_offset_x(&mut self, signal: crate::signal::Signal<f32>) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.layer = true;
+            n.layer_offset_x = Some(signal);
+        }
+        self
+    }
+
     /// Mark this node as an **external-texture layer** (P6). See
     /// [`crate::node::Node::external`].
     pub fn external(&mut self) -> &mut Self {
@@ -1758,6 +1771,34 @@ impl<'a> NodeBuilderRef<'a> {
         let handler: crate::event::DragHandler = std::rc::Rc::new(f);
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
             n.on_drag = Some(handler);
+        }
+        self
+    }
+
+    /// Hover-move callback — fires on every cursor move while the
+    /// un-pressed cursor is over this node (hover analogue of
+    /// [`Self::on_drag`]). See [`crate::event::HoverCtx`].
+    pub fn on_hover_move<F>(&mut self, f: F) -> &mut Self
+    where
+        F: for<'h> Fn(&mut crate::event::HoverCtx<'h>) + 'static,
+    {
+        let handler: crate::event::HoverHandler = std::rc::Rc::new(f);
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.on_hover_move = Some(handler);
+        }
+        self
+    }
+
+    /// Drag-end callback — fires once when a press captured on this node
+    /// releases, regardless of cursor position. Pairs with
+    /// [`Self::on_drag`] for commit-on-release sliders.
+    pub fn on_drag_end<F>(&mut self, f: F) -> &mut Self
+    where
+        F: for<'h> Fn(&mut crate::event::EventCtx<'h>) + 'static,
+    {
+        let handler: crate::event::EventHandler = std::rc::Rc::new(f);
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.on_drag_end = Some(handler);
         }
         self
     }

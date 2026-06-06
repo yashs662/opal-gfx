@@ -184,12 +184,22 @@ pub struct App {
     /// latest pointer here and let `about_to_wait` apply it at frame
     /// rate via `set_scroll_immediate`.
     pending_drag_cursor: Option<[f32; 2]>,
+    /// Cursor pending an `on_hover_move` dispatch, coalesced to frame rate
+    /// for the same reason as [`Self::pending_drag_cursor`]: a hover-move
+    /// handler typically sets a Signal (e.g. the seek-bar timestamp preview)
+    /// that dirties the tree, and firing per OS CursorMoved (500+ Hz) would
+    /// re-flatten the whole instance buffer many times per displayed frame.
+    /// Only set when the hovered node actually has a hover-move handler.
+    pending_hover_cursor: Option<[f32; 2]>,
     /// Generic-drag bookkeeping. `drag_origin` is the
     /// cursor at press on a draggable node; `drag_last` is the cursor at
     /// the previous `on_drag` fire (so `DragCtx::delta` is per-event).
     /// Both clear on release / capture loss.
     drag_origin: Option<[f32; 2]>,
     drag_last: Option<[f32; 2]>,
+    /// The node whose `on_drag` captured the current drag, remembered so
+    /// `on_drag_end` can fire for it on release (capture is cleared first).
+    drag_node: Option<crate::node::NodeId>,
     /// In-flight drag-and-drop payload. Latched from the pressed node's
     /// `drag_payload`; delivered to a drop target on release.
     drag_payload: Option<std::rc::Rc<dyn std::any::Any>>,
@@ -271,6 +281,15 @@ pub struct App {
     /// bridge from a `Signal<f32>` (e.g. a crossfade tween) to a layer's
     /// composite opacity, mirroring how reactive binds drive node props.
     layer_opacity_binds: Vec<(crate::node::NodeId, crate::signal::Signal<f32>)>,
+    /// Same bridge as [`Self::layer_opacity_binds`] but for a layer's
+    /// composite **X offset** (logical px) — collected from `.layer_offset_x`
+    /// nodes each flush and pumped each awake frame via
+    /// [`Self::set_layer_offset`]. Drives cursor-following overlays without
+    /// touching the layout tree.
+    layer_offset_x_binds: Vec<(crate::node::NodeId, crate::signal::Signal<f32>)>,
+    /// Reused scratch for [`Self::push_layer_draws`] so composite-only
+    /// updates don't allocate a fresh draw-list Vec each frame.
+    layer_draw_scratch: Vec<crate::gpu::LayerDraw>,
     /// Stat-dump cadence: continuously log on every render when set.
     /// Toggled by `FROSTIFY_STATS=1` env var or by F1 in interactive mode.
     stats_log: bool,
@@ -434,8 +453,10 @@ impl App {
             flat_event_inst: Vec::new(),
             bar_drag: None,
             pending_drag_cursor: None,
+            pending_hover_cursor: None,
             drag_origin: None,
             drag_last: None,
+            drag_node: None,
             drag_payload: None,
             drag_return: None,
             drag_return_offset: crate::signal::Signal::new([0.0, 0.0]),
@@ -456,6 +477,8 @@ impl App {
             last_dirty_mask: 0,
             layer_tree: crate::layer::LayerTree::single_root(),
             layer_opacity_binds: Vec::new(),
+            layer_offset_x_binds: Vec::new(),
+            layer_draw_scratch: Vec::new(),
             last_cpu_ms: 0.0,
             last_render_stats: None,
             stats_log: std::env::var_os("FROSTIFY_STATS").is_some(),
@@ -825,17 +848,19 @@ impl App {
         // tracks the current tree (promotions can come + go); the per-frame
         // pump then drives each layer's composite opacity from its signal.
         self.layer_opacity_binds.clear();
+        self.layer_offset_x_binds.clear();
         for p in &promoted {
-            if let Some(sig) = self
-                .ctx
-                .tree
-                .get(p.node)
-                .and_then(|n| n.layer_opacity.clone())
-            {
-                self.layer_opacity_binds.push((p.node, sig));
+            if let Some(n) = self.ctx.tree.get(p.node) {
+                if let Some(sig) = n.layer_opacity.clone() {
+                    self.layer_opacity_binds.push((p.node, sig));
+                }
+                if let Some(sig) = n.layer_offset_x.clone() {
+                    self.layer_offset_x_binds.push((p.node, sig));
+                }
             }
         }
         self.pump_layer_opacity_binds();
+        self.pump_layer_offset_binds();
         self.push_layer_draws();
         true
     }
@@ -845,14 +870,14 @@ impl App {
     /// composite-only frames (where the instance stream is untouched but
     /// a layer's composite transform/opacity changed).
     fn push_layer_draws(&mut self) {
-        let draws: Vec<crate::gpu::LayerDraw> = self
-            .layer_tree
-            .layers()
-            .iter()
-            .map(layer_to_draw)
-            .collect();
+        // Build into a reused scratch buffer (cleared, not reallocated) so a
+        // composite-only update — scroll, crossfade, a cursor-following
+        // overlay offset — doesn't allocate a fresh Vec each frame.
+        self.layer_draw_scratch.clear();
+        self.layer_draw_scratch
+            .extend(self.layer_tree.layers().iter().map(layer_to_draw));
         if let Some(gpu) = self.gpu.as_mut() {
-            gpu.set_layers(&draws);
+            gpu.set_layers(&self.layer_draw_scratch);
         }
     }
 
@@ -882,18 +907,28 @@ impl App {
     /// layer's composite opacity. Called each awake frame after the
     /// timeline tick. No-op when no bindings are registered.
     fn pump_layer_opacity_binds(&mut self) {
-        if self.layer_opacity_binds.is_empty() {
-            return;
+        // Take/restore (no alloc) to iterate while calling `&mut self` —
+        // see [`Self::pump_layer_offset_binds`].
+        let binds = std::mem::take(&mut self.layer_opacity_binds);
+        for (node, sig) in &binds {
+            self.set_layer_opacity(*node, sig.get());
         }
-        // Snapshot to avoid borrowing `self` across `set_layer_opacity`.
-        let pairs: Vec<(crate::node::NodeId, f32)> = self
-            .layer_opacity_binds
-            .iter()
-            .map(|(n, s)| (*n, s.get()))
-            .collect();
-        for (node, op) in pairs {
-            self.set_layer_opacity(node, op);
+        self.layer_opacity_binds = binds;
+    }
+
+    /// Push every layer-offset-x binding's current signal value into its
+    /// layer's composite X offset (logical px). Composite-only — no
+    /// re-flatten. Called each awake frame after the timeline tick.
+    fn pump_layer_offset_binds(&mut self) {
+        // Take the bind list out (swap with an empty Vec — no alloc) so the
+        // `&mut self` calls below don't conflict with borrowing it, then put
+        // it back. `set_layer_offset` never touches this field. Keeps a
+        // cursor-following overlay's per-move cost alloc-free.
+        let binds = std::mem::take(&mut self.layer_offset_x_binds);
+        for (node, sig) in &binds {
+            self.set_layer_offset(*node, [sig.get(), 0.0]);
         }
+        self.layer_offset_x_binds = binds;
     }
 
     /// Register/replace the **external texture** for an `.external()` node
@@ -1017,6 +1052,29 @@ impl App {
         self.gpu.as_ref().map(|g| g.memory_report())
     }
 
+    /// Log the current memory breakdown. `image_atlas`/`*_textures` are
+    /// VRAM; `*_cpu` are system RAM. Fired at startup (baseline) and on F1
+    /// so the live working set (after covers stream + a canvas plays) can be
+    /// read, not just the empty-scene baseline.
+    pub fn log_memory_report(&self) {
+        if let Some(mem) = self.memory_report() {
+            log::info!(
+                "gpu memory: total={} KiB (instance={} overlay={} blur={} overdraw={} glyph_atlas={} image_atlas={} canvas_frames={} img_src_cpu={} timing={} prev_cpu={})",
+                mem.total() / 1024,
+                mem.instance_buffer,
+                mem.overlay_buffer,
+                mem.blur_textures,
+                mem.overdraw_textures,
+                mem.glyph_atlas,
+                mem.image_atlas,
+                mem.external_frames,
+                mem.image_sources_cpu,
+                mem.timing,
+                mem.prev_instances_cpu,
+            );
+        }
+    }
+
     /// Drain the `Uploader` queue: perform each pending RGBA upload on
     /// the UI thread (where the GPU lives) and fire the caller's
     /// completion callback with the resolved [`ImageHandle`]. No-op when
@@ -1049,12 +1107,23 @@ impl App {
         let Some(gpu) = self.gpu.as_mut() else {
             return false;
         };
-        for (node, msg) in pending {
-            match msg {
-                crate::frame_sink::FrameMsg::Frame(f) => {
-                    gpu.upload_external_frame(node, &f.rgba, f.width, f.height);
+        for cmd in pending {
+            match cmd {
+                crate::frame_sink::FrameCmd::Frame { node, frame } => {
+                    gpu.upload_external_frame(node, &frame.rgba, frame.width, frame.height);
                 }
-                crate::frame_sink::FrameMsg::Clear => gpu.clear_external_texture(node),
+                crate::frame_sink::FrameCmd::Push { node, frame } => {
+                    gpu.push_external_frame(node, &frame.rgba, frame.width, frame.height);
+                }
+                crate::frame_sink::FrameCmd::Select { node, index } => {
+                    gpu.select_external_frame(node, index);
+                }
+                crate::frame_sink::FrameCmd::Migrate { old, new } => {
+                    gpu.migrate_external_frames(old, new);
+                }
+                crate::frame_sink::FrameCmd::Clear { node } => {
+                    gpu.clear_external_texture(node);
+                }
             }
         }
         true
@@ -1660,6 +1729,7 @@ impl App {
             }
             self.drag_origin = Some(origin);
             self.drag_last = Some(origin);
+            self.drag_node = if has_drag { Some(cap) } else { None };
             self.drag_payload = payload;
             // Lift the node immediately (zero offset) so it's already on
             // top before the first move.
@@ -1702,15 +1772,61 @@ impl App {
             return false;
         };
         let last = self.drag_last.unwrap_or(start);
+        let rect = self
+            .hits
+            .iter()
+            .find(|e| e.node_id == cap)
+            .map(|e| {
+                let b = e.bounds;
+                [b[0], b[1], b[2] - b[0], b[3] - b[1]]
+            })
+            .unwrap_or([0.0; 4]);
+        let scale = self.scale_factor;
         let mut dctx = crate::event::DragCtx {
             tree: &mut self.ctx.tree,
             node: cap,
             start,
             current: [x, y],
             delta: [x - last[0], y - last[1]],
+            rect,
+            scale,
         };
         h(&mut dctx);
         self.drag_last = Some([x, y]);
+        true
+    }
+
+    /// Fire the hovered (un-captured) node's `on_hover_move` for a cursor
+    /// move to `[x, y]`. No-op while a press is captured (that's the drag
+    /// path). Returns true if a handler ran (caller should react).
+    fn fire_hover_move(&mut self, x: f32, y: f32) -> bool {
+        if self.input.captured.is_some() {
+            return false;
+        }
+        let Some(hovered) = self.input.hovered else {
+            return false;
+        };
+        let Some(h) = self.ctx.tree.get(hovered).and_then(|n| n.on_hover_move.clone()) else {
+            return false;
+        };
+        let rect = self
+            .hits
+            .iter()
+            .find(|e| e.node_id == hovered)
+            .map(|e| {
+                let b = e.bounds;
+                [b[0], b[1], b[2] - b[0], b[3] - b[1]]
+            })
+            .unwrap_or([0.0; 4]);
+        let scale = self.scale_factor;
+        let mut hctx = crate::event::HoverCtx {
+            tree: &mut self.ctx.tree,
+            node: hovered,
+            pos: [x, y],
+            rect,
+            scale,
+        };
+        h(&mut hctx);
         true
     }
 
@@ -1718,6 +1834,20 @@ impl App {
     /// drop target under the cursor, then animate a lifted node back to
     /// its resting slot. No-op when nothing was being dragged.
     fn finish_drag_on_release(&mut self) {
+        // Fire the drag node's `on_drag_end` (commit-on-release sliders).
+        // Capture was already cleared by `on_left_released`, so use the
+        // remembered drag node.
+        if let Some(dn) = self.drag_node.take()
+            && let Some(h) = self.ctx.tree.get(dn).and_then(|n| n.on_drag_end.clone())
+        {
+            let mut ectx = crate::event::EventCtx {
+                tree: &mut self.ctx.tree,
+                timeline: &mut self.timeline,
+                node: dn,
+                now: Instant::now(),
+            };
+            h(&mut ectx);
+        }
         let was_dragging = self.drag_payload.is_some() || self.drag_origin.is_some();
         // 1. Deliver the payload to a drop target under the cursor.
         if let Some(payload) = self.drag_payload.take()
@@ -1805,10 +1935,47 @@ impl App {
     fn clear_drag_state(&mut self) {
         self.drag_origin = None;
         self.drag_last = None;
+        self.drag_node = None;
         self.drag_payload = None;
         self.timeline.stop(DRAG_RETURN_TWEEN_KEY);
         self.drag_return = None;
         self.ctx.tree.set_drag_follow(None);
+    }
+
+    /// Fully reset pointer interaction on capture loss — the cursor left
+    /// the window or focus moved, so the button's eventual release will
+    /// never reach us. Fires the active drag's `on_drag_end` (so app-side
+    /// drag state, e.g. a seek-bar `seeking` signal, resets instead of
+    /// latching on), settles scrollbar drag, drops generic-drag
+    /// bookkeeping, and clears capture + every pressed/hover signal.
+    /// Returns true if anything changed (caller should react).
+    fn cancel_pointer_interaction(&mut self) -> bool {
+        // Fire on_drag_end so the app can commit/reset a held scrub even
+        // though we won't see the button release.
+        if let Some(dn) = self.drag_node.take()
+            && let Some(h) = self.ctx.tree.get(dn).and_then(|n| n.on_drag_end.clone())
+        {
+            let mut ectx = crate::event::EventCtx {
+                tree: &mut self.ctx.tree,
+                timeline: &mut self.timeline,
+                node: dn,
+                now: Instant::now(),
+            };
+            h(&mut ectx);
+        }
+        self.end_bar_drag_if_active();
+        self.clear_drag_state();
+        let bar_changed =
+            crate::input::update_scrollbar_hover(None, &self.scroll_bars, &mut self.ctx.tree);
+        let change = self.input.cancel(&self.hits, &self.ctx.tree);
+        self.dwell = None;
+        if self.last_cursor_icon != CursorIcon::Default {
+            self.last_cursor_icon = CursorIcon::Default;
+            if let Some(w) = &self.window {
+                w.set_cursor(CursorIcon::Default);
+            }
+        }
+        change.any() || bar_changed
     }
 
     /// Advance keyboard focus to the next (`forward = true`, Tab) or
@@ -1891,9 +2058,10 @@ impl App {
         self.dwell = None;
         // Drag bookkeeping references destroyed node ids — drop it.
         self.clear_drag_state();
-        // Layer-opacity bindings hold node ids from the old tree — drop
-        // them; the rebuilt scene re-binds via `bind_layer_opacity`.
+        // Layer-opacity / layer-offset bindings hold node ids from the old
+        // tree — drop them; the rebuilt scene re-collects them on next flush.
         self.layer_opacity_binds.clear();
+        self.layer_offset_x_binds.clear();
         // 3. Re-invoke the stored builder on the now-empty ctx. Take
         //    + put back so the closure can call back into &mut self
         //    via captures without re-borrowing the builder slot.
@@ -2911,21 +3079,7 @@ impl ApplicationHandler for App {
             }
         }
 
-        if let Some(mem) = self.memory_report() {
-            log::info!(
-                "gpu memory: total={} KiB (instance={} overlay={} blur={} overdraw={} glyph_atlas={} image_atlas={} img_src_cpu={} timing={} prev_cpu={})",
-                mem.total() / 1024,
-                mem.instance_buffer,
-                mem.overlay_buffer,
-                mem.blur_textures,
-                mem.overdraw_textures,
-                mem.glyph_atlas,
-                mem.image_atlas,
-                mem.image_sources_cpu,
-                mem.timing,
-                mem.prev_instances_cpu,
-            );
-        }
+        self.log_memory_report();
 
         // First flush + render so the visible window already shows
         // the scene by the time the user sees it.
@@ -3091,6 +3245,16 @@ impl ApplicationHandler for App {
                     // entries would never match again under the new
                     // scale so drop them to keep the table small.
                     self.ctx.text.clear_shape_cache();
+                    // Re-shape + re-rasterize everything at the new physical
+                    // size *now* so text stays sharp. We just emptied the
+                    // glyph atlas + shape cache; without forcing a re-flatten
+                    // here, sharpness would depend on a `Resized` happening to
+                    // follow (not guaranteed for a pure scale change), and any
+                    // redraw in between would sample a stale/empty atlas.
+                    // Mirrors the `Resized` tail.
+                    self.ctx.tree.mark_all_dirty();
+                    self.flush_tree();
+                    self.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -3132,6 +3296,22 @@ impl ApplicationHandler for App {
                 // draggable node (slider/scrubber). Independent of the
                 // scrollbar-thumb drag handled above.
                 let dragged = self.fire_drag(x, y);
+                // Hover-move: coalesce to frame rate. Firing per OS
+                // CursorMoved (500+ Hz) would re-flatten the whole tree each
+                // event, since the handler sets a Signal (seek-bar preview)
+                // that dirties layout. Stash the cursor + wake; `about_to_wait`
+                // fires it once per frame. Only arm when the hovered node has
+                // a hover-move handler, so a plain hover stays at 0% CPU.
+                let wants_hover_move = self
+                    .input
+                    .hovered
+                    .and_then(|id| self.ctx.tree.get(id))
+                    .map(|n| n.on_hover_move.is_some())
+                    .unwrap_or(false);
+                if wants_hover_move {
+                    self.pending_hover_cursor = Some([x, y]);
+                    self.request_redraw();
+                }
                 // Drag-follow: track the cursor for a lifted node.
                 let following = self.update_drag_follow(x, y);
                 if change.hovered_changed {
@@ -3142,34 +3322,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
-                // With a working OS-level mouse capture, the cursor
-                // can leave the client area without `CursorLeft`
-                // firing (events are still routed to us). Receiving
-                // this event mid-drag means capture has been lost or
-                // never installed — settle the drag so `bar_active`
-                // doesn't latch on. Same rationale as the focus-loss
-                // path above.
-                self.end_bar_drag_if_active();
-                // Capture genuinely lost (OS capture would otherwise keep
-                // routing moves) — abandon any in-flight generic drag /
-                // drag-payload rather than leave it stuck.
-                self.clear_drag_state();
-                let bar_changed = crate::input::update_scrollbar_hover(
-                    None,
-                    &self.scroll_bars,
-                    &mut self.ctx.tree,
-                );
-                let change = self.input.on_cursor_left(&self.hits, &self.ctx.tree);
-                if change.hovered_changed {
-                    self.dwell = None;
-                }
-                if self.last_cursor_icon != CursorIcon::Default {
-                    self.last_cursor_icon = CursorIcon::Default;
-                    if let Some(w) = &self.window {
-                        w.set_cursor(CursorIcon::Default);
-                    }
-                }
-                if change.any() || bar_changed {
+                // The cursor left the client area. Receiving this mid-drag
+                // means OS capture wasn't held (or was lost) — the button's
+                // release will never reach us, so fully reset pointer
+                // interaction (capture, drag, pressed + hover signals)
+                // rather than leave a node stuck "down"/"hovered" or a
+                // seek-bar stuck "seeking".
+                if self.cancel_pointer_interaction() {
                     self.react();
                 }
             }
@@ -3181,12 +3340,14 @@ impl ApplicationHandler for App {
                 // events for keys still down, so the held set would
                 // leak and suppress settle forever. Clear it now.
                 self.held_scroll_keys.clear();
-                // Same logic for an in-flight scrollbar drag: if focus
-                // moves elsewhere, we'll miss the eventual button
-                // release. Settle the drag now to free `bar_active`
-                // and avoid the thumb staying painted in its
-                // mouse-down color forever.
-                self.end_bar_drag_if_active();
+                // Same for in-flight pointer interaction: a button held at
+                // focus-loss (alt-tab, click-through to another window) will
+                // release where we can't see it, so fully reset capture +
+                // drag + pressed/hover signals (fires on_drag_end so a held
+                // scrub commits/resets rather than sticking).
+                if self.cancel_pointer_interaction() {
+                    self.react();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let Some([cx, cy]) = self.input.cursor else {
@@ -3438,6 +3599,9 @@ impl ApplicationHandler for App {
                                     if self.hud_enabled { "on" } else { "off" },
                                     self.current_stats()
                                 );
+                                // Dump the live memory split (VRAM vs system
+                                // RAM) for the current working set.
+                                self.log_memory_report();
                                 if !self.hud_enabled {
                                     self.clear_hud_overlay();
                                 }
@@ -3655,6 +3819,13 @@ impl ApplicationHandler for App {
         } else {
             false
         };
+        // Drain the coalesced hover-move cursor: one `on_hover_move` dispatch
+        // per frame regardless of how many CursorMoved events fired.
+        let hover_moved = if let Some(c) = self.pending_hover_cursor.take() {
+            self.fire_hover_move(c[0], c[1])
+        } else {
+            false
+        };
         // Hold-key poke: while any scroll key is physically held, keep
         // the input-quiescence gate suppressed so settle doesn't fire
         // during the OS auto-repeat initial-delay window.
@@ -3693,6 +3864,7 @@ impl ApplicationHandler for App {
         if !timeline_active
             && !scroll_active
             && !drag_moved
+            && !hover_moved
             && !dwell_pending
             && !dwell_fired
             && auto_deadline.is_none()
@@ -3751,7 +3923,13 @@ impl ApplicationHandler for App {
         if res.updated {
             self.pump_layer_opacity_binds();
         }
-        if res.updated || scroll_moved || drag_moved || hook_active || dwell_fired {
+        // Push coalesced hover-move / drag offsets into cursor-following
+        // overlay layers (e.g. the seek tooltip) — composite-only, so the
+        // overlay tracks the cursor with no re-flatten of the scene.
+        if hover_moved || drag_moved {
+            self.pump_layer_offset_binds();
+        }
+        if res.updated || scroll_moved || drag_moved || hover_moved || hook_active || dwell_fired {
             if res.updated {
                 self.pump_animated_displays();
             }
@@ -3912,10 +4090,11 @@ impl App {
         );
         let change = self.input.on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
         self.refresh_cursor(x, y);
+        let hovered_moved = self.fire_hover_move(x, y);
         if change.hovered_changed {
             self.refresh_dwell(Instant::now());
         }
-        if change.any() || bar_changed {
+        if change.any() || bar_changed || hovered_moved {
             self.react();
         }
     }

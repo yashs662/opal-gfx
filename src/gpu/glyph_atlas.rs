@@ -175,7 +175,7 @@ impl GlyphAtlas {
         let alloc = match self.allocator.allocate(size2(w, h)) {
             Some(a) => a,
             None => {
-                self.reset();
+                self.reset(queue);
                 self.allocator.allocate(size2(w, h))?
             }
         };
@@ -228,10 +228,36 @@ impl GlyphAtlas {
     /// prior frame can detect the invalidation. Triggered when the
     /// physical glyph size changes (DPI scale flip) or the atlas
     /// fills up.
-    pub fn reset(&mut self) {
+    ///
+    /// Also **zeroes the texture**: cells get reused by the new
+    /// generation, and glyph writes only cover the bitmap — not the 1px
+    /// padding border — so without clearing, stale coverage from the
+    /// previous generation lingers in those borders and bleeds into a
+    /// neighbour under linear filtering (a faint mark beside a glyph).
+    pub fn reset(&mut self, queue: &wgpu::Queue) {
         self.allocator.clear();
         self.occupants.clear();
         self.generation = self.generation.wrapping_add(1);
+        let zeros = vec![0u8; (self.size as usize) * (self.size as usize)];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &zeros,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.size),
+                rows_per_image: Some(self.size),
+            },
+            wgpu::Extent3d {
+                width: self.size,
+                height: self.size,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Reported GPU bytes used by the atlas texture.
