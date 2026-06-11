@@ -196,8 +196,13 @@ fn sd_rectangle(p: vec2<f32>, xy: vec2<f32>) -> f32 {
 }
 
 fn sd_rounded_rect(p: vec2<f32>, xy: vec2<f32>, r: vec4<f32>) -> f32 {
+    // `r` is [TL, TR, BL, BR] (matching the `.radii(tl,tr,bl,br)` API).
+    // Fragment coords are y-DOWN (origin top-left), so `p.y < 0` is the TOP
+    // half and `p.y > 0` the BOTTOM half — select the bottom cases for
+    // `p.y > 0`. (A previous `p.y < 0` here swapped top/bottom radii, which
+    // only shows up with per-corner radii — uniform corners are symmetric.)
     let qx = select(0u, 1u, p.x > 0.0);
-    let qy = select(0u, 2u, p.y < 0.0);
+    let qy = select(0u, 2u, p.y > 0.0);
     let idx = qx + qy;
     var s: f32;
     switch idx {

@@ -192,6 +192,12 @@ pub struct LayerResources {
     /// here without threading it through every call.
     shape_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// Linear-filtered composite sampler, used **only** for external-texture
+    /// layers (video / Canvas). Their source texture is at the decoder's
+    /// resolution, not the on-screen rect, so the composite quad scales it —
+    /// nearest sampling there aliases hard on diagonals. Normal UI layers
+    /// stay on the nearest [`Self::sampler`] (rastered 1:1, keeps text crisp).
+    linear_sampler: wgpu::Sampler,
     format: wgpu::TextureFormat,
     /// Default texture size for identity layers (= current surface size).
     surface_size: [u32; 2],
@@ -312,8 +318,10 @@ impl LayerResources {
         let pipeline = make_pipeline(format, "frostify.composite pipeline");
         // P4: composites below-glass content into the linear backdrop
         // texture (blur input). Unused until the segment walk lands.
-        let backdrop_pipeline =
-            make_pipeline(super::blur::BACKDROP_FORMAT, "frostify.composite→backdrop pipeline");
+        let backdrop_pipeline = make_pipeline(
+            super::blur::BACKDROP_FORMAT,
+            "frostify.composite→backdrop pipeline",
+        );
 
         // Nearest sampling: a 1:1-px composite window maps the quad to the
         // layer texels exactly (identity OR a pixel-aligned scroll window),
@@ -327,6 +335,18 @@ impl LayerResources {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        // Linear sampler for external (video / Canvas) layers — see the
+        // `linear_sampler` field doc. Clamp to edge so the bilinear tap at
+        // the frame border doesn't wrap.
+        let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("frostify.composite sampler (linear)"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
 
         let mut res = LayerResources {
             pipeline,
@@ -334,6 +354,7 @@ impl LayerResources {
             bgl,
             shape_bgl: shape_bgl.clone(),
             sampler,
+            linear_sampler,
             format,
             surface_size: [width.max(1), height.max(1)],
             textures: Vec::new(),
@@ -505,7 +526,10 @@ impl LayerResources {
             // layer texture is surface-sized, so tex_size = surface.
             None => CompositeUniform {
                 dst_origin: draw.offset,
-                dst_size: [surface_size[0] * draw.scale[0], surface_size[1] * draw.scale[1]],
+                dst_size: [
+                    surface_size[0] * draw.scale[0],
+                    surface_size[1] * draw.scale[1],
+                ],
                 src_origin: [0.0, 0.0],
                 src_extent: surface_size,
                 tex_size: surface_size,
@@ -579,7 +603,9 @@ impl LayerResources {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    // Linear: the external view is at decoder resolution and
+                    // gets scaled by the composite quad — nearest aliases.
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
                 },
             ],
         })

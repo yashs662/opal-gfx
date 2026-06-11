@@ -6,8 +6,10 @@
 //! `NodeId`s are stable across mutations of *other* nodes — they only
 //! invalidate when the specific slot they refer to is reused.
 
-use crate::gpu::{ImageHandle, NO_CLIP, ShapeInstance, SHAPE_KIND_GLASS, SHAPE_KIND_IMAGE, SHAPE_KIND_RECT};
-use crate::layout::{Align, Axis, Justify, Len, LayoutStyle};
+use crate::gpu::{
+    ImageHandle, NO_CLIP, SHAPE_KIND_GLASS, SHAPE_KIND_IMAGE, SHAPE_KIND_RECT, ShapeInstance,
+};
+use crate::layout::{Align, Axis, Justify, LayoutStyle, Len};
 use crate::signal::Signal;
 
 /// Tree-level dirty flags.
@@ -227,6 +229,11 @@ pub struct ScrollbarStyle {
     pub thickness: f32,
     pub min_thumb: f32,
     pub margin: f32,
+    /// Extra inset (logical px) at the **start** (top) of the vertical
+    /// track, on top of `margin`. Lets the bar begin below a pinned overlay
+    /// (e.g. a sticky header that would otherwise cover its top) while its
+    /// bottom stays put. 0 = full-height (default).
+    pub inset_start: f32,
     pub radius: f32,
     pub y_side: BarSide,
     pub x_side: BarSide,
@@ -250,6 +257,7 @@ impl Default for ScrollbarStyle {
             thickness: 4.0,
             min_thumb: 24.0,
             margin: 4.0,
+            inset_start: 0.0,
             radius: 2.0,
             y_side: BarSide::End,
             x_side: BarSide::End,
@@ -261,19 +269,62 @@ impl Default for ScrollbarStyle {
 }
 
 impl ScrollbarStyle {
-    pub fn track_color(mut self, c: [f32; 4]) -> Self { self.track_color = c; self }
-    pub fn thumb_color(mut self, c: [f32; 4]) -> Self { self.thumb_color = c; self }
-    pub fn thumb_hover_color(mut self, c: [f32; 4]) -> Self { self.thumb_hover_color = c; self }
-    pub fn thumb_active_color(mut self, c: [f32; 4]) -> Self { self.thumb_active_color = c; self }
-    pub fn thickness(mut self, px: f32) -> Self { self.thickness = px; self }
-    pub fn min_thumb(mut self, px: f32) -> Self { self.min_thumb = px; self }
-    pub fn margin(mut self, px: f32) -> Self { self.margin = px; self }
-    pub fn radius(mut self, px: f32) -> Self { self.radius = px; self }
-    pub fn y_side(mut self, side: BarSide) -> Self { self.y_side = side; self }
-    pub fn x_side(mut self, side: BarSide) -> Self { self.x_side = side; self }
-    pub fn fade(mut self, seconds: f32) -> Self { self.fade_seconds = seconds.max(0.0); self }
-    pub fn auto_hide(mut self, on: bool) -> Self { self.auto_hide = on; self }
-    pub fn always_visible(mut self, on: bool) -> Self { self.always_visible = on; self }
+    pub fn track_color(mut self, c: [f32; 4]) -> Self {
+        self.track_color = c;
+        self
+    }
+    pub fn thumb_color(mut self, c: [f32; 4]) -> Self {
+        self.thumb_color = c;
+        self
+    }
+    pub fn thumb_hover_color(mut self, c: [f32; 4]) -> Self {
+        self.thumb_hover_color = c;
+        self
+    }
+    pub fn thumb_active_color(mut self, c: [f32; 4]) -> Self {
+        self.thumb_active_color = c;
+        self
+    }
+    pub fn thickness(mut self, px: f32) -> Self {
+        self.thickness = px;
+        self
+    }
+    pub fn min_thumb(mut self, px: f32) -> Self {
+        self.min_thumb = px;
+        self
+    }
+    pub fn margin(mut self, px: f32) -> Self {
+        self.margin = px;
+        self
+    }
+    pub fn inset_start(mut self, px: f32) -> Self {
+        self.inset_start = px;
+        self
+    }
+    pub fn radius(mut self, px: f32) -> Self {
+        self.radius = px;
+        self
+    }
+    pub fn y_side(mut self, side: BarSide) -> Self {
+        self.y_side = side;
+        self
+    }
+    pub fn x_side(mut self, side: BarSide) -> Self {
+        self.x_side = side;
+        self
+    }
+    pub fn fade(mut self, seconds: f32) -> Self {
+        self.fade_seconds = seconds.max(0.0);
+        self
+    }
+    pub fn auto_hide(mut self, on: bool) -> Self {
+        self.auto_hide = on;
+        self
+    }
+    pub fn always_visible(mut self, on: bool) -> Self {
+        self.always_visible = on;
+        self
+    }
 }
 
 /// One scrollbar AABB pair surfaced from flatten. Drives pointer
@@ -489,9 +540,7 @@ impl ColorMod {
     pub fn apply(self, base: [f32; 4]) -> [f32; 4] {
         match self {
             ColorMod::Fixed(c) => c,
-            ColorMod::AlphaScale(f) => {
-                [base[0], base[1], base[2], (base[3] * f).clamp(0.0, 1.0)]
-            }
+            ColorMod::AlphaScale(f) => [base[0], base[1], base[2], (base[3] * f).clamp(0.0, 1.0)],
         }
     }
 }
@@ -610,7 +659,6 @@ pub const SCROLL_INPUT_QUIESCE_SECONDS: f32 = 0.1;
 /// effect.
 pub const OVERSCROLL_LIMIT_LOGICAL: f32 = 60.0;
 
-
 impl Default for ScrollState {
     fn default() -> Self {
         Self {
@@ -719,6 +767,10 @@ pub struct Node {
     /// opaque longer then drops off, <1 drops fast then tapers). 0 → 1.
     pub edge_fade_falloff: f32,
     pub children: Vec<NodeId>,
+    /// Parent node, set by [`NodeTree::add_child`]. `None` for roots. Lets
+    /// hover/containment walk upward (e.g. ancestor-hover, so a container's
+    /// `on_hover` signal lights when any descendant is hovered).
+    pub parent: Option<NodeId>,
     pub interact: NodeInteract,
     pub text: Option<NodeText>,
     pub image: Option<ImageHandle>,
@@ -808,14 +860,23 @@ impl std::fmt::Debug for Node {
             .field("image", &self.image)
             .field("window_action", &self.window_action)
             .field("on_click", &self.on_click.as_ref().map(|_| "<handler>"))
-            .field("on_right_click", &self.on_right_click.as_ref().map(|_| "<handler>"))
-            .field("on_hover_dwell", &self.on_hover_dwell.as_ref().map(|(d, _)| ("<handler>", d)))
+            .field(
+                "on_right_click",
+                &self.on_right_click.as_ref().map(|_| "<handler>"),
+            )
+            .field(
+                "on_hover_dwell",
+                &self.on_hover_dwell.as_ref().map(|(d, _)| ("<handler>", d)),
+            )
             .field("interact_colors", &self.interact_colors)
             .field("editor", &self.editor)
             .field("lazy_list", &self.lazy_list)
             .field("dismiss_transparent", &self.dismiss_transparent)
             .field("on_drag", &self.on_drag.as_ref().map(|_| "<handler>"))
-            .field("drag_payload", &self.drag_payload.as_ref().map(|_| "<payload>"))
+            .field(
+                "drag_payload",
+                &self.drag_payload.as_ref().map(|_| "<payload>"),
+            )
             .field("on_drop", &self.on_drop.as_ref().map(|_| "<handler>"))
             .field("drag_follow", &self.drag_follow)
             .field("cursor", &self.cursor)
@@ -842,6 +903,7 @@ impl Node {
                 edge_fade: [0.0; 4],
                 edge_fade_falloff: 1.0,
                 children: Vec::new(),
+                parent: None,
                 interact: NodeInteract::default(),
                 text: None,
                 image: None,
@@ -990,7 +1052,10 @@ impl NodeBuilder {
     }
 
     pub fn scroll(self) -> Self {
-        self.overflow(crate::layout::Overflow::Scroll, crate::layout::Overflow::Scroll)
+        self.overflow(
+            crate::layout::Overflow::Scroll,
+            crate::layout::Overflow::Scroll,
+        )
     }
 
     pub fn scroll_x(self) -> Self {
@@ -1002,7 +1067,10 @@ impl NodeBuilder {
     }
 
     pub fn clip(self) -> Self {
-        self.overflow(crate::layout::Overflow::Hidden, crate::layout::Overflow::Hidden)
+        self.overflow(
+            crate::layout::Overflow::Hidden,
+            crate::layout::Overflow::Hidden,
+        )
     }
 
     /// Spring stiffness for scroll smoothing. Stored on the node's
@@ -1535,8 +1603,16 @@ impl NodeTree {
         if let Some(p) = self.get_mut_raw(parent) {
             p.children.push(id);
         }
+        if let Some(c) = self.get_mut_raw(id) {
+            c.parent = Some(parent);
+        }
         self.dirty |= dirty::TREE;
         id
+    }
+
+    /// Parent of `id`, or `None` for a root / missing node.
+    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
+        self.get(id).and_then(|n| n.parent)
     }
 
     /// Remove a single node from the arena. Prefer
@@ -1707,54 +1783,63 @@ impl NodeTree {
     pub fn set_layout_padding(&mut self, id: NodeId, padding: [f32; 4]) {
         let mask = self.transform_mask();
         if let Some(n) = self.get_mut_raw(id)
-            && n.layout.padding != padding {
-                n.layout.padding = padding;
-                self.dirty |= mask;
-            }
+            && n.layout.padding != padding
+        {
+            n.layout.padding = padding;
+            self.dirty |= mask;
+        }
     }
 
     pub fn set_layout_gap(&mut self, id: NodeId, gap: f32) {
         let mask = self.transform_mask();
         if let Some(n) = self.get_mut_raw(id)
-            && n.layout.gap != gap {
-                n.layout.gap = gap;
-                self.dirty |= mask;
-            }
+            && n.layout.gap != gap
+        {
+            n.layout.gap = gap;
+            self.dirty |= mask;
+        }
     }
 
     pub fn set_layout_justify(&mut self, id: NodeId, j: Justify) {
         let mask = self.transform_mask();
         if let Some(n) = self.get_mut_raw(id)
-            && n.layout.justify != j {
-                n.layout.justify = j;
-                self.dirty |= mask;
-            }
+            && n.layout.justify != j
+        {
+            n.layout.justify = j;
+            self.dirty |= mask;
+        }
     }
 
     pub fn set_layout_align(&mut self, id: NodeId, a: Align) {
         let mask = self.transform_mask();
         if let Some(n) = self.get_mut_raw(id)
-            && n.layout.align != a {
-                n.layout.align = a;
-                self.dirty |= mask;
-            }
+            && n.layout.align != a
+        {
+            n.layout.align = a;
+            self.dirty |= mask;
+        }
     }
 
     pub fn set_layout_axis(&mut self, id: NodeId, ax: Axis) {
         let mask = self.transform_mask();
         if let Some(n) = self.get_mut_raw(id)
-            && n.layout.axis != ax {
-                n.layout.axis = ax;
-                self.dirty |= mask;
-            }
+            && n.layout.axis != ax
+        {
+            n.layout.axis = ax;
+            self.dirty |= mask;
+        }
     }
 
     /// Set per-axis overflow. Allocates `ScrollState` on the node when
     /// either axis becomes Scroll; clears it when both axes drop back
     /// to Visible/Hidden. Maintains `scrollable_ids` so the frame
     /// loop's scroll tick has an O(1) iteration list.
-    pub fn set_layout_overflow(&mut self, id: NodeId, ox: crate::layout::Overflow,
-                               oy: crate::layout::Overflow) {
+    pub fn set_layout_overflow(
+        &mut self,
+        id: NodeId,
+        ox: crate::layout::Overflow,
+        oy: crate::layout::Overflow,
+    ) {
         use crate::layout::Overflow;
         let mask = self.transform_mask();
         let mut allocated = false;
@@ -1851,11 +1936,10 @@ impl NodeTree {
                 // — the spring's natural oscillation is what produces
                 // the "alive" feel; gating on cur_oor would freeze it
                 // mid-cycle.
-                let bouncing =
-                    target_in_range && (already_bouncing || cur_oor);
+                let bouncing = target_in_range && (already_bouncing || cur_oor);
                 if bouncing {
-                    let target_shifted = already_bouncing
-                        && (s.bounce_target[axis] - tgt).abs() > 0.5;
+                    let target_shifted =
+                        already_bouncing && (s.bounce_target[axis] - tgt).abs() > 0.5;
                     if !already_bouncing || target_shifted {
                         s.bounce_from[axis] = cur;
                         s.bounce_target[axis] = tgt;
@@ -2333,19 +2417,20 @@ impl NodeTree {
     pub fn set_color(&mut self, id: NodeId, color: [f32; 4]) {
         let has_glass = self.has_glass();
         if let Some(n) = self.get_mut_raw(id)
-            && n.style.color != color {
-                // Only re-run the blur if this node feeds the backdrop
-                // (sits behind the glass — `blur_source`). A front-of-glass
-                // recolour (accent pill, hover tint, …) paints on top of
-                // the glass and can't change what it blurs, so flagging
-                // BACKDROP for it just burns GPU on a redundant blur.
-                let bs = n.blur_source;
-                n.style.color = color;
-                self.dirty |= dirty::VISUAL;
-                if bs && has_glass {
-                    self.dirty |= dirty::BACKDROP;
-                }
+            && n.style.color != color
+        {
+            // Only re-run the blur if this node feeds the backdrop
+            // (sits behind the glass — `blur_source`). A front-of-glass
+            // recolour (accent pill, hover tint, …) paints on top of
+            // the glass and can't change what it blurs, so flagging
+            // BACKDROP for it just burns GPU on a redundant blur.
+            let bs = n.blur_source;
+            n.style.color = color;
+            self.dirty |= dirty::VISUAL;
+            if bs && has_glass {
+                self.dirty |= dirty::BACKDROP;
             }
+        }
     }
 
     /// Swap an image node's texture handle (or clear it with `None`).
@@ -2373,50 +2458,55 @@ impl NodeTree {
 
     pub fn set_opacity(&mut self, id: NodeId, opacity: f32) {
         if let Some(n) = self.get_mut_raw(id)
-            && n.style.opacity != opacity {
-                n.style.opacity = opacity;
-                self.dirty |= dirty::VISUAL;
-            }
+            && n.style.opacity != opacity
+        {
+            n.style.opacity = opacity;
+            self.dirty |= dirty::VISUAL;
+        }
     }
 
     /// Runtime visual-scale setter. Layout + hit-test are untouched —
     /// only the rendered geometry scales around the rect centre.
     pub fn set_scale_xy(&mut self, id: NodeId, scale: [f32; 2]) {
         if let Some(n) = self.get_mut_raw(id)
-            && n.style.scale != scale {
-                n.style.scale = scale;
-                self.dirty |= dirty::VISUAL;
-            }
+            && n.style.scale != scale
+        {
+            n.style.scale = scale;
+            self.dirty |= dirty::VISUAL;
+        }
     }
 
     pub fn set_text(&mut self, id: NodeId, content: impl Into<String>) {
         let content = content.into();
         if let Some(n) = self.get_mut_raw(id)
             && let Some(t) = n.text.as_mut()
-                && t.content != content {
-                    t.content = content;
-                    // Text width changes → relayout (Auto-sized text).
-                    self.dirty |= dirty::VISUAL | dirty::TRANSFORM;
-                }
+            && t.content != content
+        {
+            t.content = content;
+            // Text width changes → relayout (Auto-sized text).
+            self.dirty |= dirty::VISUAL | dirty::TRANSFORM;
+        }
     }
 
     pub fn set_font_size(&mut self, id: NodeId, font_size: f32) {
         if let Some(n) = self.get_mut_raw(id)
             && let Some(t) = n.text.as_mut()
-                && t.font_size != font_size {
-                    let old_ratio = t.line_height / t.font_size.max(0.0001);
-                    t.font_size = font_size;
-                    t.line_height = font_size * old_ratio;
-                    self.dirty |= dirty::VISUAL | dirty::TRANSFORM;
-                }
+            && t.font_size != font_size
+        {
+            let old_ratio = t.line_height / t.font_size.max(0.0001);
+            t.font_size = font_size;
+            t.line_height = font_size * old_ratio;
+            self.dirty |= dirty::VISUAL | dirty::TRANSFORM;
+        }
     }
 
     pub fn set_visible(&mut self, id: NodeId, visible: bool) {
         if let Some(n) = self.get_mut_raw(id)
-            && n.visible != visible {
-                n.visible = visible;
-                self.dirty |= dirty::TREE;
-            }
+            && n.visible != visible
+        {
+            n.visible = visible;
+            self.dirty |= dirty::TREE;
+        }
     }
 
     pub fn dirty(&self) -> u32 {
@@ -2478,10 +2568,11 @@ impl NodeTree {
     /// otherwise notice). No-op on non-lazy_list nodes.
     pub fn invalidate_lazy_list(&mut self, id: NodeId) {
         if let Some(n) = self.get_mut_raw(id)
-            && let Some(ll) = n.lazy_list.as_mut() {
-                ll.version = ll.version.wrapping_add(1);
-                self.dirty |= dirty::TRANSFORM;
-            }
+            && let Some(ll) = n.lazy_list.as_mut()
+        {
+            ll.version = ll.version.wrapping_add(1);
+            self.dirty |= dirty::TRANSFORM;
+        }
     }
 
     /// Resize a lazy-list. Setting a different `item_count` adjusts
@@ -2490,18 +2581,19 @@ impl NodeTree {
     pub fn set_lazy_list_count(&mut self, id: NodeId, item_count: u32) {
         if let Some(n) = self.get_mut_raw(id)
             && let Some(ll) = n.lazy_list.as_mut()
-                && ll.item_count != item_count {
-                    ll.item_count = item_count;
-                    ll.version = ll.version.wrapping_add(1);
-                    // If a row_heights vec exists, keep it in sync with
-                    // the new row count. New rows take `item_height`.
-                    if let Some(heights) = ll.row_heights.as_mut() {
-                        heights.resize(item_count as usize, ll.item_height);
-                        ll.heights_version = ll.heights_version.wrapping_add(1);
-                        ll.first_dirty_row = 0;
-                    }
-                    self.dirty |= dirty::TRANSFORM;
-                }
+            && ll.item_count != item_count
+        {
+            ll.item_count = item_count;
+            ll.version = ll.version.wrapping_add(1);
+            // If a row_heights vec exists, keep it in sync with
+            // the new row count. New rows take `item_height`.
+            if let Some(heights) = ll.row_heights.as_mut() {
+                heights.resize(item_count as usize, ll.item_height);
+                ll.heights_version = ll.heights_version.wrapping_add(1);
+                ll.first_dirty_row = 0;
+            }
+            self.dirty |= dirty::TRANSFORM;
+        }
     }
 
     /// Set the logical height of row `row` on a lazy-list. Switches
@@ -2527,10 +2619,11 @@ impl NodeTree {
     /// Replace every row's height in one call. Wholesale invalidation.
     pub fn set_lazy_list_row_heights(&mut self, id: NodeId, heights: Vec<f32>) {
         if let Some(n) = self.get_mut_raw(id)
-            && let Some(ll) = n.lazy_list.as_mut() {
-                ll.set_row_heights(heights);
-                self.dirty |= dirty::TRANSFORM;
-            }
+            && let Some(ll) = n.lazy_list.as_mut()
+        {
+            ll.set_row_heights(heights);
+            self.dirty |= dirty::TRANSFORM;
+        }
     }
 
     /// Iterate every live `NodeId` in the arena. Order is slot order
@@ -2539,15 +2632,12 @@ impl NodeTree {
     /// to find every node with a particular property without
     /// pre-building an index.
     pub fn iter_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| {
-                slot.payload.as_ref().map(|_| NodeId {
-                    index: i as u32,
-                    generation: slot.generation,
-                })
+        self.slots.iter().enumerate().filter_map(|(i, slot)| {
+            slot.payload.as_ref().map(|_| NodeId {
+                index: i as u32,
+                generation: slot.generation,
             })
+        })
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
@@ -2600,7 +2690,12 @@ impl NodeTree {
     pub fn flatten(
         &self,
         scale: f32,
-    ) -> (Vec<FlatEvent>, Vec<HitEntry>, Vec<ScrollHit>, Vec<ScrollbarHit>) {
+    ) -> (
+        Vec<FlatEvent>,
+        Vec<HitEntry>,
+        Vec<ScrollHit>,
+        Vec<ScrollbarHit>,
+    ) {
         let mut events = Vec::with_capacity(self.len());
         let mut hits = Vec::new();
         let mut scroll_hits = Vec::new();
@@ -2776,44 +2871,40 @@ impl NodeTree {
                 let no_fill = st.color[3] <= 0.0;
                 let no_border = st.border_width <= 0.0 || st.border_color[3] <= 0.0;
                 let no_shadow = st.shadow_opacity <= 0.0 || st.shadow_color[3] <= 0.0;
-                let invisible = !is_glass && (opacity <= 0.0 || (no_fill && no_border && no_shadow));
+                let invisible =
+                    !is_glass && (opacity <= 0.0 || (no_fill && no_border && no_shadow));
                 // For glass, repurpose backdrop_uv_rect.xy to carry bevel
                 // params (the field is ignored by the glass branch's UV
                 // sampling since glass uses screen-space UVs).
                 let extras = if is_glass {
-                    [
-                        node.style.blur_amount,
-                        node.style.refraction,
-                        0.0,
-                        0.0,
-                    ]
+                    [node.style.blur_amount, node.style.refraction, 0.0, 0.0]
                 } else {
                     [0.0; 4]
                 };
                 if invisible {
                     // no-op: nothing to paint
                 } else {
-                events.push(FlatEvent::Shape(ShapeInstance {
-                    color: node.style.color,
-                    border_color: node.style.border_color,
-                    shadow_color: node.style.shadow_color,
-                    border_radius: node.style.border_radius,
-                    backdrop_uv_rect: extras,
-                    clip_rect: clip,
-                    position: abs,
-                    size,
-                    shadow_offset: node.style.shadow_offset,
-                    shape_kind: node.style.kind.as_u32()
-                        | ((node.style.border_sides.bits() as u32) << 8),
-                    roughness: node.style.roughness,
-                    border_width: node.style.border_width,
-                    shadow_blur: node.style.shadow_blur,
-                    shadow_opacity: node.style.shadow_opacity,
-                    opacity,
-                    scale: node.style.scale,
-                    clip_radius,
-                    _pad1: 0.0,
-                }));
+                    events.push(FlatEvent::Shape(ShapeInstance {
+                        color: node.style.color,
+                        border_color: node.style.border_color,
+                        shadow_color: node.style.shadow_color,
+                        border_radius: node.style.border_radius,
+                        backdrop_uv_rect: extras,
+                        clip_rect: clip,
+                        position: abs,
+                        size,
+                        shadow_offset: node.style.shadow_offset,
+                        shape_kind: node.style.kind.as_u32()
+                            | ((node.style.border_sides.bits() as u32) << 8),
+                        roughness: node.style.roughness,
+                        border_width: node.style.border_width,
+                        shadow_blur: node.style.shadow_blur,
+                        shadow_opacity: node.style.shadow_opacity,
+                        opacity,
+                        scale: node.style.scale,
+                        clip_radius,
+                        _pad1: 0.0,
+                    }));
                 }
             }
             ShapeKind::Text => {
@@ -2860,7 +2951,12 @@ impl NodeTree {
         {
             hits.push(HitEntry {
                 node_id: id,
-                bounds: [hit_abs[0], hit_abs[1], hit_abs[0] + size[0], hit_abs[1] + size[1]],
+                bounds: [
+                    hit_abs[0],
+                    hit_abs[1],
+                    hit_abs[0] + size[0],
+                    hit_abs[1] + size[1],
+                ],
                 clip_rect: hit_clip,
             });
         }
@@ -2874,7 +2970,12 @@ impl NodeTree {
             chain.extend(scroll_stack.iter().rev().copied());
             scroll_hits.push(ScrollHit {
                 node_id: id,
-                bounds: [hit_abs[0], hit_abs[1], hit_abs[0] + size[0], hit_abs[1] + size[1]],
+                bounds: [
+                    hit_abs[0],
+                    hit_abs[1],
+                    hit_abs[0] + size[0],
+                    hit_abs[1] + size[1],
+                ],
                 clip_rect: hit_clip,
                 ancestor_chain: chain,
             });
@@ -2930,10 +3031,26 @@ impl NodeTree {
         } else {
             let cc = if node.layout.clips() {
                 let self_clip = [
-                    if node.layout.overflow_x.clips() { abs[0] } else { -1.0e30 },
-                    if node.layout.overflow_y.clips() { abs[1] } else { -1.0e30 },
-                    if node.layout.overflow_x.clips() { abs[0] + size[0] } else { 1.0e30 },
-                    if node.layout.overflow_y.clips() { abs[1] + size[1] } else { 1.0e30 },
+                    if node.layout.overflow_x.clips() {
+                        abs[0]
+                    } else {
+                        -1.0e30
+                    },
+                    if node.layout.overflow_y.clips() {
+                        abs[1]
+                    } else {
+                        -1.0e30
+                    },
+                    if node.layout.overflow_x.clips() {
+                        abs[0] + size[0]
+                    } else {
+                        1.0e30
+                    },
+                    if node.layout.overflow_y.clips() {
+                        abs[1] + size[1]
+                    } else {
+                        1.0e30
+                    },
                 ];
                 intersect_clip(clip, self_clip)
             } else {
@@ -2954,10 +3071,26 @@ impl NodeTree {
         // content-local into the layer texture above.
         let child_hit_clip = if node.layout.clips() {
             let self_clip = [
-                if node.layout.overflow_x.clips() { hit_abs[0] } else { -1.0e30 },
-                if node.layout.overflow_y.clips() { hit_abs[1] } else { -1.0e30 },
-                if node.layout.overflow_x.clips() { hit_abs[0] + size[0] } else { 1.0e30 },
-                if node.layout.overflow_y.clips() { hit_abs[1] + size[1] } else { 1.0e30 },
+                if node.layout.overflow_x.clips() {
+                    hit_abs[0]
+                } else {
+                    -1.0e30
+                },
+                if node.layout.overflow_y.clips() {
+                    hit_abs[1]
+                } else {
+                    -1.0e30
+                },
+                if node.layout.overflow_x.clips() {
+                    hit_abs[0] + size[0]
+                } else {
+                    1.0e30
+                },
+                if node.layout.overflow_y.clips() {
+                    hit_abs[1] + size[1]
+                } else {
+                    1.0e30
+                },
             ];
             intersect_clip(hit_clip, self_clip)
         } else {
@@ -3128,7 +3261,11 @@ fn emit_scrollbars(
     let bar_w = style.thickness * scale;
     let bar_margin = style.margin * scale;
     let min_thumb = style.min_thumb * scale;
-    let bar_alpha = if style.always_visible { 1.0 } else { s.bar_alpha };
+    let bar_alpha = if style.always_visible {
+        1.0
+    } else {
+        s.bar_alpha
+    };
     let visual = bar_alpha * opacity;
     let radius = style.radius;
 
@@ -3140,8 +3277,11 @@ fn emit_scrollbars(
                 BarSide::End => abs[0] + size[0] - bar_w - bar_margin,
                 BarSide::Start => abs[0] + bar_margin,
             };
-            let track_y = abs[1] + bar_margin;
-            let track_h = size[1] - bar_margin * 2.0;
+            // Inset the track's top (e.g. below a sticky header overlay)
+            // while keeping its bottom anchored.
+            let inset = style.inset_start * scale;
+            let track_y = abs[1] + bar_margin + inset;
+            let track_h = size[1] - bar_margin * 2.0 - inset;
             if track_h > 0.0 {
                 let visible_ratio = (size[1] / node.content_size[1]).clamp(0.0, 1.0);
                 let thumb_h = (track_h * visible_ratio).max(min_thumb).min(track_h);
@@ -3150,10 +3290,24 @@ fn emit_scrollbars(
                 let thumb_color = pick_thumb_color(style, s.bar_active[1], s.bar_hover[1]);
                 let track_rgba = scale_alpha(style.track_color, visual);
                 let thumb_rgba = scale_alpha(thumb_color, visual);
-                bar_quad(events, [track_x, track_y], [bar_w, track_h], track_rgba, radius, clip);
+                bar_quad(
+                    events,
+                    [track_x, track_y],
+                    [bar_w, track_h],
+                    track_rgba,
+                    radius,
+                    clip,
+                );
                 emit_scroll_thumb(
-                    events, spans, node_id, promote_thumb, radius, clip,
-                    [track_x, thumb_y], [bar_w, thumb_h], thumb_rgba,
+                    events,
+                    spans,
+                    node_id,
+                    promote_thumb,
+                    radius,
+                    clip,
+                    [track_x, thumb_y],
+                    [bar_w, thumb_h],
+                    thumb_rgba,
                 );
                 scroll_bars.push(ScrollbarHit {
                     node_id,
@@ -3197,10 +3351,24 @@ fn emit_scrollbars(
                 let thumb_color = pick_thumb_color(style, s.bar_active[0], s.bar_hover[0]);
                 let track_rgba = scale_alpha(style.track_color, visual);
                 let thumb_rgba = scale_alpha(thumb_color, visual);
-                bar_quad(events, [track_x, track_y], [track_w, bar_w], track_rgba, radius, clip);
+                bar_quad(
+                    events,
+                    [track_x, track_y],
+                    [track_w, bar_w],
+                    track_rgba,
+                    radius,
+                    clip,
+                );
                 emit_scroll_thumb(
-                    events, spans, node_id, promote_thumb, radius, clip,
-                    [thumb_x, track_y], [thumb_w, bar_w], thumb_rgba,
+                    events,
+                    spans,
+                    node_id,
+                    promote_thumb,
+                    radius,
+                    clip,
+                    [thumb_x, track_y],
+                    [thumb_w, bar_w],
+                    thumb_rgba,
                 );
                 scroll_bars.push(ScrollbarHit {
                     node_id,
@@ -3365,12 +3533,7 @@ fn snap_to_step(value: f32, step_logical: f32, scale: f32, max_off: f32) -> f32 
 /// runs after a wheel burst pushed `target` past edge with rubber-
 /// band so the spring lands in-range and on a multiple. Returns true
 /// if the target moved.
-fn settle_target(
-    s: &mut ScrollState,
-    rect: [f32; 4],
-    content: [f32; 2],
-    scale: f32,
-) -> bool {
+fn settle_target(s: &mut ScrollState, rect: [f32; 4], content: [f32; 2], scale: f32) -> bool {
     let max_off = [
         (content[0] - rect[2]).max(0.0),
         (content[1] - rect[3]).max(0.0),
@@ -3553,7 +3716,10 @@ mod tests {
         t.get_mut_raw(a).unwrap().rect = [0.0, 0.0, 10.0, 10.0];
         t.get_mut_raw(b).unwrap().rect = [0.0, 20.0, 10.0, 10.0];
         // Without follow: painter order is A then B.
-        assert_eq!(shape_positions(&t.flatten(1.0).0), vec![[0.0, 0.0], [0.0, 20.0]]);
+        assert_eq!(
+            shape_positions(&t.flatten(1.0).0),
+            vec![[0.0, 0.0], [0.0, 20.0]]
+        );
         // Follow A with a +5,+7 cursor delta.
         t.set_drag_follow(Some((a, [5.0, 7.0])));
         let positions = shape_positions(&t.flatten(1.0).0);
@@ -3754,7 +3920,10 @@ mod tests {
         t.set_layout_width(fg, Len::Px(50.0));
         let d = t.dirty_for_test();
         assert!(d & dirty::TRANSFORM != 0);
-        assert!(d & dirty::BACKDROP == 0, "front-of-glass layout must not re-blur");
+        assert!(
+            d & dirty::BACKDROP == 0,
+            "front-of-glass layout must not re-blur"
+        );
 
         t.take_dirty();
         t.set_layout_width(bg, Len::Px(60.0));
@@ -3779,7 +3948,11 @@ mod tests {
         let mut t = NodeTree::new();
         let id = t.add_root(Node::rect().build());
         assert!(t.get(id).unwrap().scroll.is_none());
-        t.set_layout_overflow(id, crate::layout::Overflow::Scroll, crate::layout::Overflow::Visible);
+        t.set_layout_overflow(
+            id,
+            crate::layout::Overflow::Scroll,
+            crate::layout::Overflow::Visible,
+        );
         assert!(t.get(id).unwrap().scroll.is_some());
     }
 
@@ -3793,7 +3966,10 @@ mod tests {
             n.content_size = [200.0, 200.0];
         }
         let applied = t.add_scroll_delta(id, [0.0, 200.0]);
-        assert!((applied[1] - 100.0).abs() < 0.01, "clamped applied = {applied:?}");
+        assert!(
+            (applied[1] - 100.0).abs() < 0.01,
+            "clamped applied = {applied:?}"
+        );
         // Already at edge — next push should report zero applied so
         // wheel routing can bubble.
         let again = t.add_scroll_delta(id, [0.0, 50.0]);
@@ -3860,7 +4036,11 @@ mod tests {
         let mut t = NodeTree::new();
         // Opt the backdrop image in via `blur_source`; only then does its
         // colour change re-run the blur.
-        let img = t.add_root(Node::image(crate::gpu::ImageHandle(0)).blur_source().build());
+        let img = t.add_root(
+            Node::image(crate::gpu::ImageHandle(0))
+                .blur_source()
+                .build(),
+        );
         let _glass = t.add_root(Node::glass().build());
         t.take_dirty();
         t.set_color(img, [1.0, 1.0, 1.0, 0.5]);
@@ -3972,8 +4152,7 @@ mod tests {
     #[test]
     fn snap_step_retargets_to_nearest_multiple_after_settle() {
         let mut t = NodeTree::new();
-        let id = t
-            .add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
+        let id = t.add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 1000.0];
@@ -3999,8 +4178,7 @@ mod tests {
         // snap point) — the alternative (100) would clip the bottom of
         // the list with 30 px of empty space below the last "row".
         let mut t = NodeTree::new();
-        let id = t
-            .add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
+        let id = t.add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 230.0];
@@ -4018,8 +4196,7 @@ mod tests {
     fn snap_step_lands_on_multiple_when_far_from_edge() {
         // Mid-list scroll: nearest multiple is closer than max_off.
         let mut t = NodeTree::new();
-        let id = t
-            .add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
+        let id = t.add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 1000.0]; // max_off = 900
@@ -4042,12 +4219,7 @@ mod tests {
         // produces an asymptotic stretch — never a runaway "scroll out
         // of view" — so the visual matches native scrollbar behaviour.
         let mut t = NodeTree::new();
-        let id = t.add_root(
-            Node::rect()
-                .scroll_y()
-                .overscroll(true)
-                .build(),
-        );
+        let id = t.add_root(Node::rect().scroll_y().overscroll(true).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 500.0]; // max_off = 400, limit = 60
@@ -4097,7 +4269,10 @@ mod tests {
         crate::input::end_drag(id, ScrollAxis::Y, &mut t);
         let s = t.get(id).unwrap().scroll.unwrap();
         assert_eq!(s.target[1], 400.0, "target should retarget to max_off");
-        assert!(s.current[1] > 400.0, "current still past edge ready to bounce");
+        assert!(
+            s.current[1] > 400.0,
+            "current still past edge ready to bounce"
+        );
     }
 
     #[test]
@@ -4105,15 +4280,17 @@ mod tests {
         // Snap-on-input: target lands on the nearest multiple right
         // away. No "settle then jump" pause once the spring catches up.
         let mut t = NodeTree::new();
-        let id = t
-            .add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
+        let id = t.add_root(Node::rect().scroll_y().snap_step_y(50.0).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 1000.0];
         }
         let _ = t.add_scroll_delta(id, [0.0, 38.0]);
         let s = t.get(id).unwrap().scroll.unwrap();
-        assert_eq!(s.target[1], 50.0, "target should snap on input, not on settle");
+        assert_eq!(
+            s.target[1], 50.0,
+            "target should snap on input, not on settle"
+        );
         // current still 0 — spring will chase 50.
         assert_eq!(s.current[1], 0.0);
     }
@@ -4125,12 +4302,7 @@ mod tests {
         // budget covers the full damped oscillation including any
         // small undershoot — well past the perceptual settle (~250ms).
         let mut t = NodeTree::new();
-        let id = t.add_root(
-            Node::rect()
-                .scroll_y()
-                .overscroll(true)
-                .build(),
-        );
+        let id = t.add_root(Node::rect().scroll_y().overscroll(true).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 200.0];
@@ -4147,7 +4319,10 @@ mod tests {
         }
         let s = t.get(id).unwrap().scroll.unwrap();
         assert_eq!(s.current[1], 100.0, "bounce should settle within 1s");
-        assert_eq!(s.bounce_elapsed[1], -1.0, "bounce flag must reset on settle");
+        assert_eq!(
+            s.bounce_elapsed[1], -1.0,
+            "bounce flag must reset on settle"
+        );
     }
 
     #[test]
@@ -4158,12 +4333,7 @@ mod tests {
         // event would re-saturate it and the resulting target
         // oscillation reads as a jerk.
         let mut t = NodeTree::new();
-        let id = t.add_root(
-            Node::rect()
-                .scroll_y()
-                .overscroll(true)
-                .build(),
-        );
+        let id = t.add_root(Node::rect().scroll_y().overscroll(true).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 200.0]; // max_off = 100
@@ -4213,12 +4383,7 @@ mod tests {
         // at least once — that's what gives the "alive" feel vs the
         // monotonic exponential ease used for forward chase.
         let mut t = NodeTree::new();
-        let id = t.add_root(
-            Node::rect()
-                .scroll_y()
-                .overscroll(true)
-                .build(),
-        );
+        let id = t.add_root(Node::rect().scroll_y().overscroll(true).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 200.0]; // max_off = 100
@@ -4247,12 +4412,7 @@ mod tests {
     #[test]
     fn rubber_band_engages_only_after_first_edge_stop() {
         let mut t = NodeTree::new();
-        let id = t.add_root(
-            Node::rect()
-                .scroll_y()
-                .overscroll(true)
-                .build(),
-        );
+        let id = t.add_root(Node::rect().scroll_y().overscroll(true).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 200.0]; // max_off = 100
@@ -4280,12 +4440,7 @@ mod tests {
         // asymptote engage. Prevents the "forced" feel of rubber-band
         // on a single fast wheel event.
         let mut t = NodeTree::new();
-        let id = t.add_root(
-            Node::rect()
-                .scroll_y()
-                .overscroll(true)
-                .build(),
-        );
+        let id = t.add_root(Node::rect().scroll_y().overscroll(true).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 200.0];
@@ -4301,12 +4456,7 @@ mod tests {
     #[test]
     fn rubber_band_caps_at_max_plus_limit() {
         let mut t = NodeTree::new();
-        let id = t.add_root(
-            Node::rect()
-                .scroll_y()
-                .overscroll(true)
-                .build(),
-        );
+        let id = t.add_root(Node::rect().scroll_y().overscroll(true).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 200.0]; // max_off = 100, limit = 100
@@ -4317,18 +4467,17 @@ mod tests {
             let _ = t.add_scroll_delta(id, [0.0, 1000.0]);
         }
         let s = t.get(id).unwrap().scroll.unwrap();
-        assert!(s.target[1] < 200.0, "must cap below limit, got {}", s.target[1]);
+        assert!(
+            s.target[1] < 200.0,
+            "must cap below limit, got {}",
+            s.target[1]
+        );
     }
 
     #[test]
     fn overscroll_target_settles_back_into_range() {
         let mut t = NodeTree::new();
-        let id = t.add_root(
-            Node::rect()
-                .scroll_y()
-                .overscroll(true)
-                .build(),
-        );
+        let id = t.add_root(Node::rect().scroll_y().overscroll(true).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 200.0]; // max_off = 100
@@ -4350,12 +4499,7 @@ mod tests {
     #[test]
     fn rubber_band_unwinds_freely_toward_range() {
         let mut t = NodeTree::new();
-        let id = t.add_root(
-            Node::rect()
-                .scroll_y()
-                .overscroll(true)
-                .build(),
-        );
+        let id = t.add_root(Node::rect().scroll_y().overscroll(true).build());
         if let Some(n) = t.get_mut_raw(id) {
             n.rect = [0.0, 0.0, 100.0, 100.0];
             n.content_size = [100.0, 200.0];

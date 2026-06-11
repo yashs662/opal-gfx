@@ -99,9 +99,8 @@ impl InputState {
         let mut change = InputChange::default();
         if new_hover != self.hovered {
             self.hovered = new_hover;
-            change.hovered_changed = sync_bool_signals(hits, tree, self.hovered, |n| {
-                &n.interact.hover
-            });
+            change.hovered_changed =
+                sync_bool_signals(hits, tree, self.hovered, |n| &n.interact.hover);
         }
 
         if let Some(cap) = self.captured {
@@ -124,8 +123,7 @@ impl InputState {
         let mut change = InputChange::default();
         if self.hovered.is_some() {
             self.hovered = None;
-            change.hovered_changed =
-                sync_bool_signals(hits, tree, None, |n| &n.interact.hover);
+            change.hovered_changed = sync_bool_signals(hits, tree, None, |n| &n.interact.hover);
         }
         change
     }
@@ -140,8 +138,7 @@ impl InputState {
         };
         if self.focused != target {
             self.focused = target;
-            change.focused_changed =
-                sync_bool_signals(hits, tree, target, |n| &n.interact.focused);
+            change.focused_changed = sync_bool_signals(hits, tree, target, |n| &n.interact.focused);
         }
         change
     }
@@ -529,15 +526,14 @@ pub fn on_scroll_key(
     };
     // Resolve the target chain: cursor-over → its ancestor_chain;
     // else → first scrollable.
-    let chain: Vec<NodeId> = match cursor
-        .and_then(|[x, y]| scroll_hits.iter().rev().find(|h| h.contains(x, y)))
-    {
-        Some(hit) => hit.ancestor_chain.clone(),
-        None => match tree.scrollables().first().copied() {
-            Some(id) => vec![id],
-            None => return false,
-        },
-    };
+    let chain: Vec<NodeId> =
+        match cursor.and_then(|[x, y]| scroll_hits.iter().rev().find(|h| h.contains(x, y))) {
+            Some(hit) => hit.ancestor_chain.clone(),
+            None => match tree.scrollables().first().copied() {
+                Some(id) => vec![id],
+                None => return false,
+            },
+        };
     if let Some(d) = delta {
         let mut request = d;
         let mut moved = false;
@@ -574,12 +570,20 @@ pub fn on_scroll_key(
         // `on_key` for grid-style scrollers.
         let (target_x, target_y) = match (sx, sy) {
             (true, false) => (
-                if matches!(edge, JumpEdge::End) { max_off[0] } else { 0.0 },
+                if matches!(edge, JumpEdge::End) {
+                    max_off[0]
+                } else {
+                    0.0
+                },
                 0.0,
             ),
             (_, true) => (
                 0.0,
-                if matches!(edge, JumpEdge::End) { max_off[1] } else { 0.0 },
+                if matches!(edge, JumpEdge::End) {
+                    max_off[1]
+                } else {
+                    0.0
+                },
             ),
             (false, false) => return false,
         };
@@ -634,15 +638,14 @@ pub fn pump_held_scroll(
     if delta[0].abs() < f32::EPSILON && delta[1].abs() < f32::EPSILON {
         return false;
     }
-    let chain: Vec<NodeId> = match cursor
-        .and_then(|[x, y]| scroll_hits.iter().rev().find(|h| h.contains(x, y)))
-    {
-        Some(hit) => hit.ancestor_chain.clone(),
-        None => match tree.scrollables().first().copied() {
-            Some(id) => vec![id],
-            None => return false,
-        },
-    };
+    let chain: Vec<NodeId> =
+        match cursor.and_then(|[x, y]| scroll_hits.iter().rev().find(|h| h.contains(x, y))) {
+            Some(hit) => hit.ancestor_chain.clone(),
+            None => match tree.scrollables().first().copied() {
+                Some(id) => vec![id],
+                None => return false,
+            },
+        };
     let mut request = delta;
     let mut moved = false;
     for id in &chain {
@@ -667,15 +670,27 @@ fn sync_bool_signals(
     target: Option<NodeId>,
     select: impl Fn(&crate::node::Node) -> &Option<crate::signal::Signal<bool>>,
 ) -> bool {
+    // A node's hover/bool signal is on when it's the target OR an ancestor of
+    // it — so a container's `on_hover` lights when any descendant is hovered
+    // (e.g. a scroll strip revealing its arrow bars while the cursor sits over
+    // any tile inside it). Collect the target's parent chain (inclusive);
+    // depth is tiny, so a plain Vec scan is cheaper than a hash set.
+    let mut on_chain: Vec<NodeId> = Vec::new();
+    let mut cur = target;
+    while let Some(id) = cur {
+        on_chain.push(id);
+        cur = tree.parent(id);
+    }
     let mut changed = false;
     for entry in hits {
         if let Some(n) = tree.get(entry.node_id)
-            && let Some(sig) = select(n).as_ref() {
-                let on = Some(entry.node_id) == target;
-                if sig.set(on) {
-                    changed = true;
-                }
+            && let Some(sig) = select(n).as_ref()
+        {
+            let on = on_chain.contains(&entry.node_id);
+            if sig.set(on) {
+                changed = true;
             }
+        }
     }
     changed
 }
@@ -685,8 +700,15 @@ mod tests {
     use super::*;
     use crate::node::{Node, ScrollHit};
 
-    fn scrollable(t: &mut NodeTree, x: f32, y: f32, w: f32, h: f32, content: [f32; 2],
-                  axis: char) -> NodeId {
+    fn scrollable(
+        t: &mut NodeTree,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        content: [f32; 2],
+        axis: char,
+    ) -> NodeId {
         let b = match axis {
             'y' => Node::rect().scroll_y(),
             'x' => Node::rect().scroll_x(),
@@ -838,7 +860,11 @@ mod tests {
         let outcome = press_scrollbar([195.0, 195.0], &bars, &mut t);
         assert!(matches!(outcome, ScrollbarPress::JumpedToPosition));
         let s = t.get(id).unwrap().scroll.unwrap();
-        assert!(s.target[1] > 400.0, "target should jump near bottom: {:?}", s.target);
+        assert!(
+            s.target[1] > 400.0,
+            "target should jump near bottom: {:?}",
+            s.target
+        );
         assert_eq!(s.current[1], 0.0, "current shouldn't snap — spring chases");
     }
 
@@ -861,8 +887,15 @@ mod tests {
         );
         assert!(moved);
         let s = t.get(id).unwrap().scroll.unwrap();
-        assert!((s.current[1] - 400.0).abs() < 0.01, "current={:?}", s.current);
-        assert_eq!(s.target[1], s.current[1], "drag keeps target glued to current");
+        assert!(
+            (s.current[1] - 400.0).abs() < 0.01,
+            "current={:?}",
+            s.current
+        );
+        assert_eq!(
+            s.target[1], s.current[1],
+            "drag keeps target glued to current"
+        );
     }
 
     #[test]
@@ -885,21 +918,18 @@ mod tests {
         );
         assert!(moved);
         let s = t.get(id).unwrap().scroll.unwrap();
-        assert!((s.target[1] - 40.0).abs() < 0.01, "expected 40, got {}", s.target[1]);
+        assert!(
+            (s.target[1] - 40.0).abs() < 0.01,
+            "expected 40, got {}",
+            s.target[1]
+        );
     }
 
     #[test]
     fn arrow_falls_back_to_first_scrollable_without_cursor() {
         let mut t = NodeTree::new();
         let id = scrollable(&mut t, 0.0, 0.0, 200.0, 200.0, [200.0, 1000.0], 'y');
-        let moved = on_scroll_key(
-            KeyCode::ArrowDown,
-            None,
-            [200.0, 200.0],
-            1.0,
-            &[],
-            &mut t,
-        );
+        let moved = on_scroll_key(KeyCode::ArrowDown, None, [200.0, 200.0], 1.0, &[], &mut t);
         assert!(moved);
         let s = t.get(id).unwrap().scroll.unwrap();
         assert!(s.target[1] > 0.0);
@@ -976,14 +1006,7 @@ mod tests {
     fn unhandled_key_returns_false() {
         let mut t = NodeTree::new();
         let _id = scrollable(&mut t, 0.0, 0.0, 200.0, 200.0, [200.0, 1500.0], 'y');
-        let moved = on_scroll_key(
-            KeyCode::KeyA,
-            None,
-            [200.0, 200.0],
-            1.0,
-            &[],
-            &mut t,
-        );
+        let moved = on_scroll_key(KeyCode::KeyA, None, [200.0, 200.0], 1.0, &[], &mut t);
         assert!(!moved);
     }
 

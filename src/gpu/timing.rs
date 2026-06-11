@@ -282,6 +282,9 @@ pub struct FrameStats {
     pub raster_count: u32,
     /// Layers composited to the surface this frame.
     pub composite_count: u32,
+    /// Backdrop pyramid (re)builds this frame (full-screen opaque +
+    /// downsample each) — the dominant glass cost. 0 on idle/cached frames.
+    pub backdrop_builds: u32,
     /// Total bytes the layer textures occupy (projected in P1).
     pub layer_vram: u64,
 }

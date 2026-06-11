@@ -30,7 +30,11 @@ pub trait IntoNodeName {
 
 impl IntoNodeName for &str {
     fn into_node_name(self) -> Option<String> {
-        if self.is_empty() { None } else { Some(self.to_string()) }
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.to_string())
+        }
     }
 }
 
@@ -42,12 +46,18 @@ impl IntoNodeName for String {
 
 impl IntoNodeName for &String {
     fn into_node_name(self) -> Option<String> {
-        if self.is_empty() { None } else { Some(self.clone()) }
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.clone())
+        }
     }
 }
 
 impl IntoNodeName for () {
-    fn into_node_name(self) -> Option<String> { None }
+    fn into_node_name(self) -> Option<String> {
+        None
+    }
 }
 
 impl<T: IntoNodeName> IntoNodeName for Option<T> {
@@ -71,6 +81,11 @@ pub struct SceneCtx {
     /// (measure) and the GPU glyph-instance builder (shape + atlas
     /// upload).
     pub text: TextResources,
+    /// Display scale (physical px per logical px), kept in sync by the app
+    /// shell each frame. Lets per-frame hooks (`on_frame`) convert between
+    /// physical reads like [`NodeTree::scroll_offset`] and logical layout
+    /// units. Mirrors [`crate::event::EventCtx::scale`] for the frame path.
+    pub scale: f32,
 }
 
 impl Default for SceneCtx {
@@ -86,6 +101,7 @@ impl SceneCtx {
             names: HashMap::new(),
             binds: BindRegistry::default(),
             text: TextResources::new(),
+            scale: 1.0,
         }
     }
 
@@ -113,34 +129,28 @@ impl SceneCtx {
         }
         let dropped_set: std::collections::HashSet<NodeId> = dropped.iter().copied().collect();
 
-        let dropped_color_slots = tombstone_matching(
-            &mut self.binds.color,
-            &mut self.binds.color_free,
-            |s| dropped_set.contains(&s.node_id),
-        );
+        let dropped_color_slots =
+            tombstone_matching(&mut self.binds.color, &mut self.binds.color_free, |s| {
+                dropped_set.contains(&s.node_id)
+            });
         let dropped_position_slots = tombstone_matching(
             &mut self.binds.position,
             &mut self.binds.position_free,
             |s| dropped_set.contains(&s.node_id),
         );
-        let dropped_size_slots = tombstone_matching(
-            &mut self.binds.size,
-            &mut self.binds.size_free,
-            |s| dropped_set.contains(&s.node_id),
-        );
+        let dropped_size_slots =
+            tombstone_matching(&mut self.binds.size, &mut self.binds.size_free, |s| {
+                dropped_set.contains(&s.node_id)
+            });
         // Image binds have no timeline tweens, so their dropped indices
         // aren't surfaced in `SubtreeRemoval` (nothing to stop) — just
         // tombstone + free-list them for reuse.
-        let _ = tombstone_matching(
-            &mut self.binds.image,
-            &mut self.binds.image_free,
-            |s| dropped_set.contains(&s.node_id),
-        );
-        let _ = tombstone_matching(
-            &mut self.binds.text,
-            &mut self.binds.text_free,
-            |s| dropped_set.contains(&s.node_id),
-        );
+        let _ = tombstone_matching(&mut self.binds.image, &mut self.binds.image_free, |s| {
+            dropped_set.contains(&s.node_id)
+        });
+        let _ = tombstone_matching(&mut self.binds.text, &mut self.binds.text_free, |s| {
+            dropped_set.contains(&s.node_id)
+        });
         let _ = tombstone_matching(
             &mut self.binds.width_pct,
             &mut self.binds.width_pct_free,
@@ -156,11 +166,9 @@ impl SceneCtx {
             &mut self.binds.height_px_free,
             |s| dropped_set.contains(&s.node_id),
         );
-        let _ = tombstone_matching(
-            &mut self.binds.opacity,
-            &mut self.binds.opacity_free,
-            |s| dropped_set.contains(&s.node_id),
-        );
+        let _ = tombstone_matching(&mut self.binds.opacity, &mut self.binds.opacity_free, |s| {
+            dropped_set.contains(&s.node_id)
+        });
 
         // Prune any named-node entries pointing at dropped ids.
         self.names.retain(|_, v| !dropped_set.contains(v));
@@ -349,6 +357,10 @@ pub struct OpacityBindSlot {
     pub node_id: NodeId,
     pub bind: Bind<f32>,
     pub last_version: u64,
+    /// `Some` for an animated opacity bind — the timeline tweens this toward
+    /// the source value; `pump_animated_displays` pushes it into the node's
+    /// opacity each frame. `None` = snap directly (the original behaviour).
+    pub displayed: Option<Signal<f32>>,
 }
 
 /// A scoped scene cursor. Holds an implicit `parent` so nested
@@ -424,11 +436,7 @@ impl<'a> Scene<'a> {
     /// Default tint is `[1,1,1,1]` — chain `.color()`/`.rgba()` to tint.
     /// Default size is `Len::Auto`; chain `.size_px(w,h)` to fix size.
     /// Pass `()` for anon.
-    pub fn image(
-        &mut self,
-        name: impl IntoNodeName,
-        handle: ImageHandle,
-    ) -> NodeBuilderRef<'_> {
+    pub fn image(&mut self, name: impl IntoNodeName, handle: ImageHandle) -> NodeBuilderRef<'_> {
         self.spawn(name.into_node_name(), SpawnKind::Image(handle), Axis::Col)
     }
 
@@ -471,10 +479,7 @@ impl<'a> Scene<'a> {
                 },
             );
         }
-        NodeBuilderRef {
-            ctx: self.ctx,
-            id,
-        }
+        NodeBuilderRef { ctx: self.ctx, id }
     }
 
     /// Text node whose content tracks a reactive [`TextBind`] (a
@@ -508,10 +513,7 @@ impl<'a> Scene<'a> {
                 },
             );
         }
-        NodeBuilderRef {
-            ctx: self.ctx,
-            id,
-        }
+        NodeBuilderRef { ctx: self.ctx, id }
     }
 
     /// Virtualized fixed-height list. Acts as a scroll container; only
@@ -543,7 +545,9 @@ impl<'a> Scene<'a> {
         // overflow_y = Scroll so the existing scroll machinery
         // (ScrollState allocation, wheel routing, scroll bar) picks
         // it up.
-        let root_id = self.spawn(name.into_node_name(), SpawnKind::Rect, Axis::Col).id();
+        let root_id = self
+            .spawn(name.into_node_name(), SpawnKind::Rect, Axis::Col)
+            .id();
 
         // Force scroll-y on. Tree setter reconciles ScrollState +
         // scrollable_ids in one call.
@@ -603,17 +607,20 @@ impl<'a> Scene<'a> {
                 .color([0.20, 0.55, 0.95, 0.35])
                 .hidden()
                 .layout_abs(0.0, 0.0)
-                .layout_size(crate::layout::Len::Px(0.0), crate::layout::Len::Px(font_size))
+                .layout_size(
+                    crate::layout::Len::Px(0.0),
+                    crate::layout::Len::Px(font_size),
+                )
                 .build(),
         );
 
         // 2b. Spawn the text child. Content = value when non-empty.
         //    Empty value renders an empty Text node — placeholder
         //    handling is layered on later via `.placeholder()`.
-        let text_node = self.ctx.tree.add_child(
-            root_id,
-            Node::text(initial.clone(), font_size).build(),
-        );
+        let text_node = self
+            .ctx
+            .tree
+            .add_child(root_id, Node::text(initial.clone(), font_size).build());
 
         // 3. Spawn the caret. 2 logical-px wide rect, abs-positioned
         //    inside the parent. Initially hidden — visibility tracks
@@ -624,7 +631,10 @@ impl<'a> Scene<'a> {
                 .color([1.0, 1.0, 1.0, 0.9])
                 .hidden()
                 .layout_abs(0.0, 0.0)
-                .layout_size(crate::layout::Len::Px(2.0), crate::layout::Len::Px(font_size))
+                .layout_size(
+                    crate::layout::Len::Px(2.0),
+                    crate::layout::Len::Px(font_size),
+                )
                 .build(),
         );
 
@@ -655,12 +665,7 @@ impl<'a> Scene<'a> {
         }
     }
 
-    fn spawn(
-        &mut self,
-        name: Option<String>,
-        kind: SpawnKind,
-        axis: Axis,
-    ) -> NodeBuilderRef<'_> {
+    fn spawn(&mut self, name: Option<String>, kind: SpawnKind, axis: Axis) -> NodeBuilderRef<'_> {
         let mut node = match kind {
             SpawnKind::Rect => Node::rect().build(),
             SpawnKind::Glass => Node::glass().build(),
@@ -675,10 +680,7 @@ impl<'a> Scene<'a> {
         if let Some(n) = name {
             self.ctx.names.insert(n, id);
         }
-        NodeBuilderRef {
-            ctx: self.ctx,
-            id,
-        }
+        NodeBuilderRef { ctx: self.ctx, id }
     }
 }
 
@@ -827,9 +829,10 @@ impl<'a> NodeBuilderRef<'a> {
     /// on non-text nodes.
     pub fn max_width_px(&mut self, px: f32) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
-            && let Some(t) = n.text.as_mut() {
-                t.max_width = Some(px);
-            }
+            && let Some(t) = n.text.as_mut()
+        {
+            t.max_width = Some(px);
+        }
         self
     }
 
@@ -1018,6 +1021,13 @@ impl<'a> NodeBuilderRef<'a> {
             n.visible = initial > 0.001;
         }
         if !matches!(bind, Bind::Value(_)) {
+            // Animated binds tween a `displayed` signal (seeded to the
+            // current value); non-animated reactive binds snap.
+            let displayed = if bind.animation().is_some() {
+                Some(Signal::new(initial))
+            } else {
+                None
+            };
             alloc_slot(
                 &mut self.ctx.binds.opacity,
                 &mut self.ctx.binds.opacity_free,
@@ -1025,6 +1035,7 @@ impl<'a> NodeBuilderRef<'a> {
                     node_id: self.id,
                     bind,
                     last_version: initial_version,
+                    displayed,
                 },
             );
         }
@@ -1253,9 +1264,16 @@ impl<'a> NodeBuilderRef<'a> {
         &mut self,
         f: F,
     ) -> &mut Self {
-        self.ctx
-            .tree
-            .with_scrollbar_style(self.id, |s| *s = f(*s));
+        self.ctx.tree.with_scrollbar_style(self.id, |s| *s = f(*s));
+        self
+    }
+
+    /// Override a single lazy-list row's logical height (switches the list
+    /// into variable-height mode). Used to give a list a tall first "hero"
+    /// row that scrolls away with the content while the rest stay uniform.
+    /// No-op on a non-lazy-list node.
+    pub fn lazy_list_row_height(&mut self, row: u32, height: f32) -> &mut Self {
+        self.ctx.tree.set_lazy_list_row_height(self.id, row, height);
         self
     }
 
@@ -1449,9 +1467,10 @@ impl<'a> NodeBuilderRef<'a> {
 
     pub fn line_height(&mut self, h: f32) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
-            && let Some(t) = n.text.as_mut() {
-                t.line_height = h;
-            }
+            && let Some(t) = n.text.as_mut()
+        {
+            t.line_height = h;
+        }
         self
     }
 
@@ -1467,9 +1486,10 @@ impl<'a> NodeBuilderRef<'a> {
     /// fields.
     pub fn placeholder(&mut self, text: impl Into<String>) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
-            && let Some(ed) = n.editor.as_mut() {
-                ed.placeholder = text.into();
-            }
+            && let Some(ed) = n.editor.as_mut()
+        {
+            ed.placeholder = text.into();
+        }
         self
     }
 
@@ -1477,9 +1497,10 @@ impl<'a> NodeBuilderRef<'a> {
     /// No-op on non-text_field nodes.
     pub fn on_change<F: Fn(&str) + 'static>(&mut self, f: F) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
-            && let Some(ed) = n.editor.as_mut() {
-                ed.on_change = Some(std::rc::Rc::new(f));
-            }
+            && let Some(ed) = n.editor.as_mut()
+        {
+            ed.on_change = Some(std::rc::Rc::new(f));
+        }
         self
     }
 
@@ -1491,9 +1512,10 @@ impl<'a> NodeBuilderRef<'a> {
         F: for<'h> Fn(&mut crate::event::EventCtx<'h>) + 'static,
     {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
-            && let Some(ed) = n.editor.as_mut() {
-                ed.on_submit = Some(std::rc::Rc::new(f));
-            }
+            && let Some(ed) = n.editor.as_mut()
+        {
+            ed.on_submit = Some(std::rc::Rc::new(f));
+        }
         self
     }
 
@@ -1536,7 +1558,9 @@ impl<'a> NodeBuilderRef<'a> {
     /// fade-the-whole-subtree effect, animate `style.opacity` via a
     /// hand-rolled tween in an `on_hover` handler.
     pub fn hover_opacity(&mut self, factor: f32) -> &mut Self {
-        self.update_interact_colors(|ic| ic.hover = Some(crate::node::ColorMod::AlphaScale(factor)));
+        self.update_interact_colors(|ic| {
+            ic.hover = Some(crate::node::ColorMod::AlphaScale(factor))
+        });
         self.rebuild_color_sugar();
         self
     }
@@ -1545,7 +1569,9 @@ impl<'a> NodeBuilderRef<'a> {
     /// node's alpha by `factor` while pressed. Same scope (own fill,
     /// not subtree) and same chaining semantics as `press_color`.
     pub fn press_opacity(&mut self, factor: f32) -> &mut Self {
-        self.update_interact_colors(|ic| ic.press = Some(crate::node::ColorMod::AlphaScale(factor)));
+        self.update_interact_colors(|ic| {
+            ic.press = Some(crate::node::ColorMod::AlphaScale(factor))
+        });
         self.rebuild_color_sugar();
         self
     }
@@ -1556,15 +1582,14 @@ impl<'a> NodeBuilderRef<'a> {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
             // Live base: the node's last `.color(...)` bind if any,
             // otherwise a constant snapshot of the resting fill.
-            let base = n
-                .color_bind
-                .clone()
-                .unwrap_or(Bind::Value(n.style.color));
-            let ic = n.interact_colors.get_or_insert(crate::node::InteractColors {
-                base,
-                hover: None,
-                press: None,
-            });
+            let base = n.color_bind.clone().unwrap_or(Bind::Value(n.style.color));
+            let ic = n
+                .interact_colors
+                .get_or_insert(crate::node::InteractColors {
+                    base,
+                    hover: None,
+                    press: None,
+                });
             f(ic);
         }
     }
@@ -1651,21 +1676,13 @@ impl<'a> NodeBuilderRef<'a> {
             (Some(hm), None) => {
                 let h = self.ensure_hover_signal();
                 crate::reactive::Computed::new(crate::deps!(base, h), move |(b, h)| {
-                    if h {
-                        hm.apply(b)
-                    } else {
-                        b
-                    }
+                    if h { hm.apply(b) } else { b }
                 })
             }
             (None, Some(pm)) => {
                 let p = self.ensure_press_signal();
                 crate::reactive::Computed::new(crate::deps!(base, p), move |(b, p)| {
-                    if p {
-                        pm.apply(b)
-                    } else {
-                        b
-                    }
+                    if p { pm.apply(b) } else { b }
                 })
             }
             (None, None) => return,
@@ -1871,8 +1888,8 @@ impl<'a> NodeBuilderRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reactive::{animated, Computed};
     use crate::Curve;
+    use crate::reactive::{Computed, animated};
     use std::time::Duration;
 
     #[test]
@@ -1888,7 +1905,10 @@ mod tests {
                 .id()
         };
         let n = ctx.tree.get(id).unwrap();
-        let ic = n.interact_colors.as_ref().expect("interact_colors not allocated");
+        let ic = n
+            .interact_colors
+            .as_ref()
+            .expect("interact_colors not allocated");
         assert_eq!(ic.base.read(), BASE);
         let hover = ic.hover.expect("hover color not set").apply(BASE);
         assert_eq!(hover[0..3], BASE[0..3]);
@@ -1978,7 +1998,11 @@ mod tests {
     fn computed_color_registers_bind_with_initial_value() {
         let lit = Signal::new(false);
         let c = Computed::new((lit.clone(),), |(l,)| {
-            if l { [0.0, 1.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0, 1.0] }
+            if l {
+                [0.0, 1.0, 0.0, 1.0]
+            } else {
+                [1.0, 0.0, 0.0, 1.0]
+            }
         });
         let mut ctx = SceneCtx::new();
         {
@@ -1997,10 +2021,11 @@ mod tests {
         let mut ctx = SceneCtx::new();
         {
             let mut scene = Scene::root(&mut ctx);
-            scene
-                .rect("a")
-                .size_px(10.0, 10.0)
-                .color(animated(s.clone(), Curve::EaseInOut, Duration::from_millis(220)));
+            scene.rect("a").size_px(10.0, 10.0).color(animated(
+                s.clone(),
+                Curve::EaseInOut,
+                Duration::from_millis(220),
+            ));
         }
         let slot = ctx.binds.color[0].as_ref().unwrap();
         assert!(slot.displayed.is_some());
@@ -2028,10 +2053,11 @@ mod tests {
         let mut ctx = SceneCtx::new();
         {
             let mut scene = Scene::root(&mut ctx);
-            scene
-                .rect("a")
-                .size_px(10.0, 10.0)
-                .pos(animated(s.clone(), Curve::Linear, Duration::from_millis(100)));
+            scene.rect("a").size_px(10.0, 10.0).pos(animated(
+                s.clone(),
+                Curve::Linear,
+                Duration::from_millis(100),
+            ));
         }
         let slot = ctx.binds.position[0].as_ref().unwrap();
         assert!(slot.displayed.is_some());
@@ -2076,11 +2102,17 @@ mod tests {
         let mut ctx = SceneCtx::new();
         {
             let mut scene = Scene::root(&mut ctx);
-            scene.rect("a").rgba(BASE[0], BASE[1], BASE[2], BASE[3]).hover_color(HOVER);
+            scene
+                .rect("a")
+                .rgba(BASE[0], BASE[1], BASE[2], BASE[3])
+                .hover_color(HOVER);
         }
         let id = ctx.node("a").unwrap();
         let n = ctx.tree.get(id).unwrap();
-        assert!(n.interact.hover.is_some(), "hover signal should be allocated");
+        assert!(
+            n.interact.hover.is_some(),
+            "hover signal should be allocated"
+        );
         assert!(n.interact_colors.is_some());
         assert_eq!(n.interact_colors.as_ref().unwrap().base.read(), BASE);
         assert_eq!(ctx.binds.color.len(), 1);
@@ -2093,7 +2125,10 @@ mod tests {
         let mut ctx = SceneCtx::new();
         {
             let mut scene = Scene::root(&mut ctx);
-            scene.rect("a").rgba(BASE[0], BASE[1], BASE[2], BASE[3]).hover_color(HOVER);
+            scene
+                .rect("a")
+                .rgba(BASE[0], BASE[1], BASE[2], BASE[3])
+                .hover_color(HOVER);
         }
         let id = ctx.node("a").unwrap();
         let hover_sig = ctx.tree.get(id).unwrap().interact.hover.clone().unwrap();
@@ -2110,7 +2145,10 @@ mod tests {
         let mut ctx = SceneCtx::new();
         {
             let mut scene = Scene::root(&mut ctx);
-            scene.rect("a").rgba(BASE[0], BASE[1], BASE[2], BASE[3]).press_color(PRESS);
+            scene
+                .rect("a")
+                .rgba(BASE[0], BASE[1], BASE[2], BASE[3])
+                .press_color(PRESS);
         }
         let id = ctx.node("a").unwrap();
         let n = ctx.tree.get(id).unwrap();
@@ -2219,18 +2257,12 @@ mod tests {
         let mut ctx = SceneCtx::new();
         {
             let mut scene = Scene::root(&mut ctx);
-            scene
-                .col("parent")
-                .color(pa.clone())
-                .child(|p| {
-                    p.rect("child").color(ca.clone());
-                });
+            scene.col("parent").color(pa.clone()).child(|p| {
+                p.rect("child").color(ca.clone());
+            });
         }
         // Two slots registered.
-        assert_eq!(
-            ctx.binds.color.iter().filter(|s| s.is_some()).count(),
-            2
-        );
+        assert_eq!(ctx.binds.color.iter().filter(|s| s.is_some()).count(), 2);
         let parent_id = ctx.node("parent").unwrap();
         let removal = ctx.remove_subtree(parent_id);
         // Both slots now tombstoned.
@@ -2335,9 +2367,7 @@ mod tests {
         let mut ctx = SceneCtx::new();
         {
             let mut scene = Scene::root(&mut ctx);
-            scene
-                .text_field("box", "", 14.0)
-                .placeholder("Search…");
+            scene.text_field("box", "", 14.0).placeholder("Search…");
         }
         let id = ctx.node("box").unwrap();
         let ed = ctx.tree.get(id).unwrap().editor.as_ref().unwrap();
@@ -2370,7 +2400,7 @@ mod tests {
     fn editor_apply_threads_through_state() {
         // End-to-end on the editor module's apply fn — verify
         // SceneCtx-built EditorState mutates the same way.
-        use crate::editor::{apply, EditOp};
+        use crate::editor::{EditOp, apply};
         let mut ctx = SceneCtx::new();
         {
             let mut scene = Scene::root(&mut ctx);

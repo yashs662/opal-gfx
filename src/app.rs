@@ -60,6 +60,7 @@ const RESIZE_GUTTER: f32 = 6.0;
 const BIND_TWEEN_KEY_COLOR: u32 = 0xC000_0000;
 const BIND_TWEEN_KEY_POSITION: u32 = 0xC100_0000;
 const BIND_TWEEN_KEY_SIZE: u32 = 0xC200_0000;
+const BIND_TWEEN_KEY_OPACITY: u32 = 0xC300_0000;
 /// Dedicated tween key for the drag-follow snap-back animation. Lives
 /// above the bind-tween windows so it can never alias a slot tween.
 const DRAG_RETURN_TWEEN_KEY: u32 = 0xD000_0000;
@@ -576,8 +577,7 @@ impl App {
     /// [`Self::stage_image_png`].
     pub fn stage_image_rgba(&mut self, w: u32, h: u32, bytes: Vec<u8>) -> ImageHandle {
         let id = self.staged_images.len() as u32;
-        self.staged_images
-            .push(StagedImage::Rgba { w, h, bytes });
+        self.staged_images.push(StagedImage::Rgba { w, h, bytes });
         ImageHandle(id)
     }
 
@@ -646,7 +646,6 @@ impl App {
         self.config.capture_dir = dir.into();
         self
     }
-
 
     /// Capture `frames` still snapshots of the initial scene under
     /// `capture_dir` and exit. For scripted scenarios that mutate
@@ -776,6 +775,10 @@ impl App {
         // both read from `total_height_logical()` / `prefix`, so
         // those need to be current before either runs.
         self.ensure_lazy_list_prefixes();
+        // CPU sub-phase timing (logged under FROSTIFY_STATS): pinpoints
+        // where a scroll frame's CPU goes — layout vs flatten vs expand +
+        // upload — so the scroll-path optimization targets the real hotspot.
+        let t_layout = Instant::now();
         let needs_initial_layout =
             mask & (crate::node::dirty::TREE | crate::node::dirty::TRANSFORM) != 0;
         let viewport = self.viewport();
@@ -807,6 +810,8 @@ impl App {
             // `visible` into instances).
             self.reposition_carets();
         }
+        let layout_ms = t_layout.elapsed().as_secs_f32() * 1000.0;
+        let t_flatten = Instant::now();
         self.ctx.tree.flatten_into_buffers(
             self.scale_factor,
             &mut self.flat_events,
@@ -815,6 +820,8 @@ impl App {
             &mut self.scroll_bars,
             &mut self.flat_spans,
         );
+        let flatten_ms = t_flatten.elapsed().as_secs_f32() * 1000.0;
+        let t_expand = Instant::now();
         let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
         if let Some(gpu) = self.gpu.as_mut() {
             self.instances.clear();
@@ -827,6 +834,13 @@ impl App {
                 &mut self.flat_event_inst,
             );
             gpu.set_instances(&self.instances, self.glass_count, backdrop_hint);
+        }
+        let expand_ms = t_expand.elapsed().as_secs_f32() * 1000.0;
+        if self.stats_log {
+            log::info!(
+                "flush cpu: layout={layout_ms:.2}ms flatten={flatten_ms:.2}ms expand+upload={expand_ms:.2}ms (mask={mask:#x} instances={})",
+                self.instances.len(),
+            );
         }
         // Rebuild the layer tree: map the promoted (`.layer()`) subtree
         // event spans to instance ranges, then partition the stream into
@@ -936,11 +950,7 @@ impl App {
     /// decoder frame) instead of a rastered texture. Call each time the
     /// decoder produces a new frame, then `request_redraw` (or the next
     /// awake frame) recomposites. No-op until the GPU is initialised.
-    pub fn set_external_texture(
-        &mut self,
-        node: crate::node::NodeId,
-        view: wgpu::TextureView,
-    ) {
+    pub fn set_external_texture(&mut self, node: crate::node::NodeId, view: wgpu::TextureView) {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_external_texture(node, view);
             self.request_redraw();
@@ -1192,11 +1202,7 @@ impl App {
     /// Runtime SVG upload. Rasterizes `bytes` to `px × px` and forwards
     /// to [`Self::upload_image_rgba`]. Same eviction semantics — over a
     /// full atlas, walks the tree for live handles and repacks survivors.
-    pub fn upload_image_svg(
-        &mut self,
-        bytes: &[u8],
-        px: u32,
-    ) -> Option<crate::gpu::ImageHandle> {
+    pub fn upload_image_svg(&mut self, bytes: &[u8], px: u32) -> Option<crate::gpu::ImageHandle> {
         let rgba = crate::svg::rasterize_svg(bytes, px);
         self.upload_image_rgba(px, px, &rgba)
     }
@@ -1242,7 +1248,12 @@ impl App {
         process_width_pct_binds(&mut self.ctx.binds.width_pct, &mut self.ctx.tree);
         process_width_px_binds(&mut self.ctx.binds.width_px, &mut self.ctx.tree);
         process_height_px_binds(&mut self.ctx.binds.height_px, &mut self.ctx.tree);
-        process_opacity_binds(&mut self.ctx.binds.opacity, &mut self.ctx.tree);
+        process_opacity_binds(
+            &mut self.ctx.binds.opacity,
+            &mut self.ctx.tree,
+            &mut self.timeline,
+            now,
+        );
     }
 
     /// For animated binds, copy the current `displayed` signal value
@@ -1262,6 +1273,16 @@ impl App {
         for slot in self.ctx.binds.size.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_layout_size_px(slot.node_id, disp.get());
+            }
+        }
+        for slot in self.ctx.binds.opacity.iter().flatten() {
+            if let Some(disp) = &slot.displayed {
+                let o = disp.get();
+                self.ctx.tree.set_opacity(slot.node_id, o);
+                // Mirror the snap path's visibility gating against the live
+                // tweened value, so a fading overlay drops out of flatten /
+                // hit-testing exactly when it crosses transparent.
+                self.ctx.tree.set_visible(slot.node_id, o > 0.001);
             }
         }
     }
@@ -1284,10 +1305,12 @@ impl App {
     /// handler (or no node is hovered), clear the tracker. Idempotent
     /// while hover stays on the same dwell-handler-bearing node.
     fn refresh_dwell(&mut self, now: Instant) {
-        let hovered_dwell = self
-            .input
-            .hovered
-            .and_then(|id| self.ctx.tree.get(id).and_then(|n| n.on_hover_dwell.as_ref().map(|(d, _)| (id, *d))));
+        let hovered_dwell = self.input.hovered.and_then(|id| {
+            self.ctx
+                .tree
+                .get(id)
+                .and_then(|n| n.on_hover_dwell.as_ref().map(|(d, _)| (id, *d)))
+        });
         match (hovered_dwell, self.dwell) {
             (None, _) => self.dwell = None,
             (Some((id, duration)), Some(tracker)) if tracker.node == id => {
@@ -1309,7 +1332,9 @@ impl App {
     /// node's handler and mark fired. Returns true if a handler ran
     /// (caller should `react()`).
     fn tick_dwell(&mut self, now: Instant) -> bool {
-        let Some(tracker) = self.dwell else { return false };
+        let Some(tracker) = self.dwell else {
+            return false;
+        };
         if tracker.fired || now < tracker.deadline {
             return false;
         }
@@ -1318,7 +1343,8 @@ impl App {
             self.dwell = None;
             return false;
         }
-        let handler = self.ctx
+        let handler = self
+            .ctx
             .tree
             .get(tracker.node)
             .and_then(|n| n.on_hover_dwell.as_ref().map(|(_, h)| h.clone()));
@@ -1402,19 +1428,21 @@ impl App {
         // (EventCtx) so the user can drive sibling state in response
         // to Enter.
         if outcome.value_changed
-            && let Some(cb) = on_change {
-                cb(&new_value);
-            }
+            && let Some(cb) = on_change
+        {
+            cb(&new_value);
+        }
         if outcome.submitted
-            && let Some(h) = on_submit {
-                let mut ectx = crate::event::EventCtx {
-                    tree: &mut self.ctx.tree,
-                    timeline: &mut self.timeline,
-                    node: node_id,
-                    now: Instant::now(),
-                };
-                h(&mut ectx);
-            }
+            && let Some(h) = on_submit
+        {
+            let mut ectx = crate::event::EventCtx {
+                tree: &mut self.ctx.tree,
+                timeline: &mut self.timeline,
+                node: node_id,
+                now: Instant::now(),
+            };
+            h(&mut ectx);
+        }
 
         // Step 4: react — runs bind processing + pumps animated
         // displays + flushes the tree (which calls reposition_carets
@@ -1480,7 +1508,8 @@ impl App {
     /// nothing on idle frames because `tree.set_text` short-circuits
     /// when content matches.
     fn refresh_text_fields(&mut self) {
-        let editor_ids: Vec<crate::node::NodeId> = self.ctx
+        let editor_ids: Vec<crate::node::NodeId> = self
+            .ctx
             .tree
             .iter_ids()
             .filter(|id| {
@@ -1505,7 +1534,8 @@ impl App {
                     .as_ref()
                     .map(|s| s.get())
                     .unwrap_or(false);
-                let show_placeholder = ed.value.is_empty() && !focused && !ed.placeholder.is_empty();
+                let show_placeholder =
+                    ed.value.is_empty() && !focused && !ed.placeholder.is_empty();
                 let display = if show_placeholder {
                     ed.placeholder.clone()
                 } else {
@@ -1526,7 +1556,8 @@ impl App {
     fn reposition_carets(&mut self) {
         // Collect node ids first to keep the walk + the mutating
         // updates from aliasing the same &mut tree.
-        let editor_ids: Vec<crate::node::NodeId> = self.ctx
+        let editor_ids: Vec<crate::node::NodeId> = self
+            .ctx
             .tree
             .iter_ids()
             .filter(|id| {
@@ -1541,7 +1572,16 @@ impl App {
         for id in editor_ids {
             // Snapshot every needed read from the editor + sibling
             // nodes before re-borrowing for the write.
-            let (cursor, value, font_size, text_node, caret_node, selection_node, sel_range, focused) = {
+            let (
+                cursor,
+                value,
+                font_size,
+                text_node,
+                caret_node,
+                selection_node,
+                sel_range,
+                focused,
+            ) = {
                 let Some(n) = self.ctx.tree.get(id) else {
                     continue;
                 };
@@ -1576,9 +1616,14 @@ impl App {
                 .width
             };
             let prefix_w = measure_w(&mut self.ctx.text, cursor);
-            let sel_px = sel_range
-                .map(|(lo, hi)| (measure_w(&mut self.ctx.text, lo), measure_w(&mut self.ctx.text, hi)));
-            let text_rect = self.ctx
+            let sel_px = sel_range.map(|(lo, hi)| {
+                (
+                    measure_w(&mut self.ctx.text, lo),
+                    measure_w(&mut self.ctx.text, hi),
+                )
+            });
+            let text_rect = self
+                .ctx
                 .tree
                 .get(text_node)
                 .map(|n| n.rect)
@@ -1643,7 +1688,8 @@ impl App {
     /// clear `input.focused` so subsequent keys don't route. Triggers
     /// a react so the caret repaints invisible.
     fn blur_text_field(&mut self, node_id: crate::node::NodeId) {
-        if let Some(sig) = self.ctx
+        if let Some(sig) = self
+            .ctx
             .tree
             .get(node_id)
             .and_then(|n| n.interact.focused.clone())
@@ -1669,12 +1715,20 @@ impl App {
             return;
         }
         if let Some(prev) = self.input.focused
-            && let Some(sig) = self.ctx.tree.get(prev).and_then(|n| n.interact.focused.clone())
+            && let Some(sig) = self
+                .ctx
+                .tree
+                .get(prev)
+                .and_then(|n| n.interact.focused.clone())
         {
             sig.set(false);
         }
         if let Some(next) = target
-            && let Some(sig) = self.ctx.tree.get(next).and_then(|n| n.interact.focused.clone())
+            && let Some(sig) = self
+                .ctx
+                .tree
+                .get(next)
+                .and_then(|n| n.interact.focused.clone())
         {
             sig.set(true);
         }
@@ -1713,9 +1767,14 @@ impl App {
     /// press origin + last-fire cursor and latches a clone of any
     /// payload as the in-flight drag. No-op for non-draggable targets.
     fn begin_drag_if_draggable(&mut self) {
-        let Some(cap) = self.input.captured else { return };
-        let Some(origin) = self.input.cursor else { return };
-        let (has_drag, payload, follow) = self.ctx
+        let Some(cap) = self.input.captured else {
+            return;
+        };
+        let Some(origin) = self.input.cursor else {
+            return;
+        };
+        let (has_drag, payload, follow) = self
+            .ctx
             .tree
             .get(cap)
             .map(|n| (n.on_drag.is_some(), n.drag_payload.clone(), n.drag_follow))
@@ -1751,9 +1810,18 @@ impl App {
     /// into `drag_follow`) to track the cursor. Returns true if a follow
     /// is active (caller should react so the ghost re-flattens).
     fn update_drag_follow(&mut self, x: f32, y: f32) -> bool {
-        let Some(cap) = self.input.captured else { return false };
-        let Some(origin) = self.drag_origin else { return false };
-        let follows = self.ctx.tree.get(cap).map(|n| n.drag_follow).unwrap_or(false);
+        let Some(cap) = self.input.captured else {
+            return false;
+        };
+        let Some(origin) = self.drag_origin else {
+            return false;
+        };
+        let follows = self
+            .ctx
+            .tree
+            .get(cap)
+            .map(|n| n.drag_follow)
+            .unwrap_or(false);
         if follows {
             self.ctx
                 .tree
@@ -1766,8 +1834,12 @@ impl App {
     /// `[x, y]`. `DragCtx::delta` is relative to the previous fire.
     /// Returns true if a handler ran (caller should react).
     fn fire_drag(&mut self, x: f32, y: f32) -> bool {
-        let Some(cap) = self.input.captured else { return false };
-        let Some(start) = self.drag_origin else { return false };
+        let Some(cap) = self.input.captured else {
+            return false;
+        };
+        let Some(start) = self.drag_origin else {
+            return false;
+        };
         let Some(h) = self.ctx.tree.get(cap).and_then(|n| n.on_drag.clone()) else {
             return false;
         };
@@ -1806,7 +1878,12 @@ impl App {
         let Some(hovered) = self.input.hovered else {
             return false;
         };
-        let Some(h) = self.ctx.tree.get(hovered).and_then(|n| n.on_hover_move.clone()) else {
+        let Some(h) = self
+            .ctx
+            .tree
+            .get(hovered)
+            .and_then(|n| n.on_hover_move.clone())
+        else {
             return false;
         };
         let rect = self
@@ -1859,7 +1936,10 @@ impl App {
                 .iter()
                 .find(|h| {
                     h.contains(x, y)
-                        && tree.get(h.node_id).map(|n| n.on_drop.is_some()).unwrap_or(false)
+                        && tree
+                            .get(h.node_id)
+                            .map(|n| n.on_drop.is_some())
+                            .unwrap_or(false)
                 })
                 .map(|h| h.node_id);
             if let Some(t) = target
@@ -1989,7 +2069,9 @@ impl App {
         let [vw, vh] = self.viewport();
         let mut cands: Vec<(u32, crate::node::NodeId)> = Vec::new();
         for id in self.ctx.tree.iter_ids() {
-            let Some(n) = self.ctx.tree.get(id) else { continue };
+            let Some(n) = self.ctx.tree.get(id) else {
+                continue;
+            };
             let order = n.layout.focus_order;
             if order == 0 || !n.visible {
                 continue;
@@ -2088,9 +2170,7 @@ impl App {
                 &self.scroll_bars,
                 &mut self.ctx.tree,
             );
-            let _change = self
-                .input
-                .on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
+            let _change = self.input.on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
         }
     }
 
@@ -2164,9 +2244,9 @@ impl App {
         } else if let Some(action) = self.hovered_window_action() {
             match action {
                 WindowAction::DragMove => CursorIcon::Move,
-                WindowAction::Close
-                | WindowAction::Minimize
-                | WindowAction::ToggleMaximize => CursorIcon::Pointer,
+                WindowAction::Close | WindowAction::Minimize | WindowAction::ToggleMaximize => {
+                    CursorIcon::Pointer
+                }
             }
         } else if let Some(c) = self.hovered_node_cursor(x, y) {
             c
@@ -2190,7 +2270,9 @@ impl App {
         action: WindowAction,
         event_loop: &ActiveEventLoop,
     ) -> bool {
-        let Some(win) = &self.window else { return false };
+        let Some(win) = &self.window else {
+            return false;
+        };
         match action {
             WindowAction::DragMove => {
                 let _ = win.drag_window();
@@ -2254,9 +2336,10 @@ pub fn collect_live_image_handles(
     let mut out = std::collections::HashSet::new();
     for id in tree.iter_ids() {
         if let Some(n) = tree.get(id)
-            && let Some(h) = n.image {
-                out.insert(h);
-            }
+            && let Some(h) = n.image
+        {
+            out.insert(h);
+        }
     }
     out
 }
@@ -2392,7 +2475,11 @@ fn layer_to_draw(l: &crate::layer::Layer) -> crate::gpu::LayerDraw {
         external,
         corner_radius,
         edge_fade: l.edge_fade,
-        edge_fade_falloff: if l.edge_fade_falloff > 0.0 { l.edge_fade_falloff } else { 1.0 },
+        edge_fade_falloff: if l.edge_fade_falloff > 0.0 {
+            l.edge_fade_falloff
+        } else {
+            1.0
+        },
     }
 }
 
@@ -2473,7 +2560,10 @@ fn build_hud_instances(
         format!("inst {:>5}", stats.instance_count),
         format!("draw {:>5}", stats.drawcalls),
         format!("lyr  {:>5}", stats.layer_count),
-        format!("rast {:>3} cmp {:>1}", stats.raster_count, stats.composite_count),
+        format!(
+            "rast {:>3} cmp {:>1}",
+            stats.raster_count, stats.composite_count
+        ),
         format!("vram {:>4} KiB", stats.layer_vram / 1024),
     ];
 
@@ -2527,8 +2617,7 @@ fn process_color_binds(
         }
         slot.last_version = v;
         let target = slot.bind.read();
-        if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation())
-        {
+        if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation()) {
             let key = BIND_TWEEN_KEY_COLOR + idx as u32;
             timeline.start(key, disp.clone(), target, curve, dur, now);
             log::debug!("[binds] color slot {idx}: animated tween started target={target:?}");
@@ -2592,10 +2681,7 @@ fn process_width_pct_binds(
     }
 }
 
-fn process_width_px_binds(
-    slots: &mut [Option<WidthPxBindSlot>],
-    tree: &mut crate::node::NodeTree,
-) {
+fn process_width_px_binds(slots: &mut [Option<WidthPxBindSlot>], tree: &mut crate::node::NodeTree) {
     for opt in slots.iter_mut() {
         let Some(slot) = opt.as_mut() else { continue };
         let v = slot.bind.version();
@@ -2625,20 +2711,29 @@ fn process_height_px_binds(
 fn process_opacity_binds(
     slots: &mut [Option<OpacityBindSlot>],
     tree: &mut crate::node::NodeTree,
+    timeline: &mut Timeline,
+    now: Instant,
 ) {
-    for opt in slots.iter_mut() {
+    for (idx, opt) in slots.iter_mut().enumerate() {
         let Some(slot) = opt.as_mut() else { continue };
         let v = slot.bind.version();
         if v == slot.last_version {
             continue;
         }
         slot.last_version = v;
-        let o = slot.bind.read();
-        tree.set_opacity(slot.node_id, o);
-        // Fully transparent → drop the node (and its subtree) from
-        // flatten so an invisible overlay can't eat input. Restored the
-        // instant opacity rises above the threshold again.
-        tree.set_visible(slot.node_id, o > 0.001);
+        let target = slot.bind.read();
+        if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation()) {
+            // Animated: tween `displayed` toward the new value; the pump
+            // pushes it into the node opacity (+ visibility) each frame.
+            let key = BIND_TWEEN_KEY_OPACITY + idx as u32;
+            timeline.start(key, disp.clone(), target, curve, dur, now);
+        } else {
+            tree.set_opacity(slot.node_id, target);
+            // Fully transparent → drop the node (and its subtree) from
+            // flatten so an invisible overlay can't eat input. Restored the
+            // instant opacity rises above the threshold again.
+            tree.set_visible(slot.node_id, target > 0.001);
+        }
     }
 }
 
@@ -2656,8 +2751,7 @@ fn process_position_binds(
         }
         slot.last_version = v;
         let target = slot.bind.read();
-        if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation())
-        {
+        if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation()) {
             let key = BIND_TWEEN_KEY_POSITION + idx as u32;
             timeline.start(key, disp.clone(), target, curve, dur, now);
         } else {
@@ -2680,8 +2774,7 @@ fn process_size_binds(
         }
         slot.last_version = v;
         let target = slot.bind.read();
-        if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation())
-        {
+        if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation()) {
             let key = BIND_TWEEN_KEY_SIZE + idx as u32;
             timeline.start(key, disp.clone(), target, curve, dur, now);
         } else {
@@ -2716,16 +2809,32 @@ fn resolve_edit_op(
             NamedKey::Backspace => return Some(EditOp::DeleteBack),
             NamedKey::Delete => return Some(EditOp::DeleteForward),
             NamedKey::ArrowLeft => {
-                return Some(if shift { EditOp::SelectLeft } else { EditOp::MoveLeft });
+                return Some(if shift {
+                    EditOp::SelectLeft
+                } else {
+                    EditOp::MoveLeft
+                });
             }
             NamedKey::ArrowRight => {
-                return Some(if shift { EditOp::SelectRight } else { EditOp::MoveRight });
+                return Some(if shift {
+                    EditOp::SelectRight
+                } else {
+                    EditOp::MoveRight
+                });
             }
             NamedKey::Home => {
-                return Some(if shift { EditOp::SelectHome } else { EditOp::Home });
+                return Some(if shift {
+                    EditOp::SelectHome
+                } else {
+                    EditOp::Home
+                });
             }
             NamedKey::End => {
-                return Some(if shift { EditOp::SelectEnd } else { EditOp::End });
+                return Some(if shift {
+                    EditOp::SelectEnd
+                } else {
+                    EditOp::End
+                });
             }
             NamedKey::Enter => return Some(EditOp::Submit),
             _ => {}
@@ -2749,9 +2858,11 @@ fn resolve_edit_op(
         return None;
     }
     if let Some(s) = text
-        && !s.is_empty() && !s.chars().any(|c| c.is_control()) {
-            return Some(EditOp::Insert(s.to_string()));
-        }
+        && !s.is_empty()
+        && !s.chars().any(|c| c.is_control())
+    {
+        return Some(EditOp::Insert(s.to_string()));
+    }
     None
 }
 
@@ -2868,12 +2979,8 @@ impl<'a> HeadlessHelper<'a> {
             crate::layer::Damage::classify(mask),
         );
         self.layer_tree.take_composite_dirty();
-        let draws: Vec<crate::gpu::LayerDraw> = self
-            .layer_tree
-            .layers()
-            .iter()
-            .map(layer_to_draw)
-            .collect();
+        let draws: Vec<crate::gpu::LayerDraw> =
+            self.layer_tree.layers().iter().map(layer_to_draw).collect();
         self.gpu.set_layers(&draws);
         true
     }
@@ -3069,9 +3176,10 @@ impl ApplicationHandler for App {
             for (idx, image) in staged.into_iter().enumerate() {
                 let ok = match image {
                     StagedImage::Png(bytes) => gpu.upload_image_png(&bytes).is_some(),
-                    StagedImage::Rgba { w, h, bytes } => {
-                        gpu.image_atlas.upload_rgba(&gpu.queue, w, h, &bytes).is_some()
-                    }
+                    StagedImage::Rgba { w, h, bytes } => gpu
+                        .image_atlas
+                        .upload_rgba(&gpu.queue, w, h, &bytes)
+                        .is_some(),
                 };
                 if !ok {
                     log::warn!("staged image #{idx}: decode/upload failed");
@@ -3142,12 +3250,7 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(_gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -3175,10 +3278,8 @@ impl ApplicationHandler for App {
                     .last_dpi_change
                     .map(|t| t.elapsed() < Duration::from_millis(500))
                     .unwrap_or(false);
-                let want_w = (self.logical_size[0] as f32 * self.scale_factor)
-                    .round() as u32;
-                let want_h = (self.logical_size[1] as f32 * self.scale_factor)
-                    .round() as u32;
+                let want_w = (self.logical_size[0] as f32 * self.scale_factor).round() as u32;
+                let want_h = (self.logical_size[1] as f32 * self.scale_factor).round() as u32;
                 if in_dpi_window {
                     // DPI-triggered resize. Keep logical_size; Win11
                     // 24H2 may deliver stale physical here.
@@ -3191,9 +3292,7 @@ impl ApplicationHandler for App {
                             want_w,
                             want_h
                         );
-                        let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(
-                            want_w, want_h,
-                        ));
+                        let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(want_w, want_h));
                     }
                     // Cancel winit's cursor-anchored reposition —
                     // restore pre-SF outer so the window stays under
@@ -3225,11 +3324,7 @@ impl ApplicationHandler for App {
             } => {
                 let new_scale = scale_factor as f32;
                 if (new_scale - self.scale_factor).abs() > f32::EPSILON {
-                    log::debug!(
-                        "scale factor: {} → {}",
-                        self.scale_factor,
-                        new_scale
-                    );
+                    log::debug!("scale factor: {} → {}", self.scale_factor, new_scale);
                     if let Some(w) = &self.window
                         && let Ok(p) = w.outer_position()
                     {
@@ -3288,9 +3383,7 @@ impl ApplicationHandler for App {
                     &self.scroll_bars,
                     &mut self.ctx.tree,
                 );
-                let change =
-                    self.input
-                        .on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
+                let change = self.input.on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
                 self.refresh_cursor(x, y);
                 // Generic on_drag: fire while a press is captured on a
                 // draggable node (slider/scrubber). Independent of the
@@ -3363,9 +3456,7 @@ impl ApplicationHandler for App {
                         let line = 50.0 * self.scale_factor;
                         [-lx * line, -ly * line]
                     }
-                    winit::event::MouseScrollDelta::PixelDelta(p) => {
-                        [-p.x as f32, -p.y as f32]
-                    }
+                    winit::event::MouseScrollDelta::PixelDelta(p) => [-p.x as f32, -p.y as f32],
                 };
                 let shift = self.modifiers.state().shift_key();
                 if crate::input::on_wheel(
@@ -3385,12 +3476,13 @@ impl ApplicationHandler for App {
             } => {
                 if state == ElementState::Pressed {
                     if let Some([cx, cy]) = self.input.cursor
-                        && let Some(dir) = self.edge_at(cx, cy) {
-                            if let Some(w) = &self.window {
-                                let _ = w.drag_resize_window(dir);
-                            }
-                            return;
+                        && let Some(dir) = self.edge_at(cx, cy)
+                    {
+                        if let Some(w) = &self.window {
+                            let _ = w.drag_resize_window(dir);
                         }
+                        return;
+                    }
                     // Scrollbar layer wins over normal hit-test if the
                     // cursor is on a visible bar.
                     if let Some([cx, cy]) = self.input.cursor {
@@ -3426,14 +3518,13 @@ impl ApplicationHandler for App {
                         }
                     }
                     if let Some(action) = self.hovered_window_action()
-                        && self.dispatch_window_action(action, event_loop) {
-                            return;
-                        }
+                        && self.dispatch_window_action(action, event_loop)
+                    {
+                        return;
+                    }
                 }
                 let change = match state {
-                    ElementState::Pressed => {
-                        self.input.on_left_pressed(&self.hits, &self.ctx.tree)
-                    }
+                    ElementState::Pressed => self.input.on_left_pressed(&self.hits, &self.ctx.tree),
                     ElementState::Released => {
                         // End any in-flight thumb drag. Apply the last
                         // pending cursor so the final pixel lands.
@@ -3476,10 +3567,7 @@ impl ApplicationHandler for App {
                 // borrow of the node drops before we re-borrow `&mut
                 // tree` for the EventCtx.
                 if let Some(target) = change.click_target {
-                    let handler = self.ctx
-                        .tree
-                        .get(target)
-                        .and_then(|n| n.on_click.clone());
+                    let handler = self.ctx.tree.get(target).and_then(|n| n.on_click.clone());
                     if let Some(h) = handler {
                         let mut ectx = crate::event::EventCtx {
                             tree: &mut self.ctx.tree,
@@ -3508,7 +3596,8 @@ impl ApplicationHandler for App {
                     }
                 };
                 if let Some(target) = change.right_click_target {
-                    let handler = self.ctx
+                    let handler = self
+                        .ctx
                         .tree
                         .get(target)
                         .and_then(|n| n.on_right_click.clone());
@@ -3546,7 +3635,8 @@ impl ApplicationHandler for App {
                     // fall through to the hotkey + scroll handlers so
                     // F2 screenshot etc. still work mid-edit.
                     if let Some(focused) = self.input.focused {
-                        let has_editor = self.ctx
+                        let has_editor = self
+                            .ctx
                             .tree
                             .get(focused)
                             .map(|n| n.editor.is_some())
@@ -3567,16 +3657,11 @@ impl ApplicationHandler for App {
                             if accel && is_v {
                                 let pasted = self.read_clipboard();
                                 if !pasted.is_empty() {
-                                    self.apply_edit(
-                                        focused,
-                                        crate::editor::EditOp::Paste(pasted),
-                                    );
+                                    self.apply_edit(focused, crate::editor::EditOp::Paste(pasted));
                                 }
                                 return;
                             }
-                            if let Some(op) =
-                                resolve_edit_op(&logical_key, text.as_deref(), mods)
-                            {
+                            if let Some(op) = resolve_edit_op(&logical_key, text.as_deref(), mods) {
                                 self.apply_edit(focused, op);
                                 return;
                             }
@@ -3674,10 +3759,7 @@ impl ApplicationHandler for App {
                             }
                             return;
                         }
-                        KeyCode::PageUp
-                        | KeyCode::PageDown
-                        | KeyCode::Home
-                        | KeyCode::End => {
+                        KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
                             // Page / Home / End honour OS auto-repeat —
                             // they're jump keys and `set_scroll_target`
                             // is idempotent at the clamps, so holding is
@@ -3716,6 +3798,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Keep the scene ctx's display scale in sync so per-frame hooks
+        // (`on_frame`) can convert physical reads (scroll offsets) to
+        // logical layout units. Cheap; the value rarely changes.
+        self.ctx.scale = self.scale_factor;
         // Deferred autocapture: once the deadline elapses, render a
         // settled frame, snap, and exit. Loop has been running normally
         // up to this point so worker state, image uploads, and any
@@ -3757,16 +3843,25 @@ impl ApplicationHandler for App {
         if self.wake.take()
             && let Some(mut hook) = self.on_frame.take()
         {
-            log::debug!("[loop] wake-driven on_frame fired (timeline_tweens={})", self.timeline.len());
+            log::debug!(
+                "[loop] wake-driven on_frame fired (timeline_tweens={})",
+                self.timeline.len()
+            );
             hook(&mut self.ctx, &mut self.timeline, now);
             self.on_frame = Some(hook);
-            log::debug!("[loop] after on_frame: timeline_tweens={} rebuild_requested={}",
-                self.timeline.len(), self.rebuild_request.get());
+            log::debug!(
+                "[loop] after on_frame: timeline_tweens={} rebuild_requested={}",
+                self.timeline.len(),
+                self.rebuild_request.get()
+            );
             // Drain any rebuild flag the hook just set so the rebuild
             // rides this tick rather than waiting for the next wake.
             if self.rebuild_request.replace(false) {
                 self.rebuild_scene();
-                log::debug!("[loop] rebuilt scene; timeline_tweens={}", self.timeline.len());
+                log::debug!(
+                    "[loop] rebuilt scene; timeline_tweens={}",
+                    self.timeline.len()
+                );
             } else {
                 // No rebuild — but the hook may have set source signals
                 // (worker-delivered state, etc.). Walk the bind registry
@@ -3838,11 +3933,7 @@ impl ApplicationHandler for App {
         // timeline + scroll. Fire here if elapsed; either way, propagate
         // the deadline below so the loop schedules a wake.
         let dwell_fired = self.tick_dwell(now);
-        let dwell_pending = self
-            .dwell
-            .as_ref()
-            .map(|t| !t.fired)
-            .unwrap_or(false);
+        let dwell_pending = self.dwell.as_ref().map(|t| !t.fired).unwrap_or(false);
         // Hold-arrow continuous pump: replaces OS auto-repeat for the
         // arrow keys. Need a non-zero `dt` to compute the per-tick
         // delta — gate on a meaningful tick interval.
@@ -3876,7 +3967,11 @@ impl ApplicationHandler for App {
         }
         log::debug!(
             "[loop] active tick: timeline_tweens={} scroll={} drag={} dwell={}/{}",
-            self.timeline.len(), scroll_active, drag_moved, dwell_pending, dwell_fired,
+            self.timeline.len(),
+            scroll_active,
+            drag_moved,
+            dwell_pending,
+            dwell_fired,
         );
         let dt = match self.last_scroll_tick {
             Some(prev) => (now - prev).as_secs_f32().min(0.05),
@@ -3945,11 +4040,7 @@ impl ApplicationHandler for App {
         };
         // Wake up at the dwell deadline so the tooltip fires on time
         // even when nothing else is animating.
-        let dwell_deadline = self
-            .dwell
-            .as_ref()
-            .filter(|t| !t.fired)
-            .map(|t| t.deadline);
+        let dwell_deadline = self.dwell.as_ref().filter(|t| !t.fired).map(|t| t.deadline);
         // process_binds above may have *started* new tweens (when an
         // animated bind's source was just set). Those tweens didn't
         // exist when timeline.tick computed `res.next_deadline`, so
@@ -4021,11 +4112,7 @@ impl App {
     /// Run the scripted-input driver: execute any due step, return the
     /// next scheduled wake (so the loop doesn't park past it). Exits the
     /// app once the script is exhausted.
-    fn automation_tick(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        now: Instant,
-    ) -> Option<Instant> {
+    fn automation_tick(&mut self, event_loop: &ActiveEventLoop, now: Instant) -> Option<Instant> {
         let Some(mut state) = self.automation.take() else {
             return None;
         };
@@ -4172,15 +4259,16 @@ impl App {
 /// visible window. Free fn so both `App::flush_tree` and
 /// `HeadlessHelper::flush` drive the same path. Returns true if any
 /// list mutated its children (caller may need a second layout pass).
-fn materialize_lazy_lists(
-    ctx: &mut SceneCtx,
-    timeline: &mut Timeline,
-    scale: f32,
-) -> bool {
+fn materialize_lazy_lists(ctx: &mut SceneCtx, timeline: &mut Timeline, scale: f32) -> bool {
     let lazy_ids: Vec<crate::node::NodeId> = ctx
         .tree
         .iter_ids()
-        .filter(|id| ctx.tree.get(*id).map(|n| n.lazy_list.is_some()).unwrap_or(false))
+        .filter(|id| {
+            ctx.tree
+                .get(*id)
+                .map(|n| n.lazy_list.is_some())
+                .unwrap_or(false)
+        })
         .collect();
     if lazy_ids.is_empty() {
         return false;
@@ -4191,11 +4279,21 @@ fn materialize_lazy_lists(
         // the clone is cheap. Drop the &mut tree borrow before
         // invoking it (the closure spawns children, re-borrowing
         // the tree).
-        let (render, prev_range, prev_materialized,
-             current_version, last_seen_version,
-             current_heights_version, last_seen_heights_version) = {
-            let Some(n) = ctx.tree.get(list_id) else { continue };
-            let Some(ll) = n.lazy_list.as_ref() else { continue };
+        let (
+            render,
+            prev_range,
+            prev_materialized,
+            current_version,
+            last_seen_version,
+            current_heights_version,
+            last_seen_heights_version,
+        ) = {
+            let Some(n) = ctx.tree.get(list_id) else {
+                continue;
+            };
+            let Some(ll) = n.lazy_list.as_ref() else {
+                continue;
+            };
             (
                 ll.render.clone(),
                 ll.range,
@@ -4210,14 +4308,18 @@ fn materialize_lazy_lists(
         // The list is its own scroll container; read viewport
         // size + scroll offset from its rect + ScrollState.
         let (scroll_top, viewport_h) = {
-            let Some(n) = ctx.tree.get(list_id) else { continue };
+            let Some(n) = ctx.tree.get(list_id) else {
+                continue;
+            };
             let scroll_top = n.scroll.as_ref().map(|s| s.current[1]).unwrap_or(0.0);
             let viewport_h = n.rect[3];
             (scroll_top, viewport_h)
         };
 
         let new_range = {
-            let Some(n) = ctx.tree.get(list_id) else { continue };
+            let Some(n) = ctx.tree.get(list_id) else {
+                continue;
+            };
             let ll = n.lazy_list.as_ref().unwrap();
             ll.visible_window(scroll_top, viewport_h, scale)
         };
@@ -4246,15 +4348,17 @@ fn materialize_lazy_lists(
                     .map(|ll| ll.row_top_logical(i))
                     .unwrap_or(0.0);
                 if let Some(c) = ctx.tree.get_mut_raw(*child_id)
-                    && c.layout.abs != Some([0.0, top]) {
-                        c.layout.abs = Some([0.0, top]);
-                        any_moved = true;
-                    }
+                    && c.layout.abs != Some([0.0, top])
+                {
+                    c.layout.abs = Some([0.0, top]);
+                    any_moved = true;
+                }
             }
             if let Some(n) = ctx.tree.get_mut_raw(list_id)
-                && let Some(ll) = n.lazy_list.as_mut() {
-                    ll.last_heights_version = current_heights_version;
-                }
+                && let Some(ll) = n.lazy_list.as_mut()
+            {
+                ll.last_heights_version = current_heights_version;
+            }
             if any_moved {
                 any_changed = true;
             }
@@ -4276,20 +4380,12 @@ fn materialize_lazy_lists(
         // `layout.abs` so layout positions it at the right offset.
         let mut new_materialized = Vec::with_capacity((new_range[1] - new_range[0]) as usize);
         for i in new_range[0]..new_range[1] {
-            let prev_count = ctx
-                .tree
-                .get(list_id)
-                .map(|n| n.children.len())
-                .unwrap_or(0);
+            let prev_count = ctx.tree.get(list_id).map(|n| n.children.len()).unwrap_or(0);
             {
                 let mut scene = crate::scene::Scene::with_parent(ctx, list_id);
                 render(&mut scene, i);
             }
-            let next_count = ctx
-                .tree
-                .get(list_id)
-                .map(|n| n.children.len())
-                .unwrap_or(0);
+            let next_count = ctx.tree.get(list_id).map(|n| n.children.len()).unwrap_or(0);
             if next_count > prev_count {
                 let new_child = ctx.tree.get(list_id).unwrap().children[prev_count];
                 let top = ctx
@@ -4307,12 +4403,13 @@ fn materialize_lazy_lists(
 
         // Commit the new state.
         if let Some(n) = ctx.tree.get_mut_raw(list_id)
-            && let Some(ll) = n.lazy_list.as_mut() {
-                ll.materialized = new_materialized;
-                ll.range = new_range;
-                ll.last_seen_version = current_version;
-                ll.last_heights_version = current_heights_version;
-            }
+            && let Some(ll) = n.lazy_list.as_mut()
+        {
+            ll.materialized = new_materialized;
+            ll.range = new_range;
+            ll.last_seen_version = current_version;
+            ll.last_heights_version = current_heights_version;
+        }
 
         any_changed = true;
     }
@@ -4326,7 +4423,12 @@ fn ensure_lazy_list_prefixes(ctx: &mut SceneCtx) {
     let lazy_ids: Vec<crate::node::NodeId> = ctx
         .tree
         .iter_ids()
-        .filter(|id| ctx.tree.get(*id).map(|n| n.lazy_list.is_some()).unwrap_or(false))
+        .filter(|id| {
+            ctx.tree
+                .get(*id)
+                .map(|n| n.lazy_list.is_some())
+                .unwrap_or(false)
+        })
         .collect();
     for id in lazy_ids {
         if let Some(n) = ctx.tree.get_mut_raw(id)
@@ -4404,13 +4506,7 @@ mod tests {
             scene.rect("a").color(s1_for_scene.clone());
             scene.rect("b").color(s2_for_scene.clone());
         });
-        let live_before = app
-            .ctx()
-            .binds
-            .color
-            .iter()
-            .filter(|s| s.is_some())
-            .count();
+        let live_before = app.ctx().binds.color.iter().filter(|s| s.is_some()).count();
         assert_eq!(live_before, 2);
 
         app.rebuild_scene();
@@ -4419,13 +4515,7 @@ mod tests {
         // free-list reuses them for the new scene's binds. Live count is
         // restored AND the vector stays bounded — no monotonic growth
         // across rebuilds (the whole point of the free-list).
-        let live_after = app
-            .ctx()
-            .binds
-            .color
-            .iter()
-            .filter(|s| s.is_some())
-            .count();
+        let live_after = app.ctx().binds.color.iter().filter(|s| s.is_some()).count();
         assert_eq!(live_after, 2);
         assert_eq!(
             app.ctx().binds.color.len(),
@@ -4446,9 +4536,7 @@ mod tests {
 
     /// Build a 4-node Col scene where focus_order can differ from
     /// creation order. Returns (app, [ids in creation order], [signals]).
-    fn focus_scene(
-        orders: [u32; 4],
-    ) -> (App, Vec<crate::node::NodeId>, Vec<Signal<bool>>) {
+    fn focus_scene(orders: [u32; 4]) -> (App, Vec<crate::node::NodeId>, Vec<Signal<bool>>) {
         let sigs: Vec<Signal<bool>> = (0..4).map(|_| Signal::new(false)).collect();
         let sigs_for_scene = sigs.clone();
         let mut app = App::new("test", 400, 400).scene(move |s| {
@@ -4520,7 +4608,11 @@ mod tests {
         app.focus_next(true);
         assert_eq!(app.input.focused, Some(ids[0]));
         app.focus_next(true);
-        assert_eq!(app.input.focused, Some(ids[2]), "n1 (order 0) must be skipped");
+        assert_eq!(
+            app.input.focused,
+            Some(ids[2]),
+            "n1 (order 0) must be skipped"
+        );
     }
 
     #[test]
@@ -4661,7 +4753,11 @@ mod tests {
         app.input.cursor = Some([10.0, 10.0]);
         app.begin_drag_if_draggable();
         assert!(app.fire_drag(15.0, 10.0));
-        assert_eq!(last.get(), [5.0, 0.0], "delta is from press origin on first move");
+        assert_eq!(
+            last.get(),
+            [5.0, 0.0],
+            "delta is from press origin on first move"
+        );
         assert_eq!(start_seen.get(), [10.0, 10.0]);
         // Second move: delta is relative to the previous fire, not start.
         assert!(app.fire_drag(22.0, 10.0));
@@ -4674,7 +4770,9 @@ mod tests {
         let fired_c = fired.clone();
         let mut app = App::new("test", 400, 400).scene(move |s| {
             let fired_c = fired_c.clone();
-            s.rect("knob").size_px(40.0, 40.0).on_drag(move |_| fired_c.set(true));
+            s.rect("knob")
+                .size_px(40.0, 40.0)
+                .on_drag(move |_| fired_c.set(true));
         });
         let _ = app.flush_tree();
         // No press captured → no drag fires.
@@ -4750,7 +4848,10 @@ mod tests {
         });
         let _ = app.flush_tree();
         // Inside the handle's rect (0,0..20,100): returns the override.
-        assert_eq!(app.hovered_node_cursor(10.0, 50.0), Some(CursorIcon::EwResize));
+        assert_eq!(
+            app.hovered_node_cursor(10.0, 50.0),
+            Some(CursorIcon::EwResize)
+        );
         // Outside: no override → falls back to default in refresh_cursor.
         assert_eq!(app.hovered_node_cursor(150.0, 50.0), None);
     }
@@ -4760,7 +4861,9 @@ mod tests {
         let w = Signal::new(200.0_f32);
         let w_for_scene = w.clone();
         let mut app = App::new("test", 800, 400).scene(move |s| {
-            s.rect("panel").width_px_bind(w_for_scene.clone()).h_px(40.0);
+            s.rect("panel")
+                .width_px_bind(w_for_scene.clone())
+                .h_px(40.0);
         });
         let _ = app.flush_tree();
         let id = app.ctx().node("panel").unwrap();
@@ -4772,7 +4875,10 @@ mod tests {
         app.process_binds(Instant::now());
         let _ = app.flush_tree();
         let resized = app.ctx().tree.get(id).unwrap().rect[2];
-        assert!((resized - 360.0).abs() < 0.5, "width follows signal: got {resized}");
+        assert!(
+            (resized - 360.0).abs() < 0.5,
+            "width follows signal: got {resized}"
+        );
     }
 
     #[test]
@@ -4780,7 +4886,9 @@ mod tests {
         let h = Signal::new(60.0_f32);
         let h_for_scene = h.clone();
         let mut app = App::new("test", 400, 600).scene(move |s| {
-            s.rect("panel").w_px(120.0).height_px_bind(h_for_scene.clone());
+            s.rect("panel")
+                .w_px(120.0)
+                .height_px_bind(h_for_scene.clone());
         });
         let _ = app.flush_tree();
         let id = app.ctx().node("panel").unwrap();
@@ -4828,7 +4936,11 @@ mod tests {
         app.input.captured = Some(item);
         app.input.cursor = Some([10.0, 10.0]);
         app.begin_drag_if_draggable();
-        assert_eq!(app.ctx().tree.drag_follow_target(), Some(item), "lifts on press");
+        assert_eq!(
+            app.ctx().tree.drag_follow_target(),
+            Some(item),
+            "lifts on press"
+        );
         app.input.cursor = Some([30.0, 25.0]);
         assert!(app.update_drag_follow(30.0, 25.0));
         assert_eq!(app.ctx().tree.drag_follow_target(), Some(item));
@@ -4836,11 +4948,19 @@ mod tests {
         // (animating home), not cleared instantly.
         app.finish_drag_on_release();
         assert!(app.drag_return.is_some(), "release starts a snap-back");
-        assert_eq!(app.ctx().tree.drag_follow_target(), Some(item), "still lifted mid-return");
+        assert_eq!(
+            app.ctx().tree.drag_follow_target(),
+            Some(item),
+            "still lifted mid-return"
+        );
         // Simulate the tween reaching the slot, then tick the return.
         app.drag_return_offset.set([0.0, 0.0]);
         app.tick_drag_return();
-        assert_eq!(app.ctx().tree.drag_follow_target(), None, "lands → lift cleared");
+        assert_eq!(
+            app.ctx().tree.drag_follow_target(),
+            None,
+            "lands → lift cleared"
+        );
         assert!(app.drag_return.is_none());
     }
 
@@ -4848,7 +4968,10 @@ mod tests {
     fn drag_follow_click_without_move_clears_immediately() {
         let mut app = App::new("test", 400, 400).scene(|s| {
             s.col("root").fill().child(|c| {
-                c.rect("item").size_px(80.0, 40.0).drag_payload(1_u32).drag_follow();
+                c.rect("item")
+                    .size_px(80.0, 40.0)
+                    .drag_payload(1_u32)
+                    .drag_follow();
             });
         });
         let _ = app.flush_tree();
@@ -4859,8 +4982,15 @@ mod tests {
         assert_eq!(app.ctx().tree.drag_follow_target(), Some(item));
         // Release at the same spot — no snap-back needed.
         app.finish_drag_on_release();
-        assert!(app.drag_return.is_none(), "no animation for a zero-move click");
-        assert_eq!(app.ctx().tree.drag_follow_target(), None, "lift cleared at once");
+        assert!(
+            app.drag_return.is_none(),
+            "no animation for a zero-move click"
+        );
+        assert_eq!(
+            app.ctx().tree.drag_follow_target(),
+            None,
+            "lift cleared at once"
+        );
     }
 
     #[test]
@@ -4900,16 +5030,28 @@ mod tests {
         use crate::editor::EditOp;
         use winit::keyboard::{Key, ModifiersState, NamedKey};
         assert_eq!(
-            resolve_edit_op(&Key::Named(NamedKey::ArrowRight), None, ModifiersState::SHIFT),
+            resolve_edit_op(
+                &Key::Named(NamedKey::ArrowRight),
+                None,
+                ModifiersState::SHIFT
+            ),
             Some(EditOp::SelectRight)
         );
         assert_eq!(
-            resolve_edit_op(&Key::Named(NamedKey::ArrowLeft), None, ModifiersState::SHIFT),
+            resolve_edit_op(
+                &Key::Named(NamedKey::ArrowLeft),
+                None,
+                ModifiersState::SHIFT
+            ),
             Some(EditOp::SelectLeft)
         );
         // Without shift, the same keys plain-move.
         assert_eq!(
-            resolve_edit_op(&Key::Named(NamedKey::ArrowRight), None, ModifiersState::empty()),
+            resolve_edit_op(
+                &Key::Named(NamedKey::ArrowRight),
+                None,
+                ModifiersState::empty()
+            ),
             Some(EditOp::MoveRight)
         );
     }
@@ -4947,7 +5089,10 @@ mod tests {
         );
         // Unmapped accel combo (Ctrl+S) falls through, and the
         // character isn't inserted while accel is held.
-        assert_eq!(resolve_edit_op(&Key::Character("s".into()), Some("s"), ctrl), None);
+        assert_eq!(
+            resolve_edit_op(&Key::Character("s".into()), Some("s"), ctrl),
+            None
+        );
     }
 
     #[test]
@@ -4955,7 +5100,11 @@ mod tests {
         use crate::editor::EditOp;
         use winit::keyboard::{Key, ModifiersState};
         assert_eq!(
-            resolve_edit_op(&Key::Character("q".into()), Some("q"), ModifiersState::empty()),
+            resolve_edit_op(
+                &Key::Character("q".into()),
+                Some("q"),
+                ModifiersState::empty()
+            ),
             Some(EditOp::Insert("q".to_string()))
         );
     }
@@ -4968,9 +5117,7 @@ mod tests {
         let app = App::new("test", 400, 200);
         let app = app.scene(move |s| {
             s.lazy_list("list", 10_000, 40.0, |row, i| {
-                row.rect(format!("row{i}"))
-                    .w(Len::Fill)
-                    .h_px(40.0);
+                row.rect(format!("row{i}")).w(Len::Fill).h_px(40.0);
             })
             .fill();
         });
@@ -5004,9 +5151,7 @@ mod tests {
         let app = App::new("test", 400, 200);
         let app = app.scene(move |s| {
             s.lazy_list("list", 10_000, 40.0, |row, i| {
-                row.rect(format!("row{i}"))
-                    .w(Len::Fill)
-                    .h_px(40.0);
+                row.rect(format!("row{i}")).w(Len::Fill).h_px(40.0);
             })
             .fill();
         });
@@ -5023,9 +5168,7 @@ mod tests {
             .unwrap()
             .range;
         // Scroll down 4000 logical px (100 rows).
-        app.ctx
-            .tree
-            .set_scroll_target(list_id, [0.0, 4000.0]);
+        app.ctx.tree.set_scroll_target(list_id, [0.0, 4000.0]);
         // Set current immediately to skip the spring (test harness
         // doesn't run the timeline tick).
         app.ctx
@@ -5042,7 +5185,10 @@ mod tests {
             .unwrap()
             .range;
         assert_ne!(range_before, range_after, "scrolling should shift window");
-        assert!(range_after[0] >= 90, "should materialize rows around index 100");
+        assert!(
+            range_after[0] >= 90,
+            "should materialize rows around index 100"
+        );
     }
 
     #[test]
@@ -5107,11 +5253,12 @@ mod tests {
         let fired2 = fired.clone();
         let mut app = App::new("test", 100, 100).scene(move |s| {
             let fired_inner = fired2.clone();
-            s.rect("btn")
-                .size_px(40.0, 40.0)
-                .on_hover_dwell(std::time::Duration::from_millis(200), move |_| {
+            s.rect("btn").size_px(40.0, 40.0).on_hover_dwell(
+                std::time::Duration::from_millis(200),
+                move |_| {
                     fired_inner.set(fired_inner.get() + 1);
-                });
+                },
+            );
         });
         let id = app.ctx().node("btn").unwrap();
         let now = Instant::now();
@@ -5141,11 +5288,12 @@ mod tests {
         let fired2 = fired.clone();
         let mut app = App::new("test", 100, 100).scene(move |s| {
             let fired_inner = fired2.clone();
-            s.rect("btn")
-                .size_px(40.0, 40.0)
-                .on_hover_dwell(std::time::Duration::from_millis(200), move |_| {
+            s.rect("btn").size_px(40.0, 40.0).on_hover_dwell(
+                std::time::Duration::from_millis(200),
+                move |_| {
                     fired_inner.set(fired_inner.get() + 1);
-                });
+                },
+            );
         });
         let id = app.ctx().node("btn").unwrap();
         let now = Instant::now();
@@ -5169,13 +5317,14 @@ mod tests {
     fn dwell_handler_can_mutate_tree_via_ctx() {
         let mut app = App::new("test", 100, 100).scene(move |s| {
             // Tooltip child starts hidden — handler shows it on dwell.
-            s.rect("btn")
-                .size_px(40.0, 40.0)
-                .on_hover_dwell(std::time::Duration::from_millis(100), move |ctx| {
+            s.rect("btn").size_px(40.0, 40.0).on_hover_dwell(
+                std::time::Duration::from_millis(100),
+                move |ctx| {
                     if let Some(n) = ctx.tree.get_mut_raw(ctx.node) {
                         n.style.color = [1.0, 0.0, 0.0, 1.0];
                     }
-                });
+                },
+            );
         });
         let id = app.ctx().node("btn").unwrap();
         let now = Instant::now();
