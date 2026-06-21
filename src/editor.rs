@@ -50,6 +50,12 @@ pub struct EditorState {
     pub placeholder: String,
     /// Logical px. Forwarded to the text child unchanged.
     pub font_size: f32,
+    /// Colour of the typed value text. Applied to `text_node` whenever the
+    /// value (not the placeholder) is shown. Defaults to near-white so a
+    /// freshly-spawned field is legible without extra wiring.
+    pub text_color: [f32; 4],
+    /// Colour of the placeholder text (shown when empty + unfocused).
+    pub placeholder_color: [f32; 4],
     /// Text-display child node id (a `ShapeKind::Text` Node).
     pub text_node: NodeId,
     /// Caret rect child node id (a `ShapeKind::Rect` Node, 2 logical
@@ -398,6 +404,8 @@ mod tests {
             selection_anchor: None,
             placeholder: String::new(),
             font_size: 14.0,
+            text_color: [1.0, 1.0, 1.0, 1.0],
+            placeholder_color: [1.0, 1.0, 1.0, 0.45],
             text_node: dummy,
             caret_node: dummy,
             selection_node: dummy,

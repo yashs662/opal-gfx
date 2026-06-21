@@ -230,6 +230,14 @@ pub struct App {
     /// paste. `None` if arboard init failed (headless / no display) — the
     /// editor still works, clipboard ops just no-op.
     clipboard: Option<arboard::Clipboard>,
+    /// Caret-blink phase anchor for the currently-focused text field. Reset
+    /// on focus + on every edit so the caret shows solid immediately after
+    /// interaction, then blinks. Only consulted while `input.focused` is a
+    /// text field.
+    caret_blink_anchor: Instant,
+    /// Last-applied caret-on state, so the blink only writes opacity (and
+    /// flushes) on the half-second it actually toggles.
+    caret_blink_on: bool,
     /// Latched modifier state from `WindowEvent::ModifiersChanged`.
     /// Consulted by wheel routing for shift-axis swap.
     modifiers: winit::event::Modifiers,
@@ -495,6 +503,8 @@ impl App {
             drag_return: None,
             drag_return_offset: crate::signal::Signal::new([0.0, 0.0]),
             clipboard: None,
+            caret_blink_anchor: Instant::now(),
+            caret_blink_on: true,
             modifiers: winit::event::Modifiers::default(),
             held_scroll_keys: std::collections::HashSet::new(),
             input: InputState::new(),
@@ -1703,8 +1713,134 @@ impl App {
             if (outcome.cursor_moved || outcome.selection_changed) && !outcome.value_changed {
                 self.ctx.tree.mark_transform_dirty();
             }
+            // Keep the caret solid while actively editing — restart the
+            // blink phase (and force it visible) so it doesn't wink out
+            // mid-keystroke.
+            self.reset_caret_blink(node_id);
             self.react();
         }
+    }
+
+    /// Advance the caret blink for the focused text field. Writes the caret
+    /// node's opacity only on the half-second it toggles, and returns the
+    /// next toggle deadline so the loop can wake for it. `None` when no text
+    /// field is focused (caret blink idle → loop can park).
+    fn tick_caret_blink(&mut self, now: Instant) -> (bool, Option<Instant>) {
+        const HALF: std::time::Duration = std::time::Duration::from_millis(530);
+        let Some(field) = self.input.focused else {
+            self.caret_blink_on = true;
+            return (false, None);
+        };
+        let Some(caret_node) = self
+            .ctx
+            .tree
+            .get(field)
+            .and_then(|n| n.editor.as_ref())
+            .map(|ed| ed.caret_node)
+        else {
+            return (false, None);
+        };
+        let elapsed_ms = now.saturating_duration_since(self.caret_blink_anchor).as_millis();
+        let on = (elapsed_ms / HALF.as_millis()).is_multiple_of(2);
+        let changed = on != self.caret_blink_on;
+        if changed {
+            self.caret_blink_on = on;
+            self.ctx
+                .tree
+                .set_opacity(caret_node, if on { 1.0 } else { 0.0 });
+        }
+        let into_phase = (elapsed_ms % HALF.as_millis()) as u64;
+        let next = now + (HALF - std::time::Duration::from_millis(into_phase));
+        (changed, Some(next))
+    }
+
+    /// Byte index of the char boundary in text field `node_id` nearest the
+    /// given x (physical px). Walks the value's char boundaries, measuring
+    /// each prefix against the text child's painted origin. `None` on a
+    /// non-editor node.
+    fn caret_index_at_x(&mut self, node_id: crate::node::NodeId, x: f32) -> Option<usize> {
+        let (value, font_size, text_node) = {
+            let ed = self.ctx.tree.get(node_id).and_then(|n| n.editor.as_ref())?;
+            (ed.value.clone(), ed.font_size, ed.text_node)
+        };
+        let origin_x = self.ctx.tree.get(text_node).map(|n| n.rect[0]).unwrap_or(0.0);
+        let scale = self.scale_factor;
+        let mut best_idx = 0usize;
+        let mut best_dist = f32::MAX;
+        // Every char boundary, including 0 and value.len() (one-past-end).
+        for idx in (0..=value.len()).filter(|&i| value.is_char_boundary(i)) {
+            let w = self
+                .ctx
+                .text
+                .measure(&value[..idx], font_size * scale, font_size * scale * 1.25)
+                .width;
+            let dist = (origin_x + w - x).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = idx;
+            }
+        }
+        Some(best_idx)
+    }
+
+    /// Restart the caret blink solid-on (after focus / click / edit). Resets
+    /// the phase anchor AND forces the caret visible immediately — without
+    /// the explicit `set_opacity`, a click landing mid-blink-off wouldn't
+    /// repaint the caret until the next full cycle (it'd look unresponsive).
+    fn reset_caret_blink(&mut self, field: crate::node::NodeId) {
+        self.caret_blink_anchor = Instant::now();
+        self.caret_blink_on = true;
+        if let Some(cn) = self
+            .ctx
+            .tree
+            .get(field)
+            .and_then(|n| n.editor.as_ref())
+            .map(|ed| ed.caret_node)
+        {
+            self.ctx.tree.set_opacity(cn, 1.0);
+        }
+    }
+
+    /// Place the caret at the click x (physical px) — standard
+    /// click-to-position. Sets a selection anchor at the same spot so a
+    /// subsequent drag selects from here. No-op on a non-editor node.
+    fn place_caret_from_click(&mut self, node_id: crate::node::NodeId, click_x: f32) {
+        let Some(idx) = self.caret_index_at_x(node_id, click_x) else {
+            return;
+        };
+        if let Some(ed) = self.ctx.tree.get_mut_raw(node_id).and_then(|n| n.editor.as_mut()) {
+            ed.cursor = idx;
+            // Anchor here; a plain click leaves an empty (invisible)
+            // selection, a drag extends it.
+            ed.selection_anchor = Some(idx);
+        }
+        self.reset_caret_blink(node_id);
+        self.ctx.tree.mark_transform_dirty();
+        self.react();
+    }
+
+    /// Extend the selection in text field `node_id` to the drag x: keeps the
+    /// press-time anchor, moves the caret to the boundary nearest x. No-op if
+    /// nothing changed or on a non-editor node.
+    fn drag_select_to(&mut self, node_id: crate::node::NodeId, x: f32) -> bool {
+        let Some(idx) = self.caret_index_at_x(node_id, x) else {
+            return false;
+        };
+        let changed = match self.ctx.tree.get_mut_raw(node_id).and_then(|n| n.editor.as_mut()) {
+            Some(ed) if ed.cursor != idx => {
+                // First drag motion seeds an anchor if the press didn't.
+                ed.selection_anchor.get_or_insert(ed.cursor);
+                ed.cursor = idx;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.reset_caret_blink(node_id);
+            self.ctx.tree.mark_transform_dirty();
+            self.react();
+        }
+        changed
     }
 
     /// Lazily init the system clipboard and write `text`. Best-effort:
@@ -1770,7 +1906,7 @@ impl App {
             })
             .collect();
         for id in editor_ids {
-            let (text_node, display) = {
+            let (text_node, display, color) = {
                 let Some(n) = self.ctx.tree.get(id) else {
                     continue;
                 };
@@ -1785,14 +1921,15 @@ impl App {
                     .unwrap_or(false);
                 let show_placeholder =
                     ed.value.is_empty() && !focused && !ed.placeholder.is_empty();
-                let display = if show_placeholder {
-                    ed.placeholder.clone()
+                let (display, color) = if show_placeholder {
+                    (ed.placeholder.clone(), ed.placeholder_color)
                 } else {
-                    ed.value.clone()
+                    (ed.value.clone(), ed.text_color)
                 };
-                (ed.text_node, display)
+                (ed.text_node, display, color)
             };
             self.ctx.tree.set_text(text_node, display);
+            self.ctx.tree.set_color(text_node, color);
         }
     }
 
@@ -1982,6 +2119,11 @@ impl App {
             sig.set(true);
         }
         self.input.focused = target;
+        // Restart the blink solid-on so the caret is visible the instant the
+        // field gains focus (and any prior field's faded-out caret resets).
+        if let Some(next) = target {
+            self.reset_caret_blink(next);
+        }
         // A focused text field repositions/show its caret in
         // reposition_carets, which gates on TRANSFORM.
         self.ctx.tree.mark_transform_dirty();
@@ -3875,7 +4017,15 @@ impl ApplicationHandler for App {
                 let x = position.x as f32;
                 let y = position.y as f32;
                 self.input.cursor = Some([x, y]);
-                if self.bar_drag.is_some() || self.drag_origin.is_some() {
+                // A press captured on a text field turns cursor moves into a
+                // selection drag (handled in `about_to_wait`, coalesced).
+                let editor_captured = self
+                    .input
+                    .captured
+                    .and_then(|c| self.ctx.tree.get(c))
+                    .map(|n| n.editor.is_some())
+                    .unwrap_or(false);
+                if self.bar_drag.is_some() || self.drag_origin.is_some() || editor_captured {
                     // Coalesce: don't apply per OS event. Stash the
                     // latest cursor and let `about_to_wait` push it
                     // through at frame rate. OS cursor fires at 500+ Hz
@@ -4085,6 +4235,19 @@ impl ApplicationHandler for App {
                 if state == ElementState::Pressed {
                     self.begin_drag_if_draggable();
                     self.maybe_fire_unhandled_press();
+                    // Click-to-position-caret: a press inside a text field
+                    // moves the caret to the nearest char boundary.
+                    if let Some(cap) = self.input.captured
+                        && let Some([cx, _]) = self.input.cursor
+                        && self
+                            .ctx
+                            .tree
+                            .get(cap)
+                            .map(|n| n.editor.is_some())
+                            .unwrap_or(false)
+                    {
+                        self.place_caret_from_click(cap, cx);
+                    }
                 } else {
                     // Release: deliver any in-flight drag payload to a
                     // drop target under the cursor, then clear drag state.
@@ -4335,6 +4498,17 @@ impl ApplicationHandler for App {
         // (`on_frame`) can convert physical reads (scroll offsets) to
         // logical layout units. Cheap; the value rarely changes.
         self.ctx.scale = self.scale_factor;
+        // Flush any clipboard write an event handler requested this frame
+        // (e.g. a "click to copy" button) using the shell's persistent
+        // clipboard handle.
+        if let Some(text) = self.ctx.tree.take_clipboard() {
+            self.write_clipboard(text);
+        }
+        // Programmatic focus request (e.g. re-focus a field after a failed
+        // submit) — route through the same path as a click.
+        if let Some(id) = self.ctx.tree.take_focus_request() {
+            self.set_focus(Some(id));
+        }
         // Deferred autocapture: once the deadline elapses, render a
         // settled frame, snap, and exit. Loop has been running normally
         // up to this point so worker state, image uploads, and any
@@ -4446,7 +4620,22 @@ impl ApplicationHandler for App {
             };
             let generic = self.fire_drag(c[0], c[1]);
             let following = self.update_drag_follow(c[0], c[1]);
-            bar || generic || following
+            // Text-field selection drag: a press captured on an editor
+            // extends its selection toward the cursor x.
+            let editor_sel = match self.input.captured {
+                Some(cap)
+                    if self
+                        .ctx
+                        .tree
+                        .get(cap)
+                        .map(|n| n.editor.is_some())
+                        .unwrap_or(false) =>
+                {
+                    self.drag_select_to(cap, c[0])
+                }
+                _ => false,
+            };
+            bar || generic || following || editor_sel
         } else {
             false
         };
@@ -4491,6 +4680,10 @@ impl ApplicationHandler for App {
         if pumped {
             scroll_active = true;
         }
+        // Caret blink for the focused text field. Applies the caret opacity
+        // toggle (if due) and yields the next toggle deadline so the loop
+        // wakes for it; a focused field therefore keeps the loop alive.
+        let (caret_blinked, caret_deadline) = self.tick_caret_blink(now);
         if !timeline_active
             && !scroll_active
             && !drag_moved
@@ -4501,6 +4694,7 @@ impl ApplicationHandler for App {
             && self.next_hover_recheck.is_none()
             && !self.pending_hint_repaint
             && auto_deadline.is_none()
+            && caret_deadline.is_none()
         {
             self.last_scroll_tick = None;
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -4584,7 +4778,14 @@ impl ApplicationHandler for App {
         if hover_moved || drag_moved {
             self.pump_layer_offset_binds();
         }
-        if res.updated || scroll_moved || drag_moved || hover_moved || hook_active || dwell_fired {
+        if res.updated
+            || scroll_moved
+            || drag_moved
+            || hover_moved
+            || hook_active
+            || dwell_fired
+            || caret_blinked
+        {
             if res.updated {
                 self.pump_animated_displays();
             }
@@ -4644,6 +4845,13 @@ impl ApplicationHandler for App {
         };
         // Merge the scripted-input driver's next wake (REMOVABLE).
         let combined = match (combined, auto_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        // Wake for the next caret-blink toggle while a field is focused.
+        let combined = match (combined, caret_deadline) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),

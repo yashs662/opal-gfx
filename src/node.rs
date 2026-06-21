@@ -1533,6 +1533,17 @@ pub struct NodeTree {
     /// drag began. Set by the app shell during a `drag_follow` drag;
     /// `None` otherwise.
     drag_follow: Option<(NodeId, [f32; 2])>,
+    /// Pending system-clipboard write requested by an event handler (via
+    /// [`NodeTree::request_clipboard`], e.g. a "click to copy" button). The
+    /// app shell drains it once per loop iteration and performs the actual
+    /// arboard write — keeps handlers free of platform clipboard deps while
+    /// reusing the shell's persistent clipboard handle.
+    pending_clipboard: Option<String>,
+    /// Pending programmatic focus request from an event handler (via
+    /// [`NodeTree::request_focus`], e.g. re-focusing a text field after a
+    /// failed submit). Drained by the app shell, which routes it through the
+    /// same focus machinery as a click so the caret + blink reset correctly.
+    pending_focus: Option<NodeId>,
 }
 
 impl Default for NodeTree {
@@ -1546,6 +1557,8 @@ impl Default for NodeTree {
             scrollable_ids: Vec::new(),
             current_scale: 1.0,
             drag_follow: None,
+            pending_clipboard: None,
+            pending_focus: None,
         }
     }
 }
@@ -2627,6 +2640,30 @@ impl NodeTree {
     /// have to flag it explicitly.
     fn scroll_mask(&self) -> u32 {
         dirty::SCROLL
+    }
+
+    /// Request a system-clipboard write from an event handler. The text is
+    /// drained + written by the app shell on the next loop iteration. A
+    /// second request in the same frame overwrites the first.
+    pub fn request_clipboard(&mut self, text: impl Into<String>) {
+        self.pending_clipboard = Some(text.into());
+    }
+
+    /// Drain a pending clipboard write (app shell only).
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.pending_clipboard.take()
+    }
+
+    /// Request that `id` be focused (e.g. re-focus a text field after a
+    /// failed submit). The app shell drains it next iteration and routes it
+    /// through the focus machinery so the caret shows + the blink resets.
+    pub fn request_focus(&mut self, id: NodeId) {
+        self.pending_focus = Some(id);
+    }
+
+    /// Drain a pending focus request (app shell only).
+    pub fn take_focus_request(&mut self) -> Option<NodeId> {
+        self.pending_focus.take()
     }
 
     pub fn take_dirty(&mut self) -> u32 {

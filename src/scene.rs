@@ -616,11 +616,16 @@ impl<'a> Scene<'a> {
 
         // 2b. Spawn the text child. Content = value when non-empty.
         //    Empty value renders an empty Text node — placeholder
-        //    handling is layered on later via `.placeholder()`.
-        let text_node = self
-            .ctx
-            .tree
-            .add_child(root_id, Node::text(initial.clone(), font_size).build());
+        //    handling is layered on later via `.placeholder()`. Seeded
+        //    near-white so the value is legible out of the box; override
+        //    with `.text_color()` / `.placeholder_color()`.
+        let default_text_color = [1.0, 1.0, 1.0, 1.0];
+        let text_node = self.ctx.tree.add_child(
+            root_id,
+            Node::text(initial.clone(), font_size)
+                .color(default_text_color)
+                .build(),
+        );
 
         // 3. Spawn the caret. 2 logical-px wide rect, abs-positioned
         //    inside the parent. Initially hidden — visibility tracks
@@ -651,6 +656,8 @@ impl<'a> Scene<'a> {
                 selection_anchor: None,
                 placeholder: String::new(),
                 font_size,
+                text_color: default_text_color,
+                placeholder_color: [1.0, 1.0, 1.0, 0.45],
                 text_node,
                 caret_node,
                 selection_node,
@@ -1503,6 +1510,34 @@ impl<'a> NodeBuilderRef<'a> {
             && let Some(ed) = n.editor.as_mut()
         {
             ed.placeholder = text.into();
+        }
+        self
+    }
+
+    /// Colour of the typed value text. No-op on non-text_field nodes.
+    /// Applied immediately to the text child and remembered so the
+    /// value→placeholder→value swaps keep using it.
+    pub fn text_color(&mut self, color: [f32; 4]) -> &mut Self {
+        let text_node = self.ctx.tree.get_mut_raw(self.id).and_then(|n| {
+            n.editor.as_mut().map(|ed| {
+                ed.text_color = color;
+                ed.text_node
+            })
+        });
+        if let Some(tn) = text_node
+            && let Some(t) = self.ctx.tree.get_mut_raw(tn)
+        {
+            t.style.color = color;
+        }
+        self
+    }
+
+    /// Colour of the placeholder text. No-op on non-text_field nodes.
+    pub fn placeholder_color(&mut self, color: [f32; 4]) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
+            && let Some(ed) = n.editor.as_mut()
+        {
+            ed.placeholder_color = color;
         }
         self
     }
