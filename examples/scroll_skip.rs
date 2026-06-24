@@ -49,8 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("opal-gfx — scroll skip", W, H)
-        .scene(build_scene)
+    let app = App::new("opal-gfx — scroll skip", W, H, ())
+        .scene(|s, _| build_scene(s))
         .headless(|h| {
             // `resumed` already flushed + rendered once (every layer
             // rastered). Find the promoted scroll layer.

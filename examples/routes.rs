@@ -146,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Caller-owned state.
     let view = Signal::new(View::Library);
 
-    let app = App::new("routes", W, H);
+    let app = App::new("routes", W, H, ());
 
     // Token wakes the shell up for a rebuild. Clones into each
     // closure that wants to trigger a view swap.
@@ -176,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    let app = app.scene(move |s| build(s, view.get(), on_library.clone(), on_search.clone()));
+    let app = app.scene(move |s, _| build(s, view.get(), on_library.clone(), on_search.clone()));
 
     // First-run rebuild count, just so the cell variable isn't
     // optimized into nothing on early returns.

@@ -42,8 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The shell's `resumed` already did the initial flush + render (which
     // rasterizes every layer once). The headless closure then probes the
     // damage split directly.
-    let app = App::new("opal-gfx — layer skip", W, H)
-        .scene(build_scene)
+    let app = App::new("opal-gfx — layer skip", W, H, ())
+        .scene(|s, _| build_scene(s))
         .headless(|h| {
             let rebuild_draws = |h: &mut opal_gfx::HeadlessHelper| {
                 let draws: Vec<LayerDraw> = h

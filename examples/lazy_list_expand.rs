@@ -175,9 +175,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let frame_anim = anim_state.clone();
 
-    let app = App::new("lazy_list_expand", W, H)
-        .scene(move |s| build(s, scene_anim.clone(), scene_expanded.clone()))
-        .on_frame(move |ctx, _timeline, _now| {
+    let app = App::new("lazy_list_expand", W, H, ())
+        .scene(move |s, _| build(s, scene_anim.clone(), scene_expanded.clone()))
+        .on_frame(move |ctx, _timeline, _now, _| {
             // Push the currently-animating height into the list.
             // No-op when the slot is absent. The set_* call is
             // idempotent on no-change so it's safe to fire every

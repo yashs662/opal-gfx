@@ -101,8 +101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("opal-gfx — external layer", W, H)
-        .scene(build_scene)
+    let app = App::new("opal-gfx — external layer", W, H, ())
+        .scene(|s, _| build_scene(s))
         .headless(|h| {
             let video = h.ctx.node("video").expect("video node");
             // The external node must be a promoted layer carrying an

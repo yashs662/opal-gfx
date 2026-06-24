@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .init();
 
     let echo: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-    let app = App::new("text input", W, H);
-    let app = app.scene(move |s| build(s, echo.clone()));
+    let app = App::new("text input", W, H, ());
+    let app = app.scene(move |s, _| build(s, echo.clone()));
     app.run()
 }

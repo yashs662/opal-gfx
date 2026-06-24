@@ -83,11 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let mut app = App::new("layering smoke", W, H);
+    let mut app = App::new("layering smoke", W, H, ());
     let (iw, ih, bytes) = make_demo_image();
     let art = app.stage_image_rgba(iw, ih, bytes);
     let app = app
-        .scene(move |s| build(s, art))
+        .scene(move |s, _| build(s, art))
         .capture(1, "debug_captures/layering");
     app.run()
 }

@@ -77,8 +77,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("opal-gfx — glass over layer", W, H)
-        .scene(build_scene)
+    let app = App::new("opal-gfx — glass over layer", W, H, ())
+        .scene(|s, _| build_scene(s))
         .headless(|h| {
             let boxid = h
                 .layer_tree

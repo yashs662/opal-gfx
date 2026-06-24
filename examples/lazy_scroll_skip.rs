@@ -45,8 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("opal-gfx — lazy scroll skip", W, H)
-        .scene(build_scene)
+    let app = App::new("opal-gfx — lazy scroll skip", W, H, ())
+        .scene(|s, _| build_scene(s))
         .headless(|h| {
             let list = h.ctx.node("list").expect("list node");
             // Materialize the initial window (resumed already flushed once,

@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("focus cycle", W, H);
-    let app = app.scene(build);
+    let app = App::new("focus cycle", W, H, ());
+    let app = app.scene(|s, _| build(s));
     app.run()
 }

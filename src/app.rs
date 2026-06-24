@@ -165,7 +165,7 @@ pub type KeyFn = Box<dyn FnMut(KeyCode, ElementState, &mut SceneCtx)>;
 /// row height between click-to-expand and click-to-collapse). Gets
 /// access to the timeline so it can poll active tweens or start new
 /// ones.
-pub type FrameFn = Box<dyn FnMut(&mut SceneCtx, &mut crate::anim::Timeline, Instant)>;
+pub type FrameFn<S> = Box<dyn FnMut(&mut SceneCtx, &mut crate::anim::Timeline, Instant, &mut S)>;
 
 /// Optional outside-press hook. Fires on a left-button
 /// **press** that lands on no interactive node — or on a node tagged
@@ -176,7 +176,11 @@ pub type FrameFn = Box<dyn FnMut(&mut SceneCtx, &mut crate::anim::Timeline, Inst
 /// reaches whatever is behind. After it returns the shell reacts.
 pub type UnhandledPressFn = Box<dyn FnMut(&mut SceneCtx)>;
 
-pub struct App {
+pub struct App<S = ()> {
+    /// User application state, owned by the app and lent to the scene
+    /// builder (`&S`) and the `on_frame`/`on_exit` hooks (`&mut S`) — the
+    /// caller never needs interior mutability to share it across them.
+    state: S,
     config: AppConfig,
     ctx: SceneCtx,
     instances: Vec<ShapeInstance>,
@@ -259,13 +263,13 @@ pub struct App {
     input: InputState,
     timeline: Timeline,
     on_key: Option<KeyFn>,
-    on_frame: Option<FrameFn>,
+    on_frame: Option<FrameFn<S>>,
     on_unhandled_press: Option<UnhandledPressFn>,
     /// One-shot hook fired from `exiting()` (winit's last chance before
     /// the event loop tears down). Use for save-on-quit work — prefs
     /// flush, session disconnect, etc. `Option` so it can be `take`n
     /// (`FnOnce`-style) on first fire.
-    on_exit: Option<Box<dyn FnOnce()>>,
+    on_exit: Option<Box<dyn FnOnce(&mut S)>>,
     headless: Option<HeadlessFn>,
     /// Number of still frames to capture and exit after, or `None` for
     /// a normal interactive run. `Some(n)` triggers headless capture
@@ -380,7 +384,7 @@ pub struct App {
     /// timeline tweens. `FnMut` rather than `FnOnce` because rebuilds
     /// may fire many times over the app's lifetime; captured state
     /// must be re-usable.
-    scene_builder: Option<Box<dyn FnMut(&mut Scene)>>,
+    scene_builder: Option<Box<dyn FnMut(&mut Scene, &S)>>,
     /// Cooperative rebuild signal. Closures (e.g. `on_click` handlers)
     /// can't reach `&mut App` to call `rebuild_scene` directly — they
     /// own a clone of this `Rc<Cell<bool>>` via [`App::rebuild_token`]
@@ -484,10 +488,11 @@ struct DwellTracker {
     fired: bool,
 }
 
-impl App {
-    pub fn new(title: impl Into<String>, width: u32, height: u32) -> Self {
+impl<S> App<S> {
+    pub fn new(title: impl Into<String>, width: u32, height: u32, state: S) -> Self {
         let wake = Arc::new(WakeHandle::new());
         Self {
+            state,
             config: AppConfig::new(title, width, height),
             ctx: SceneCtx::new(),
             instances: Vec::new(),
@@ -575,6 +580,18 @@ impl App {
         self.rebuild_request.clone()
     }
 
+    /// Borrow the owned application state — for setup that runs before
+    /// [`Self::run`] (the scene builder + `on_frame`/`on_exit` hooks get it
+    /// lent automatically once the loop is running).
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+
+    /// Mutably borrow the owned application state (pre-`run` setup).
+    pub fn state_mut(&mut self) -> &mut S {
+        &mut self.state
+    }
+
     /// Get a clone of the cross-thread wake handle. Pass into worker
     /// threads so they can nudge the UI loop out of `ControlFlow::Wait`
     /// after delivering a response on an `mpsc` channel the UI polls
@@ -639,10 +656,10 @@ impl App {
     /// behavior) and stashes it for future [`App::rebuild_scene`]
     /// calls. The closure must be `FnMut` since rebuilds may fire
     /// repeatedly — capture signals + handles by clone, not by move.
-    pub fn scene<F: FnMut(&mut Scene) + 'static>(mut self, mut f: F) -> Self {
+    pub fn scene<F: FnMut(&mut Scene, &S) + 'static>(mut self, mut f: F) -> Self {
         {
             let mut scene = Scene::root(&mut self.ctx);
-            f(&mut scene);
+            f(&mut scene, &self.state);
         }
         self.scene_builder = Some(Box::new(f));
         self
@@ -667,7 +684,7 @@ impl App {
     /// `now` is the wall-clock at the start of the iteration.
     pub fn on_frame<F>(mut self, f: F) -> Self
     where
-        F: FnMut(&mut SceneCtx, &mut crate::anim::Timeline, Instant) + 'static,
+        F: FnMut(&mut SceneCtx, &mut crate::anim::Timeline, Instant, &mut S) + 'static,
     {
         self.on_frame = Some(Box::new(f));
         self
@@ -678,7 +695,7 @@ impl App {
     /// disconnect remote sessions, flush logs). Fires whether the exit
     /// was triggered by the close button, `event_loop.exit()`, or a
     /// kill signal that lets winit unwind cleanly.
-    pub fn on_exit<F: FnOnce() + 'static>(mut self, f: F) -> Self {
+    pub fn on_exit<F: FnOnce(&mut S) + 'static>(mut self, f: F) -> Self {
         self.on_exit = Some(Box::new(f));
         self
     }
@@ -2633,7 +2650,7 @@ impl App {
         };
         {
             let mut scene = Scene::root(&mut self.ctx);
-            builder(&mut scene);
+            builder(&mut scene, &self.state);
         }
         self.scene_builder = Some(builder);
         // 3b. Carry resident external-frame sets (Canvas video) onto their
@@ -3752,7 +3769,7 @@ impl<'a> HeadlessHelper<'a> {
     }
 }
 
-impl ApplicationHandler for App {
+impl<S> ApplicationHandler for App<S> {
     /// Empty user-event handler. The only sender is
     /// [`WakeHandle::wake`]; the payload is unused, the side effect
     /// (winit returning from `Wait` into the next `about_to_wait`)
@@ -3766,7 +3783,7 @@ impl ApplicationHandler for App {
     /// `event_loop.exit()` triggered by a callback, and any clean signal.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(hook) = self.on_exit.take() {
-            hook();
+            hook(&mut self.state);
         }
         // Wait for any in-flight PNG encode to finish writing — the
         // autocapture + exit path otherwise truncates the file when
@@ -4620,7 +4637,7 @@ impl ApplicationHandler for App {
                 "[loop] wake-driven on_frame fired (timeline_tweens={})",
                 self.timeline.len()
             );
-            hook(&mut self.ctx, &mut self.timeline, now);
+            hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
             self.on_frame = Some(hook);
             log::debug!(
                 "[loop] after on_frame: timeline_tweens={} rebuild_requested={}",
@@ -4811,7 +4828,7 @@ impl ApplicationHandler for App {
         // zero lag.
         let hook_active = self.on_frame.is_some();
         if let Some(mut hook) = self.on_frame.take() {
-            hook(&mut self.ctx, &mut self.timeline, now);
+            hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
             self.on_frame = Some(hook);
         }
         // Walk the bind registry every tick the loop is awake. This is
@@ -4945,7 +4962,7 @@ impl ApplicationHandler for App {
 // as real winit events, so the scripted path is the real path.
 // ============================================================================
 #[cfg(feature = "automation")]
-impl App {
+impl<S> App<S> {
     /// Attach a scripted-input run. The driver ticks from `about_to_wait`,
     /// injecting synthetic input + capturing screenshots, then exits the
     /// app when the script ends.

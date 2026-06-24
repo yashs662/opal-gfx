@@ -43,8 +43,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("scrollbar check", W, H)
-        .scene(build)
+    let app = App::new("scrollbar check", W, H, ())
+        .scene(|s, _| build(s))
         .capture(1, "debug_captures/scrollbar")
         .headless(|h| {
             // Push the outer list partway down then settle so the bar

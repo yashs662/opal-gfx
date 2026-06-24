@@ -88,6 +88,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("lazy_list", W, H).scene(build);
+    let app = App::new("lazy_list", W, H, ()).scene(|s, _| build(s));
     app.run()
 }

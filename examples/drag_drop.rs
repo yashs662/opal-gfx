@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .init();
 
     let slider_value = Signal::new(0.35);
-    let app = App::new("drag & drop", W, H);
-    let app = app.scene(move |s| build(s, slider_value.clone()));
+    let app = App::new("drag & drop", W, H, ());
+    let app = app.scene(move |s, _| build(s, slider_value.clone()));
     app.run()
 }

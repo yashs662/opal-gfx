@@ -320,11 +320,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scene_sigs = sigs.clone();
     let key_sigs = sigs.clone();
 
-    let mut app = App::new("opal-gfx", W, H);
+    let mut app = App::new("opal-gfx", W, H, ());
     let (img_w, img_h, img_bytes) = make_demo_image();
     let art = app.stage_image_rgba(img_w, img_h, img_bytes);
     let mut app = app
-        .scene(move |scene| build_scene(scene, &scene_sigs, art))
+        .scene(move |scene, _| build_scene(scene, &scene_sigs, art))
         .capture_from_env();
     if let Some((frames, dir)) = parse_capture_cli() {
         app = app.capture(frames, dir);

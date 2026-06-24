@@ -68,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .init();
 
     let visible = Signal::new(false);
-    let app = App::new("modal", W, H);
+    let app = App::new("modal", W, H, ());
     let rebuild = app.rebuild_token();
 
     // Outside-press dismiss: flip visibility off + request a rebuild.
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scene_vis = visible.clone();
     let scene_rebuild = rebuild.clone();
     let app = app
-        .scene(move |s| build(s, scene_vis.clone(), scene_rebuild.clone()))
+        .scene(move |s, _| build(s, scene_vis.clone(), scene_rebuild.clone()))
         .on_unhandled_press(move |_| {
             if dismiss_vis.get() {
                 dismiss_vis.set(false);
