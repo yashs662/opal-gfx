@@ -405,6 +405,19 @@ impl GpuContext {
         self.external_frame_sets.remove(&node);
     }
 
+    /// [`clear_external_texture`](Self::clear_external_texture), but only if
+    /// the node's resident set still belongs to `epoch` — a decode session's
+    /// exit cleanup that must not wipe a successor session's frames.
+    pub fn clear_external_texture_epoch(&mut self, node: crate::node::NodeId, epoch: u64) {
+        if self
+            .external_frame_sets
+            .get(&node)
+            .is_some_and(|set| set.epoch == epoch)
+        {
+            self.clear_external_texture(node);
+        }
+    }
+
     /// Append one decoded frame to `node`'s resident frame set, uploading it
     /// to a new VRAM texture **once**, and bind it as the shown texture
     /// (first-pass live build). The set is created on the first push. Bytes
@@ -762,9 +775,12 @@ impl GpuContext {
             if r.content.is_empty() {
                 continue;
             }
-            let shaped = match r.max_width {
-                Some(mw) => text.shape_constrained(&r.content, r.font_size, r.line_height, mw),
-                None => text.shape(&r.content, r.font_size, r.line_height),
+            let shaped = match (r.max_width, r.wrap) {
+                (Some(mw), true) => text.shape_wrapped(&r.content, r.font_size, r.line_height, mw),
+                (Some(mw), false) => {
+                    text.shape_constrained(&r.content, r.font_size, r.line_height, mw)
+                }
+                (None, _) => text.shape(&r.content, r.font_size, r.line_height),
             };
             for g in shaped {
                 let Some(entry) = self

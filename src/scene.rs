@@ -86,6 +86,10 @@ pub struct SceneCtx {
     /// physical reads like [`NodeTree::scroll_offset`] and logical layout
     /// units. Mirrors [`crate::event::EventCtx::scale`] for the frame path.
     pub scale: f32,
+    /// Marquee strips registered this build (see [`Scene::marquee`]) — the
+    /// app shell's per-frame tick drives their auto-pan. Rebuilt with the
+    /// scene; dead ids are skipped by the tick.
+    pub(crate) marquees: Vec<NodeId>,
 }
 
 impl Default for SceneCtx {
@@ -102,6 +106,7 @@ impl SceneCtx {
             binds: BindRegistry::default(),
             text: TextResources::new(),
             scale: 1.0,
+            marquees: Vec::new(),
         }
     }
 
@@ -570,6 +575,54 @@ impl<'a> Scene<'a> {
         }
     }
 
+    /// A horizontal auto-panning strip — classic marquee — for one line
+    /// of content that mustn't wrap but may overflow (a long title, a
+    /// multi-artist credit line). `build` spawns the content, which lays
+    /// out at its natural width inside a clipping scroll strip. When it
+    /// overflows, the app shell holds for a beat, pans the content left
+    /// to its end, holds, pans back to the start, and repeats; content
+    /// that fits never moves. The strip is a compositor scroll layer, so
+    /// the pan is composite-only (no re-flatten per frame), and because
+    /// it drives the ordinary scroll offset, hit-testing on interactive
+    /// children (clickable artist names) stays correct mid-pan.
+    ///
+    /// Returns the strip's builder — size/pad it like any row (give it a
+    /// bounded width, e.g. `.w(Len::Fill)` or a px width; `Auto` would
+    /// grow to the content and never overflow).
+    pub fn marquee(
+        &mut self,
+        name: impl IntoNodeName,
+        build: impl FnOnce(&mut Scene),
+    ) -> NodeBuilderRef<'_> {
+        let root_id = self.spawn(name.into_node_name(), SpawnKind::Rect, Axis::Row).id();
+        self.ctx
+            .tree
+            .set_layout_overflow(root_id, Overflow::Scroll, Overflow::Hidden);
+        {
+            let mut strip = NodeBuilderRef {
+                ctx: self.ctx,
+                id: root_id,
+            };
+            // The pan rides the scroll offset; the bar is meaningless
+            // chrome here — keep it from ever painting.
+            strip
+                .layer()
+                .scrollbar(|sb| {
+                    sb.auto_hide(true)
+                        .track_color([0.0; 4])
+                        .thumb_color([0.0; 4])
+                        .thumb_hover_color([0.0; 4])
+                        .thumb_active_color([0.0; 4])
+                })
+                .child(build);
+        }
+        self.ctx.marquees.push(root_id);
+        NodeBuilderRef {
+            ctx: self.ctx,
+            id: root_id,
+        }
+    }
+
     /// Editable single-line text field. Returns a builder pointing at
     /// the **parent** Rect node — chain `.rgba()`, `.border()`,
     /// `.size_px()` etc. on it like any other node. Under the hood
@@ -834,6 +887,20 @@ impl<'a> NodeBuilderRef<'a> {
     /// when the unconstrained shape exceeds it, the layout pass and
     /// glyph builder both substitute `prefix + "…"` truncation. No-op
     /// on non-text nodes.
+    /// Word-wrap this text node at its `max_width_px` constraint —
+    /// multi-line paragraph form (bios, descriptions) instead of the
+    /// default single-line ellipsis truncation. The node's Auto height
+    /// grows to cover every wrapped line. No-op without a prior/later
+    /// [`max_width_px`](Self::max_width_px) or on non-text nodes.
+    pub fn wrap(&mut self) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
+            && let Some(t) = n.text.as_mut()
+        {
+            t.wrap = true;
+        }
+        self
+    }
+
     pub fn max_width_px(&mut self, px: f32) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
             && let Some(t) = n.text.as_mut()
@@ -1052,6 +1119,19 @@ impl<'a> NodeBuilderRef<'a> {
     pub fn axis(&mut self, a: Axis) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
             n.layout.axis = a;
+        }
+        self
+    }
+
+    /// Initial visibility (default `true`). An invisible node and its
+    /// subtree are skipped by flatten entirely — no render, no hit-testing —
+    /// but the node stays in the tree, resolvable by name. Pair with
+    /// [`Tree::set_visible`](crate::node::Tree::set_visible) for state the
+    /// host mirrors per tick: setting it here too keeps a rebuild from
+    /// flashing one frame of the wrong state before the next tick lands.
+    pub fn visible(&mut self, v: bool) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.visible = v;
         }
         self
     }

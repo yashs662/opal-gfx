@@ -174,6 +174,20 @@ pub trait Measurer {
     /// Return `[width, height]` in px for the given shaped text.
     fn measure_text(&mut self, content: &str, font_size: f32, line_height: f32) -> [f32; 2];
 
+    /// Measure `content` word-wrapped at `max_width` (physical px) —
+    /// the multi-line paragraph form: width of the longest wrapped
+    /// line, height covering every line. Default impl falls back to
+    /// the truncating [`Self::measure_text_constrained`].
+    fn measure_text_wrapped(
+        &mut self,
+        content: &str,
+        font_size: f32,
+        line_height: f32,
+        max_width: f32,
+    ) -> [f32; 2] {
+        self.measure_text_constrained(content, font_size, line_height, max_width)
+    }
+
     /// Measure `content` constrained to `max_width` (physical px). When
     /// the unconstrained measurement would exceed the constraint, the
     /// returned dimensions describe the truncated `prefix + "…"` form.
@@ -187,6 +201,40 @@ pub trait Measurer {
         _max_width: f32,
     ) -> [f32; 2] {
         self.measure_text(content, font_size, line_height)
+    }
+}
+
+/// A text node's measurement inputs, snapshotted (content + physical-px
+/// font metrics + the width constraint and whether it wraps into a
+/// paragraph or truncates to one line at that width). Built once per
+/// node per measure site so the constraint semantics live in one place.
+pub(crate) struct TextProbe {
+    content: String,
+    size: f32,
+    lh: f32,
+    max_w: Option<f32>,
+    wrap: bool,
+}
+
+impl TextProbe {
+    fn from_node(t: &crate::node::NodeText, scale: f32) -> Self {
+        Self {
+            content: t.content.clone(),
+            size: t.font_size * scale,
+            lh: t.line_height * scale,
+            max_w: t.max_width.map(|w| w * scale),
+            wrap: t.wrap,
+        }
+    }
+
+    fn measure<M: Measurer>(&self, measurer: &mut M) -> [f32; 2] {
+        match (self.max_w, self.wrap) {
+            (Some(w), true) => measurer.measure_text_wrapped(&self.content, self.size, self.lh, w),
+            (Some(w), false) => {
+                measurer.measure_text_constrained(&self.content, self.size, self.lh, w)
+            }
+            (None, _) => measurer.measure_text(&self.content, self.size, self.lh),
+        }
     }
 }
 
@@ -232,9 +280,7 @@ fn layout_root<M: Measurer>(
         return;
     }
     let style = node.layout.clone();
-    let kind_text = node.text.as_ref().map(|t| {
-        (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale))
-    });
+    let kind_text = node.text.as_ref().map(|t| TextProbe::from_node(t, scale));
 
     let w = resolve_main_size(
         &style.width, viewport[0], measurer, tree, id, &kind_text, true, scale,
@@ -301,18 +347,42 @@ fn layout_children<M: Measurer>(
     let mut fr_total: f32 = 0.0;
     let mut fixed_main: f32 = 0.0;
     for &c in &flow {
-        let (len, text) = {
+        let (len, cross_len, aspect, text) = {
             let n = tree.get(c).expect("flow child");
-            let len = match style.axis {
-                Axis::Row => n.layout.width,
-                Axis::Col => n.layout.height,
+            let (len, cross_len) = match style.axis {
+                Axis::Row => (n.layout.width, n.layout.height),
+                Axis::Col => (n.layout.height, n.layout.width),
             };
-            let text = n
-                .text
-                .as_ref()
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
-            (len, text)
+            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, scale));
+            (len, cross_len, n.layout.aspect_ratio, text)
         };
+        // In a Col parent an aspect-ratio child's height derives from its
+        // width, which resolves on the cross axis independently of the
+        // main-axis flex distribution — so it's knowable now. Resolve it
+        // here so justify slack, Fr shares, and content_size all see the
+        // real height; deferring to the placement override alone would
+        // centre/space children by a stale (usually zero) main size.
+        // (Row parents need nothing here: aspect drives their *cross*
+        // axis, and placement already recomputes it.)
+        if matches!(style.axis, Axis::Col)
+            && let Some(ratio) = aspect
+        {
+            let w = resolve_cross_size(
+                tree,
+                c,
+                &cross_len,
+                cross_size,
+                style.align,
+                &text,
+                measurer,
+                style.axis,
+                scale,
+            );
+            let v = w / ratio.max(f32::EPSILON);
+            fixed_main += v;
+            child_main.push(v);
+            continue;
+        }
         match len {
             Len::Fill => {
                 fr_total += 1.0;
@@ -419,10 +489,7 @@ fn layout_children<M: Measurer>(
                 Axis::Row => n.layout.height,
                 Axis::Col => n.layout.width,
             };
-            let text = n
-                .text
-                .as_ref()
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
+            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, scale));
             (len, text)
         };
         let cross = resolve_cross_size(
@@ -479,10 +546,7 @@ fn layout_children<M: Measurer>(
         let (width_len, height_len, abs_off, text) = {
             let n = tree.get(c).expect("abs child");
             let off = n.layout.abs.unwrap_or([0.0, 0.0]);
-            let text = n
-                .text
-                .as_ref()
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
+            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, scale));
             (n.layout.width, n.layout.height, off, text)
         };
         let w = match width_len {
@@ -491,11 +555,20 @@ fn layout_children<M: Measurer>(
             Len::Fr(_) | Len::Fill => content_w,
             Len::Auto => intrinsic_main(tree, c, Axis::Row, content_h, &text, measurer, scale),
         };
-        let h = match height_len {
-            Len::Px(p) => p * scale,
-            Len::Pct(p) => p * content_h,
-            Len::Fr(_) | Len::Fill => content_h,
-            Len::Auto => intrinsic_main(tree, c, Axis::Col, content_w, &text, measurer, scale),
+        // Aspect ratio drives height from the resolved width for abs
+        // children too, mirroring the flow path above — without this an
+        // `.abs(...).w(Fill).aspect_ratio(r)` node silently lays out at
+        // height 0 (Auto intrinsic of abs-only content).
+        let aspect = tree.get(c).and_then(|n| n.layout.aspect_ratio);
+        let h = if let Some(ratio) = aspect {
+            w / ratio.max(f32::EPSILON)
+        } else {
+            match height_len {
+                Len::Px(p) => p * scale,
+                Len::Pct(p) => p * content_h,
+                Len::Fr(_) | Len::Fill => content_h,
+                Len::Auto => intrinsic_main(tree, c, Axis::Col, content_w, &text, measurer, scale),
+            }
         };
         let x = content_x + abs_off[0] * scale;
         let y = content_y + abs_off[1] * scale;
@@ -517,8 +590,13 @@ fn layout_children<M: Measurer>(
         // measured child extent is NOT the scrollable height. Override the
         // main axis with the full virtual height (item_count * item_height)
         // so the scrollbar + bounds reflect the whole list, not the window.
+        // The container's own vertical padding stays part of the extent —
+        // rows sit inside the content box, so a declared bottom inset must
+        // let the last row scroll clear of the edge (the raw override used
+        // to drop it, leaving the final row flush against the clip).
         if let Some(ll) = p.lazy_list.as_ref() {
-            cs[1] = ll.total_height_logical() * scale;
+            let pad_v = (p.layout.padding[1] + p.layout.padding[3]) * scale;
+            cs[1] = ll.total_height_logical() * scale + pad_v;
         }
         p.content_size = cs;
         // Re-clamp scroll target if not in overscroll mode and content
@@ -545,7 +623,7 @@ fn resolve_main_size<M: Measurer>(
     measurer: &mut M,
     tree: &NodeTree,
     id: NodeId,
-    text: &Option<(String, f32, f32, Option<f32>)>,
+    text: &Option<TextProbe>,
     is_width_axis: bool,
     scale: f32,
 ) -> f32 {
@@ -572,7 +650,7 @@ fn intrinsic_main<M: Measurer>(
     id: NodeId,
     probe_axis: Axis,
     cross_avail: f32,
-    text: &Option<(String, f32, f32, Option<f32>)>,
+    text: &Option<TextProbe>,
     measurer: &mut M,
     scale: f32,
 ) -> f32 {
@@ -580,11 +658,8 @@ fn intrinsic_main<M: Measurer>(
     if !n.visible {
         return 0.0;
     }
-    if let Some((content, size, lh, max_w)) = text {
-        let m = match max_w {
-            Some(w) => measurer.measure_text_constrained(content, *size, *lh, *w),
-            None => measurer.measure_text(content, *size, *lh),
-        };
+    if let Some(probe) = text {
+        let m = probe.measure(measurer);
         return match probe_axis {
             Axis::Row => m[0],
             Axis::Col => m[1],
@@ -602,16 +677,13 @@ fn intrinsic_main_from_node<M: Measurer>(
     self_axis: Axis,
     probe_axis: Axis,
     cross_avail: f32,
-    self_text: &Option<(String, f32, f32, Option<f32>)>,
+    self_text: &Option<TextProbe>,
     measurer: &mut M,
     scale: f32,
 ) -> f32 {
     let Some(n) = tree.get(id) else { return 0.0 };
-    if let Some((content, size, lh, max_w)) = self_text {
-        let m = match max_w {
-            Some(w) => measurer.measure_text_constrained(content, *size, *lh, *w),
-            None => measurer.measure_text(content, *size, *lh),
-        };
+    if let Some(probe) = self_text {
+        let m = probe.measure(measurer);
         return match probe_axis {
             Axis::Row => m[0],
             Axis::Col => m[1],
@@ -624,6 +696,16 @@ fn intrinsic_main_from_node<M: Measurer>(
     if n.children.is_empty() {
         return pad_main;
     }
+    // What the children can actually span on the non-probe axis: the
+    // incoming avail minus this node's own padding there. Without this,
+    // a padded Auto container over-measures Pct/aspect children by its
+    // padding (e.g. a padded col with a `w: Fill` square child reserves
+    // the *unpadded* width as height — a phantom gap below the child).
+    let pad_cross = match probe_axis {
+        Axis::Row => (n.layout.padding[1] + n.layout.padding[3]) * scale,
+        Axis::Col => (n.layout.padding[0] + n.layout.padding[2]) * scale,
+    };
+    let child_avail = (cross_avail - pad_cross).max(0.0);
     // Collect flow children intrinsic sizes along probe_axis.
     let flow: Vec<NodeId> = n
         .children
@@ -650,49 +732,57 @@ fn intrinsic_main_from_node<M: Measurer>(
     if self_axis == probe_axis {
         let mut sum = 0.0f32;
         for c in &flow {
-            let text = tree
-                .get(*c)
-                .and_then(|cn| cn.text.as_ref())
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
-            let len = match probe_axis {
-                Axis::Row => tree.get(*c).map(|cn| cn.layout.width).unwrap_or_default(),
-                Axis::Col => tree.get(*c).map(|cn| cn.layout.height).unwrap_or_default(),
-            };
-            let v = match len {
-                Len::Px(p) => p * scale,
-                Len::Pct(p) => p * cross_avail,
-                Len::Fr(_) | Len::Fill => 0.0,
-                Len::Auto => {
-                    intrinsic_main(tree, *c, probe_axis, cross_avail, &text, measurer, scale)
-                }
-            };
-            sum += v;
+            sum += intrinsic_child_size(tree, *c, probe_axis, child_avail, measurer, scale);
         }
         sum + gap_total + pad_main
     } else {
         let mut mx = 0.0f32;
         for c in &flow {
-            let text = tree
-                .get(*c)
-                .and_then(|cn| cn.text.as_ref())
-                .map(|t| (t.content.clone(), t.font_size * scale, t.line_height * scale, t.max_width.map(|w| w * scale)));
-            let len = match probe_axis {
-                Axis::Row => tree.get(*c).map(|cn| cn.layout.width).unwrap_or_default(),
-                Axis::Col => tree.get(*c).map(|cn| cn.layout.height).unwrap_or_default(),
-            };
-            let v = match len {
-                Len::Px(p) => p * scale,
-                Len::Pct(p) => p * cross_avail,
-                Len::Fr(_) | Len::Fill => 0.0,
-                Len::Auto => {
-                    intrinsic_main(tree, *c, probe_axis, cross_avail, &text, measurer, scale)
-                }
-            };
+            let v = intrinsic_child_size(tree, *c, probe_axis, child_avail, measurer, scale);
             if v > mx {
                 mx = v;
             }
         }
         mx + pad_main
+    }
+}
+
+/// One flow child's intrinsic contribution along `probe_axis`, for
+/// [`intrinsic_main`]. Honours `aspect_ratio`: an aspect child's height
+/// derives from its resolved width (the height `Len` is ignored by
+/// layout for such nodes), so probing the vertical axis measures the
+/// width and divides — without this, a `w: Fill` aspect child would
+/// contribute 0 to an Auto-height parent.
+fn intrinsic_child_size<M: Measurer>(
+    tree: &NodeTree,
+    c: NodeId,
+    probe_axis: Axis,
+    cross_avail: f32,
+    measurer: &mut M,
+    scale: f32,
+) -> f32 {
+    let Some(cn) = tree.get(c) else { return 0.0 };
+    let text = cn.text.as_ref().map(|t| TextProbe::from_node(t, scale));
+    if matches!(probe_axis, Axis::Col)
+        && let Some(ratio) = cn.layout.aspect_ratio
+    {
+        let w = match cn.layout.width {
+            Len::Px(p) => p * scale,
+            Len::Pct(p) => p * cross_avail,
+            Len::Fr(_) | Len::Fill => cross_avail,
+            Len::Auto => intrinsic_main(tree, c, Axis::Row, cross_avail, &text, measurer, scale),
+        };
+        return w / ratio.max(f32::EPSILON);
+    }
+    let len = match probe_axis {
+        Axis::Row => cn.layout.width,
+        Axis::Col => cn.layout.height,
+    };
+    match len {
+        Len::Px(p) => p * scale,
+        Len::Pct(p) => p * cross_avail,
+        Len::Fr(_) | Len::Fill => 0.0,
+        Len::Auto => intrinsic_main(tree, c, probe_axis, cross_avail, &text, measurer, scale),
     }
 }
 
@@ -704,7 +794,7 @@ fn resolve_cross_size<M: Measurer>(
     len: &Len,
     cross_avail: f32,
     align: Align,
-    text: &Option<(String, f32, f32, Option<f32>)>,
+    text: &Option<TextProbe>,
     measurer: &mut M,
     parent_axis: Axis,
     scale: f32,

@@ -184,6 +184,57 @@ impl TextResources {
         self.shape(&s, size_px, line_height_px)
     }
 
+    /// Shape `text` **wrapped** at `max_width_px` — multi-line paragraph
+    /// form (cosmic-text word wrap), glyphs positioned across as many
+    /// baselines as needed. Memoized; the cache key folds the wrap width
+    /// in, since the same string re-wraps differently per width.
+    pub fn shape_wrapped(
+        &mut self,
+        text: &str,
+        size_px: f32,
+        line_height_px: f32,
+        max_width_px: f32,
+    ) -> Vec<ShapedGlyph> {
+        let key = wrap_key(text, size_px, line_height_px, max_width_px);
+        if let Some(cached) = self.shape_cache.get(&key) {
+            return cached.clone();
+        }
+        let out = shape_uncached_width(
+            &mut self.font_system,
+            text,
+            size_px,
+            line_height_px,
+            Some(max_width_px),
+        );
+        self.shape_cache.insert(key, out.clone());
+        out
+    }
+
+    /// Bounding box of [`Self::shape_wrapped`]: width of the longest
+    /// wrapped line, height = line count × line height. Memoized like
+    /// the shape.
+    pub fn measure_wrapped(
+        &mut self,
+        text: &str,
+        size_px: f32,
+        line_height_px: f32,
+        max_width_px: f32,
+    ) -> TextMetrics {
+        let key = wrap_key(text, size_px, line_height_px, max_width_px);
+        if let Some(&cached) = self.measure_cache.get(&key) {
+            return cached;
+        }
+        let m = measure_uncached_width(
+            &mut self.font_system,
+            text,
+            size_px,
+            line_height_px,
+            Some(max_width_px),
+        );
+        self.measure_cache.insert(key, m);
+        m
+    }
+
     /// Rasterize one glyph. Returns `None` for color-emoji glyphs
     /// (stage-1 atlas is R8 only) or missing glyphs.
     pub fn rasterize(&mut self, key: CacheKey) -> Option<RasterizedGlyph> {
@@ -225,6 +276,16 @@ impl crate::layout::Measurer for TextResources {
         let m = self.measure_constrained(content, font_size, line_height, max_width);
         [m.width, m.height]
     }
+    fn measure_text_wrapped(
+        &mut self,
+        content: &str,
+        font_size: f32,
+        line_height: f32,
+        max_width: f32,
+    ) -> [f32; 2] {
+        let m = self.measure_wrapped(content, font_size, line_height, max_width);
+        [m.width, m.height]
+    }
 }
 
 fn shape_key(content: &str, size_px: f32, line_height_px: f32) -> u64 {
@@ -235,14 +296,40 @@ fn shape_key(content: &str, size_px: f32, line_height_px: f32) -> u64 {
     h.finish()
 }
 
+/// Cache key for wrapped shapes — folds the wrap width in (the same
+/// string re-wraps differently per width) plus a tag bit so a wrapped
+/// entry can never collide with an unwrapped one of equal params.
+fn wrap_key(content: &str, size_px: f32, line_height_px: f32, max_width_px: f32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    h.write_u32(size_px.to_bits());
+    h.write_u32(line_height_px.to_bits());
+    h.write_u32(max_width_px.to_bits());
+    h.write_u8(1);
+    h.finish()
+}
+
 fn shape_uncached(
     fs: &mut FontSystem,
     text: &str,
     size_px: f32,
     line_height_px: f32,
 ) -> Vec<ShapedGlyph> {
+    shape_uncached_width(fs, text, size_px, line_height_px, None)
+}
+
+/// Shape with an optional wrap width (cosmic-text buffer width — `None`
+/// = single unconstrained line, `Some(w)` = word-wrapped paragraph).
+fn shape_uncached_width(
+    fs: &mut FontSystem,
+    text: &str,
+    size_px: f32,
+    line_height_px: f32,
+    wrap_width: Option<f32>,
+) -> Vec<ShapedGlyph> {
     let mut buf = Buffer::new(fs, Metrics::new(size_px, line_height_px));
     let attrs = Attrs::new().family(Family::SansSerif);
+    buf.set_size(wrap_width, None);
     buf.set_text(text, &attrs, Shaping::Advanced, None);
     buf.shape_until_scroll(fs, false);
     let mut out = Vec::new();
@@ -265,8 +352,19 @@ fn measure_uncached(
     size_px: f32,
     line_height_px: f32,
 ) -> TextMetrics {
+    measure_uncached_width(fs, text, size_px, line_height_px, None)
+}
+
+fn measure_uncached_width(
+    fs: &mut FontSystem,
+    text: &str,
+    size_px: f32,
+    line_height_px: f32,
+    wrap_width: Option<f32>,
+) -> TextMetrics {
     let mut buf = Buffer::new(fs, Metrics::new(size_px, line_height_px));
     let attrs = Attrs::new().family(Family::SansSerif);
+    buf.set_size(wrap_width, None);
     buf.set_text(text, &attrs, Shaping::Advanced, None);
     buf.shape_until_scroll(fs, false);
     let mut w: f32 = 0.0;

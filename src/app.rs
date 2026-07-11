@@ -4,7 +4,7 @@
 //!
 //! ```ignore
 //! opal_gfx::app::App::new("demo", 1100, 750)
-//!     .scene(|s| build_demo(s))
+//!     .scene(|s, _: &()| build_demo(s))
 //!     .on_key(|code, state, ctx| handle_key(code, state, ctx))
 //!     .run()
 //!     .unwrap();
@@ -77,6 +77,25 @@ const HINT_FADE: Duration = Duration::from_millis(120);
 /// Picked so a continuous change re-checks hover ~10×/s (no per-frame thrash)
 /// and the last-armed check lands shortly after movement stops.
 const HOVER_RECHECK: Duration = Duration::from_millis(90);
+/// How long after the last `Moved`/`Resized` event the modal-loop paint
+/// chain keeps itself alive (see the `RedrawRequested` arm). Long enough
+/// to bridge hold-still moments mid-drag, short enough to die out right
+/// after the interaction ends.
+const MODAL_PUMP: Duration = Duration::from_millis(200);
+/// Marquee pacing (see [`Scene::marquee`]): how long an overflowing strip
+/// rests at each end before panning.
+const MARQUEE_HOLD: Duration = Duration::from_millis(1400);
+/// Marquee pan rate, **logical** px per second (scaled to physical at tick).
+const MARQUEE_SPEED: f32 = 26.0;
+
+/// One marquee strip's auto-pan phase. Slide variants carry the last tick
+/// instant (for dt); hold variants the deadline to resume.
+enum MarqueeState {
+    HoldStart(Instant),
+    SlideEnd(Instant),
+    HoldEnd(Instant),
+    SlideBack(Instant),
+}
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -416,6 +435,16 @@ pub struct App<S = ()> {
     /// stationary cursor. Armed (no-reset) by content-changing flushes; fires
     /// in `about_to_wait`. See `arm_hover_recheck` / `tick_hover_recheck`.
     next_hover_recheck: Option<Instant>,
+    /// Per-strip auto-pan phase for [`Scene::marquee`] strips, keyed by the
+    /// strip's node id. A rebuild re-keys (fresh ids) and restarts from the
+    /// initial hold — the right behavior for freshly-swapped content. Dead
+    /// ids are pruned each tick.
+    marquee_states: std::collections::HashMap<crate::node::NodeId, MarqueeState>,
+    /// Last `Moved`/`Resized` event — while within [`MODAL_PUMP`] the app is
+    /// (very likely) inside the OS modal move/resize loop, where winit stops
+    /// pumping `about_to_wait`; the `RedrawRequested` arm then ticks the
+    /// animations itself and re-requests, keeping the UI live through the drag.
+    last_move_resize: Option<Instant>,
     /// External-wake plumbing for the case where the event loop is
     /// parked on `Wait` (no animation / scroll / dwell) and another
     /// thread (e.g. a worker delivering an async result) needs the UI
@@ -553,6 +582,8 @@ impl<S> App<S> {
             hint_fade: crate::signal::Signal::new(0.0),
             hint_visible: false,
             next_hover_recheck: None,
+            marquee_states: std::collections::HashMap::new(),
+            last_move_resize: None,
             wake: wake.clone(),
             uploader: crate::uploader::Uploader::new(wake.clone()),
             frame_sink: crate::frame_sink::FrameSink::new(wake),
@@ -1121,6 +1152,41 @@ impl<S> App<S> {
         }
     }
 
+    /// One animation step for the modal-loop paint chain (see the
+    /// `RedrawRequested` arm): advance the timeline, fire the app's
+    /// per-frame hook, push bind values, drain queued video frames, and
+    /// re-flatten if anything dirtied. A trimmed `about_to_wait` — no
+    /// input coalescing, no scheduling (WM_PAINT is the clock while the
+    /// modal loop runs).
+    fn pump_modal_frame(&mut self) {
+        let now = Instant::now();
+        self.timeline.tick(now);
+        // The app's per-frame hook is what turns fresh layout into state
+        // (measurement feedback like the now-playing pane deriving its
+        // width from its measured height) — without it here, constraints
+        // that follow the viewport only apply after the resize ends.
+        if let Some(mut hook) = self.on_frame.take() {
+            hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
+            self.on_frame = Some(hook);
+            if self.rebuild_request.replace(false) {
+                self.rebuild_scene();
+            }
+        }
+        // Unconditional: the hook may have set source signals even when
+        // no tween advanced this step.
+        self.process_binds(now);
+        self.pump_animated_displays();
+        self.pump_layer_opacity_binds();
+        let dt = match self.last_scroll_tick {
+            Some(prev) => (now - prev).as_secs_f32().min(0.05),
+            None => 0.0,
+        };
+        self.last_scroll_tick = Some(now);
+        self.ctx.tree.tick_scrolls(dt);
+        self.drain_external_frames();
+        self.flush_tree();
+    }
+
     fn render_once(&mut self) {
         if self.hud_enabled {
             self.refresh_hud_overlay();
@@ -1343,6 +1409,9 @@ impl<S> App<S> {
                 crate::frame_sink::FrameCmd::Clear { node } => {
                     gpu.clear_external_texture(node);
                 }
+                crate::frame_sink::FrameCmd::ClearEpoch { node, epoch } => {
+                    gpu.clear_external_texture_epoch(node, epoch);
+                }
             }
         }
         true
@@ -1511,8 +1580,39 @@ impl<S> App<S> {
     /// reset while one is already pending, which both throttles continuous
     /// change (≈10 Hz) and lets the last-armed check fire once after it
     /// stops. Cheap no-op when the pointer isn't in the window.
+    ///
+    /// One case skips the debounce entirely: the hovered node no longer
+    /// **exists** (a lazy list re-materialized the row under the pointer —
+    /// e.g. every page-append while a playlist streams in). That's not
+    /// "maybe stale", it's wrong right now — its replacement was born with
+    /// a fresh un-hovered signal, and waiting out the debounce paints the
+    /// row un-lit for a beat, a visible ~10 Hz hover flicker for as long
+    /// as the appends keep coming. Re-derive against the fresh hit cache
+    /// synchronously so the replacement row lights up in the same frame.
     fn arm_hover_recheck(&mut self) {
-        if self.input.cursor.is_some() && self.next_hover_recheck.is_none() {
+        let Some([x, y]) = self.input.cursor else {
+            return;
+        };
+        let hovered_dead = self
+            .input
+            .hovered
+            .map(|id| self.ctx.tree.get(id).is_none())
+            .unwrap_or(false);
+        if hovered_dead
+            && self.input.captured.is_none()
+            && self.bar_drag.is_none()
+            && self.drag_origin.is_none()
+        {
+            let change = self.input.on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
+            if change.hovered_changed {
+                self.refresh_dwell(Instant::now());
+            }
+            if change.any() {
+                self.react();
+            }
+            return;
+        }
+        if self.next_hover_recheck.is_none() {
             self.next_hover_recheck = Some(Instant::now() + HOVER_RECHECK);
         }
     }
@@ -1555,6 +1655,102 @@ impl<S> App<S> {
             return true;
         }
         false
+    }
+
+    /// Advance every registered marquee strip (see [`Scene::marquee`]):
+    /// rest at the start, pan to the end, rest, pan back, repeat —
+    /// content that fits (or hasn't laid out yet) never moves. Drives
+    /// the strip's ordinary scroll offset via `restore_scroll`, so the
+    /// pan rides the strip's compositor scroll layer (no re-flatten) and
+    /// hit-testing on interactive children stays correct mid-pan.
+    /// Returns `(moved_any, earliest_wake_deadline)`.
+    fn tick_marquees(&mut self, now: Instant) -> (bool, Option<Instant>) {
+        if self.ctx.marquees.is_empty() {
+            if !self.marquee_states.is_empty() {
+                self.marquee_states.clear();
+            }
+            return (false, None);
+        }
+        fn fold(next: &mut Option<Instant>, d: Instant) {
+            *next = Some(next.map_or(d, |n| n.min(d)));
+        }
+        let speed = MARQUEE_SPEED * self.scale_factor.max(0.5);
+        let frame = Duration::from_millis(16);
+        let mut moved = false;
+        let mut next: Option<Instant> = None;
+        let ids: Vec<crate::node::NodeId> = self.ctx.marquees.clone();
+        for id in ids {
+            let Some(strip_w) = self.ctx.tree.get(id).map(|n| n.rect[2]) else {
+                self.marquee_states.remove(&id);
+                continue;
+            };
+            if strip_w <= 1.0 {
+                // Pre-layout zero rect — try again next frame.
+                fold(&mut next, now + frame);
+                continue;
+            }
+            let max_off = (self.ctx.tree.scrollable_size(id)[0] - strip_w).max(0.0);
+            if max_off <= 1.0 {
+                // Fits — pin at the start, no animation.
+                if self.ctx.tree.scroll_offset(id)[0] > 0.0 {
+                    self.ctx.tree.restore_scroll(id, [0.0, 0.0]);
+                    moved = true;
+                }
+                self.marquee_states.remove(&id);
+                continue;
+            }
+            let st = self
+                .marquee_states
+                .entry(id)
+                .or_insert(MarqueeState::HoldStart(now + MARQUEE_HOLD));
+            match st {
+                MarqueeState::HoldStart(until) => {
+                    if now >= *until {
+                        *st = MarqueeState::SlideEnd(now);
+                        fold(&mut next, now + frame);
+                    } else {
+                        fold(&mut next, *until);
+                    }
+                }
+                MarqueeState::SlideEnd(last) => {
+                    let dt = (now - *last).as_secs_f32().min(0.05);
+                    *last = now;
+                    let cur = self.ctx.tree.scroll_offset(id)[0] + dt * speed;
+                    if cur >= max_off {
+                        self.ctx.tree.restore_scroll(id, [max_off, 0.0]);
+                        *st = MarqueeState::HoldEnd(now + MARQUEE_HOLD);
+                        fold(&mut next, now + MARQUEE_HOLD);
+                    } else {
+                        self.ctx.tree.restore_scroll(id, [cur, 0.0]);
+                        fold(&mut next, now + frame);
+                    }
+                    moved = true;
+                }
+                MarqueeState::HoldEnd(until) => {
+                    if now >= *until {
+                        *st = MarqueeState::SlideBack(now);
+                        fold(&mut next, now + frame);
+                    } else {
+                        fold(&mut next, *until);
+                    }
+                }
+                MarqueeState::SlideBack(last) => {
+                    let dt = (now - *last).as_secs_f32().min(0.05);
+                    *last = now;
+                    let cur = self.ctx.tree.scroll_offset(id)[0] - dt * speed;
+                    if cur <= 0.0 {
+                        self.ctx.tree.restore_scroll(id, [0.0, 0.0]);
+                        *st = MarqueeState::HoldStart(now + MARQUEE_HOLD);
+                        fold(&mut next, now + MARQUEE_HOLD);
+                    } else {
+                        self.ctx.tree.restore_scroll(id, [cur, 0.0]);
+                        fold(&mut next, now + frame);
+                    }
+                    moved = true;
+                }
+            }
+        }
+        (moved, next)
     }
 
     /// Re-sync the hover-dwell tracker against the current hovered
@@ -2642,6 +2838,9 @@ impl<S> App<S> {
         // tree — drop them; the rebuilt scene re-collects them on next flush.
         self.layer_opacity_binds.clear();
         self.layer_offset_x_binds.clear();
+        // Marquee registry likewise holds old ids — the rebuilt scene
+        // re-registers its strips; per-strip pan state re-keys lazily.
+        self.ctx.marquees.clear();
         // 3. Re-invoke the stored builder on the now-empty ctx. Take
         //    + put back so the closure can call back into &mut self
         //    via captures without re-borrowing the builder slot.
@@ -3155,6 +3354,7 @@ fn build_hud_instances(
             font_size,
             line_height: line_h,
             max_width: None,
+            wrap: false,
             clip_rect: crate::gpu::NO_CLIP,
         })
         .collect();
@@ -3222,6 +3422,7 @@ fn build_hint_instances(
         font_size,
         line_height: line_h,
         max_width: None,
+        wrap: false,
         clip_rect: crate::gpu::NO_CLIP,
     }];
     out.extend(gpu.build_glyph_instances(text_res, &refs));
@@ -4052,6 +4253,14 @@ impl<S> ApplicationHandler for App<S> {
                 // backdrop region). Reflow + re-upload at the new size.
                 self.ctx.tree.mark_all_dirty();
                 self.flush_tree();
+                self.last_move_resize = Some(Instant::now());
+                self.request_redraw();
+            }
+            WindowEvent::Moved(_) => {
+                // A window drag runs the OS modal move loop — kick the
+                // modal paint chain (see `RedrawRequested`) so animations
+                // and video keep running while the window is dragged.
+                self.last_move_resize = Some(Instant::now());
                 self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged {
@@ -4089,7 +4298,26 @@ impl<S> ApplicationHandler for App<S> {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // During the OS modal move/resize loop (`drag_window` /
+                // `drag_resize_window` — the undecorated chrome's move +
+                // edge-resize paths) winit stops pumping `about_to_wait`,
+                // which normally drives every animation and redraw — the
+                // UI would freeze for the whole drag. WM_PAINT still
+                // arrives here, so while an interaction is live, tick the
+                // animations in-place and re-request: a self-sustaining
+                // paint chain that dies out MODAL_PUMP after the last
+                // Moved/Resized (zero cost when idle).
+                let modal = self
+                    .last_move_resize
+                    .map(|t| t.elapsed() < MODAL_PUMP)
+                    .unwrap_or(false);
+                if modal {
+                    self.pump_modal_frame();
+                }
                 self.render_once();
+                if modal {
+                    self.request_redraw();
+                }
             }
             WindowEvent::Occluded(occluded) => {
                 if !occluded {
@@ -4745,6 +4973,10 @@ impl<S> ApplicationHandler for App<S> {
         // Re-derive hover if a debounced re-check is due (content changed
         // under a stationary cursor). Returns true if hover flipped.
         let hover_rechecked = self.tick_hover_recheck(now);
+        // Auto-pan marquee strips (rest → pan → rest). `marquee_deadline`
+        // keeps the loop awake through holds; `marquee_moved` joins the
+        // flush sources below so a pan step recomposites.
+        let (marquee_moved, marquee_deadline) = self.tick_marquees(now);
         // Hold-arrow continuous pump: replaces OS auto-repeat for the
         // arrow keys. Need a non-zero `dt` to compute the per-tick
         // delta — gate on a meaningful tick interval.
@@ -4774,6 +5006,8 @@ impl<S> ApplicationHandler for App<S> {
             && !dwell_pending
             && !dwell_fired
             && !hover_rechecked
+            && !marquee_moved
+            && marquee_deadline.is_none()
             && self.next_hover_recheck.is_none()
             && !self.pending_hint_repaint
             && auto_deadline.is_none()
@@ -4868,6 +5102,7 @@ impl<S> ApplicationHandler for App<S> {
             || hook_active
             || dwell_fired
             || caret_blinked
+            || marquee_moved
         {
             if res.updated {
                 self.pump_animated_displays();
@@ -4935,6 +5170,13 @@ impl<S> ApplicationHandler for App<S> {
         };
         // Wake for the next caret-blink toggle while a field is focused.
         let combined = match (combined, caret_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        // Wake for the next marquee step (a pan frame or a hold expiry).
+        let combined = match (combined, marquee_deadline) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -5403,7 +5645,7 @@ mod tests {
     fn rebuild_scene_swaps_named_nodes() {
         let toggle = Rc::new(Cell::new(false));
         let toggle_for_scene = toggle.clone();
-        let app = App::new("test", 100, 100).scene(move |s| {
+        let app = App::new("test", 100, 100, ()).scene(move |s, _: &()| {
             if toggle_for_scene.get() {
                 s.rect("view_b").size_px(20.0, 20.0);
             } else {
@@ -5430,7 +5672,7 @@ mod tests {
         let s2 = Signal::new([0.0_f32, 1.0, 0.0, 1.0]);
         let s1_for_scene = s1.clone();
         let s2_for_scene = s2.clone();
-        let mut app = App::new("test", 100, 100).scene(move |scene| {
+        let mut app = App::new("test", 100, 100, ()).scene(move |scene, _: &()| {
             scene.rect("a").color(s1_for_scene.clone());
             scene.rect("b").color(s2_for_scene.clone());
         });
@@ -5454,7 +5696,7 @@ mod tests {
 
     #[test]
     fn rebuild_scene_with_no_builder_is_noop() {
-        let mut app = App::new("test", 100, 100);
+        let mut app = App::new("test", 100, 100, ());
         // No `.scene(...)` call — no stored builder.
         app.rebuild_scene();
         assert_eq!(app.ctx().tree.len(), 0);
@@ -5467,7 +5709,7 @@ mod tests {
     fn focus_scene(orders: [u32; 4]) -> (App, Vec<crate::node::NodeId>, Vec<Signal<bool>>) {
         let sigs: Vec<Signal<bool>> = (0..4).map(|_| Signal::new(false)).collect();
         let sigs_for_scene = sigs.clone();
-        let mut app = App::new("test", 400, 400).scene(move |s| {
+        let mut app = App::new("test", 400, 400, ()).scene(move |s, _: &()| {
             for i in 0..4 {
                 let mut b = s.rect(format!("n{i}"));
                 b.size_px(100.0, 40.0).on_focus(sigs_for_scene[i].clone());
@@ -5577,11 +5819,11 @@ mod tests {
     fn unhandled_press_fires_on_empty_hit() {
         let count = Rc::new(Cell::new(0u32));
         let count_for_hook = count.clone();
-        let mut app = App::new("test", 200, 200)
+        let mut app = App::new("test", 200, 200, ())
             .on_unhandled_press(move |_ctx| {
                 count_for_hook.set(count_for_hook.get() + 1);
             })
-            .scene(|s| {
+            .scene(|s, _: &()| {
                 s.rect("btn").size_px(50.0, 50.0).on_click(|_| {});
             });
         let _ = app.flush_tree();
@@ -5595,11 +5837,11 @@ mod tests {
     fn unhandled_press_fires_on_dismiss_transparent_scrim() {
         let count = Rc::new(Cell::new(0u32));
         let count_for_hook = count.clone();
-        let mut app = App::new("test", 200, 200)
+        let mut app = App::new("test", 200, 200, ())
             .on_unhandled_press(move |_ctx| {
                 count_for_hook.set(count_for_hook.get() + 1);
             })
-            .scene(|s| {
+            .scene(|s, _: &()| {
                 s.rect("scrim").fill().dismiss_transparent();
             });
         let _ = app.flush_tree();
@@ -5613,11 +5855,11 @@ mod tests {
     fn unhandled_press_skips_regular_interactive_node() {
         let count = Rc::new(Cell::new(0u32));
         let count_for_hook = count.clone();
-        let mut app = App::new("test", 200, 200)
+        let mut app = App::new("test", 200, 200, ())
             .on_unhandled_press(move |_ctx| {
                 count_for_hook.set(count_for_hook.get() + 1);
             })
-            .scene(|s| {
+            .scene(|s, _: &()| {
                 s.rect("btn").size_px(50.0, 50.0).on_click(|_| {});
             });
         let _ = app.flush_tree();
@@ -5630,7 +5872,7 @@ mod tests {
 
     #[test]
     fn unhandled_press_noop_without_hook() {
-        let mut app = App::new("test", 200, 200).scene(|s| {
+        let mut app = App::new("test", 200, 200, ()).scene(|s, _: &()| {
             s.rect("btn").size_px(50.0, 50.0).on_click(|_| {});
         });
         let _ = app.flush_tree();
@@ -5643,7 +5885,7 @@ mod tests {
     fn dismiss_transparent_node_is_a_hit_target() {
         // A scrim with no other interactivity must still flatten into
         // the hit cache so it blocks click-through.
-        let mut app = App::new("test", 200, 200).scene(|s| {
+        let mut app = App::new("test", 200, 200, ()).scene(|s, _: &()| {
             s.rect("scrim").fill().dismiss_transparent();
         });
         let _ = app.flush_tree();
@@ -5667,7 +5909,7 @@ mod tests {
         let start_seen = Rc::new(Cell::new([0.0_f32, 0.0]));
         let last_c = last.clone();
         let start_c = start_seen.clone();
-        let mut app = App::new("test", 400, 400).scene(move |s| {
+        let mut app = App::new("test", 400, 400, ()).scene(move |s, _: &()| {
             let last_c = last_c.clone();
             let start_c = start_c.clone();
             s.rect("knob").size_px(40.0, 40.0).on_drag(move |d| {
@@ -5696,7 +5938,7 @@ mod tests {
     fn on_drag_not_fired_without_capture() {
         let fired = Rc::new(Cell::new(false));
         let fired_c = fired.clone();
-        let mut app = App::new("test", 400, 400).scene(move |s| {
+        let mut app = App::new("test", 400, 400, ()).scene(move |s, _: &()| {
             let fired_c = fired_c.clone();
             s.rect("knob")
                 .size_px(40.0, 40.0)
@@ -5714,7 +5956,7 @@ mod tests {
     fn drag_payload_delivered_to_drop_target() {
         let got = Rc::new(Cell::new(None::<u32>));
         let got_c = got.clone();
-        let mut app = App::new("test", 400, 400).scene(move |s| {
+        let mut app = App::new("test", 400, 400, ()).scene(move |s, _: &()| {
             let got_c = got_c.clone();
             s.col("root").fill().child(move |c| {
                 c.rect("src").size_px(100.0, 40.0).drag_payload(42_u32);
@@ -5744,7 +5986,7 @@ mod tests {
     fn drop_not_fired_when_released_off_target() {
         let got = Rc::new(Cell::new(None::<u32>));
         let got_c = got.clone();
-        let mut app = App::new("test", 400, 400).scene(move |s| {
+        let mut app = App::new("test", 400, 400, ()).scene(move |s, _: &()| {
             let got_c = got_c.clone();
             s.col("root").fill().child(move |c| {
                 c.rect("src").size_px(100.0, 40.0).drag_payload(7_u32);
@@ -5769,7 +6011,7 @@ mod tests {
 
     #[test]
     fn cursor_override_picked_from_hovered_node() {
-        let mut app = App::new("test", 200, 200).scene(|s| {
+        let mut app = App::new("test", 200, 200, ()).scene(|s, _: &()| {
             s.rect("handle")
                 .size_px(20.0, 100.0)
                 .cursor(CursorIcon::EwResize);
@@ -5788,7 +6030,7 @@ mod tests {
     fn width_px_bind_updates_layout_on_signal_change() {
         let w = Signal::new(200.0_f32);
         let w_for_scene = w.clone();
-        let mut app = App::new("test", 800, 400).scene(move |s| {
+        let mut app = App::new("test", 800, 400, ()).scene(move |s, _: &()| {
             s.rect("panel")
                 .width_px_bind(w_for_scene.clone())
                 .h_px(40.0);
@@ -5813,7 +6055,7 @@ mod tests {
     fn height_px_bind_updates_layout_on_signal_change() {
         let h = Signal::new(60.0_f32);
         let h_for_scene = h.clone();
-        let mut app = App::new("test", 400, 600).scene(move |s| {
+        let mut app = App::new("test", 400, 600, ()).scene(move |s, _: &()| {
             s.rect("panel")
                 .w_px(120.0)
                 .height_px_bind(h_for_scene.clone());
@@ -5835,7 +6077,7 @@ mod tests {
         // press position so sliders/scrubbers jump on click.
         let seen = Rc::new(Cell::new([f32::NAN, f32::NAN]));
         let seen_c = seen.clone();
-        let mut app = App::new("test", 400, 400).scene(move |s| {
+        let mut app = App::new("test", 400, 400, ()).scene(move |s, _: &()| {
             let seen_c = seen_c.clone();
             s.rect("track")
                 .size_px(200.0, 8.0)
@@ -5851,7 +6093,7 @@ mod tests {
 
     #[test]
     fn drag_follow_tracks_and_clears() {
-        let mut app = App::new("test", 400, 400).scene(|s| {
+        let mut app = App::new("test", 400, 400, ()).scene(|s, _: &()| {
             s.col("root").fill().child(|c| {
                 c.rect("item")
                     .size_px(80.0, 40.0)
@@ -5894,7 +6136,7 @@ mod tests {
 
     #[test]
     fn drag_follow_click_without_move_clears_immediately() {
-        let mut app = App::new("test", 400, 400).scene(|s| {
+        let mut app = App::new("test", 400, 400, ()).scene(|s, _: &()| {
             s.col("root").fill().child(|c| {
                 c.rect("item")
                     .size_px(80.0, 40.0)
@@ -5923,7 +6165,7 @@ mod tests {
 
     #[test]
     fn drag_without_follow_flag_does_not_lift() {
-        let mut app = App::new("test", 400, 400).scene(|s| {
+        let mut app = App::new("test", 400, 400, ()).scene(|s, _: &()| {
             s.col("root").fill().child(|c| {
                 c.rect("item").size_px(80.0, 40.0).drag_payload(1_u32);
             });
@@ -5939,7 +6181,7 @@ mod tests {
 
     #[test]
     fn begin_drag_ignores_non_draggable_node() {
-        let mut app = App::new("test", 400, 400).scene(|s| {
+        let mut app = App::new("test", 400, 400, ()).scene(|s, _: &()| {
             s.rect("btn").size_px(40.0, 40.0).on_click(|_| {});
         });
         let _ = app.flush_tree();
@@ -6042,8 +6284,8 @@ mod tests {
         // 10K-row list, item_height 40 logical px. With viewport
         // height 200, ~5 rows visible. Buffer 2 each side → ~9 rows
         // materialized.
-        let app = App::new("test", 400, 200);
-        let app = app.scene(move |s| {
+        let app = App::new("test", 400, 200, ());
+        let app = app.scene(move |s, _: &()| {
             s.lazy_list("list", 10_000, 40.0, |row, i| {
                 row.rect(format!("row{i}")).w(Len::Fill).h_px(40.0);
             })
@@ -6076,8 +6318,8 @@ mod tests {
 
     #[test]
     fn lazy_list_scroll_re_materializes() {
-        let app = App::new("test", 400, 200);
-        let app = app.scene(move |s| {
+        let app = App::new("test", 400, 200, ());
+        let app = app.scene(move |s, _: &()| {
             s.lazy_list("list", 10_000, 40.0, |row, i| {
                 row.rect(format!("row{i}")).w(Len::Fill).h_px(40.0);
             })
@@ -6121,7 +6363,7 @@ mod tests {
 
     #[test]
     fn rebuild_scene_resets_input_state() {
-        let mut app = App::new("test", 100, 100).scene(move |s| {
+        let mut app = App::new("test", 100, 100, ()).scene(move |s, _: &()| {
             s.rect("a").size_px(10.0, 10.0);
         });
         // Pretend something captured a node id.
@@ -6145,7 +6387,7 @@ mod tests {
         // fresh hit cache so the signal stays on across rebuilds.
         let hover_sig = crate::signal::Signal::new(false);
         let hover_for_scene = hover_sig.clone();
-        let mut app = App::new("test", 100, 100).scene(move |s| {
+        let mut app = App::new("test", 100, 100, ()).scene(move |s, _: &()| {
             s.rect("btn")
                 .size_px(40.0, 40.0)
                 .on_hover(hover_for_scene.clone());
@@ -6179,7 +6421,7 @@ mod tests {
     fn dwell_arms_on_hover_into_dwell_node() {
         let fired = Rc::new(Cell::new(0_u32));
         let fired2 = fired.clone();
-        let mut app = App::new("test", 100, 100).scene(move |s| {
+        let mut app = App::new("test", 100, 100, ()).scene(move |s, _: &()| {
             let fired_inner = fired2.clone();
             s.rect("btn").size_px(40.0, 40.0).on_hover_dwell(
                 std::time::Duration::from_millis(200),
@@ -6214,7 +6456,7 @@ mod tests {
     fn dwell_resets_when_hover_leaves() {
         let fired = Rc::new(Cell::new(0_u32));
         let fired2 = fired.clone();
-        let mut app = App::new("test", 100, 100).scene(move |s| {
+        let mut app = App::new("test", 100, 100, ()).scene(move |s, _: &()| {
             let fired_inner = fired2.clone();
             s.rect("btn").size_px(40.0, 40.0).on_hover_dwell(
                 std::time::Duration::from_millis(200),
@@ -6243,7 +6485,7 @@ mod tests {
 
     #[test]
     fn dwell_handler_can_mutate_tree_via_ctx() {
-        let mut app = App::new("test", 100, 100).scene(move |s| {
+        let mut app = App::new("test", 100, 100, ()).scene(move |s, _: &()| {
             // Tooltip child starts hidden — handler shows it on dwell.
             s.rect("btn").size_px(40.0, 40.0).on_hover_dwell(
                 std::time::Duration::from_millis(100),

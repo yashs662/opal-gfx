@@ -46,9 +46,12 @@ pub struct TextRef {
     pub font_size: f32,
     pub line_height: f32,
     /// When set, the glyph builder shapes the truncated `prefix + "…"`
-    /// form to fit within this many **physical** pixels. Already
-    /// scale-multiplied by `expand_events_into`.
+    /// form to fit within this many **physical** pixels (or wraps at it,
+    /// when [`wrap`](Self::wrap)). Already scale-multiplied by
+    /// `expand_events_into`.
     pub max_width: Option<f32>,
+    /// Wrap at `max_width` (multi-line) instead of truncating.
+    pub wrap: bool,
     /// Scissor rect propagated from the nearest Scroll/Hidden ancestor.
     /// `crate::gpu::NO_CLIP` when none. Stamped onto every glyph
     /// instance built from this ref.
@@ -562,6 +565,11 @@ pub struct NodeText {
     /// width. Layout multiplies this by the display scale at measure
     /// time, mirroring `font_size` / `line_height`.
     pub max_width: Option<f32>,
+    /// With `max_width` set, wrap onto multiple lines at that width
+    /// instead of single-line ellipsis truncation (paragraph text —
+    /// bios, descriptions). The node's Auto height grows to the wrapped
+    /// line count. No effect without `max_width`.
+    pub wrap: bool,
 }
 
 /// Per-node scroll state. Allocated only on containers whose layout has
@@ -972,6 +980,7 @@ impl Node {
             font_size,
             line_height: font_size * 1.25,
             max_width: None,
+            wrap: false,
         });
         b
     }
@@ -3007,6 +3016,24 @@ impl NodeTree {
                 if invisible {
                     // no-op: nothing to paint
                 } else {
+                    // Snap fill edges to the physical pixel grid — round
+                    // each EDGE (`round(x)` / `round(x+w)`), not origin +
+                    // size independently, so two nodes sharing an edge
+                    // coordinate snap to the same line. This is the
+                    // browser-style defense against the recurring 1px AA
+                    // seam between flush siblings (stacked card sections,
+                    // pane edges): fractional layout (text-derived Auto
+                    // heights, odd splits) can land a shared edge between
+                    // pixels, and each side then anti-aliases its own
+                    // half-covered row. Glyphs already snap the same way;
+                    // images keep sub-pixel placement (resampling shift
+                    // would outweigh a soft edge).
+                    let x0 = abs[0].round();
+                    let y0 = abs[1].round();
+                    let snapped = [
+                        (abs[0] + size[0]).round() - x0,
+                        (abs[1] + size[1]).round() - y0,
+                    ];
                     events.push(FlatEvent::Shape(ShapeInstance {
                         color: node.style.color,
                         border_color: node.style.border_color,
@@ -3014,8 +3041,8 @@ impl NodeTree {
                         border_radius: node.style.border_radius,
                         backdrop_uv_rect: extras,
                         clip_rect: clip,
-                        position: abs,
-                        size,
+                        position: [x0, y0],
+                        size: snapped,
                         shadow_offset: node.style.shadow_offset,
                         shape_kind: node.style.kind.as_u32()
                             | ((node.style.border_sides.bits() as u32) << 8),
@@ -3040,6 +3067,7 @@ impl NodeTree {
                         font_size: t.font_size,
                         line_height: t.line_height,
                         max_width: t.max_width,
+                        wrap: t.wrap,
                         clip_rect: clip,
                     }));
                 }
@@ -3257,11 +3285,18 @@ impl NodeTree {
         // node clips its overflow AND has a corner radius, children clip to
         // its rounded rect (using the node's own radius). Scroll layers clip
         // at composite time (children unclipped here), so they reset it.
-        // Otherwise inherit the ancestor clip radius unchanged.
+        // Otherwise the ancestor radius is inherited **only while the clip
+        // rect is unchanged**: the shader models one rounded rect, so once
+        // a radius-less descendant clipper shrinks the rect, keeping the
+        // ancestor's radius would re-anchor the rounding to the *smaller*
+        // rect's corners — visibly rounding content (e.g. a full-bleed
+        // image in a card) that sits nowhere near the rounded ancestor.
         let child_clip_radius = if is_scroll_layer {
             0.0
         } else if node.layout.clips() && node.style.border_radius[0] > 0.0 {
             node.style.border_radius[0]
+        } else if node.layout.clips() && child_clip != clip {
+            0.0
         } else {
             clip_radius
         };

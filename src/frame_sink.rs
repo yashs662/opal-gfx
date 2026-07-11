@@ -65,6 +65,10 @@ pub(crate) enum FrameCmd {
     Migrate { old: NodeId, new: NodeId },
     /// Drop the node's external texture + any resident frame set.
     Clear { node: NodeId },
+    /// Drop the node's set **only if** it still belongs to `epoch` — a
+    /// decode session's own last-word cleanup that can't wipe a successor
+    /// session's frames.
+    ClearEpoch { node: NodeId, epoch: u64 },
 }
 
 /// Clone-anywhere external-frame submission token. Get one via
@@ -126,6 +130,16 @@ impl FrameSink {
     /// Drop `node`'s external texture + resident set on the next drain.
     pub fn clear(&self, node: NodeId) {
         self.push_cmd(FrameCmd::Clear { node });
+    }
+
+    /// Drop `node`'s set only if it still belongs to `epoch`. This is the
+    /// decoder's own **exit cleanup**: queued from the decode thread after
+    /// its final push/select, FIFO ordering guarantees it lands last — so a
+    /// stop that raced a commit can never leave a stale frame registered.
+    /// The epoch guard makes a late-exiting session's clear a no-op once a
+    /// newer session owns the node.
+    pub fn clear_epoch(&self, node: NodeId, epoch: u64) {
+        self.push_cmd(FrameCmd::ClearEpoch { node, epoch });
     }
 
     /// Drain all pending commands in order. Called from `about_to_wait`.
