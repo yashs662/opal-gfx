@@ -3386,14 +3386,19 @@ impl NodeTree {
                     }
                     None => node.content_size[1].max(size[1]),
                 };
+                // Texture width must cover the horizontal content extent for a
+                // horizontally-scrolling layer (a marquee strip), else panning
+                // samples past the texture's right edge and the last column
+                // smears into a line. Vertical scrollers have `content_size.x
+                // == viewport`, so this stays viewport-wide for them.
+                let tex_w = node.content_size[0].max(size[0]);
                 spans.push(LayerSpan {
                     node: id,
                     events: children_start..children_end,
                     scroll: Some(ScrollSpan {
                         viewport_origin: abs,
                         viewport: size,
-                        // Texture is viewport-wide × `tex_h` tall.
-                        content: [size[0], tex_h],
+                        content: [tex_w, tex_h],
                         tex_origin,
                         scroll: s.current,
                     }),
