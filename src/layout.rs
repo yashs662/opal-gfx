@@ -214,21 +214,49 @@ pub(crate) struct TextProbe {
     lh: f32,
     max_w: Option<f32>,
     wrap: bool,
+    /// The node's width is parent-derived (Fill/Pct/Fr) rather than sized
+    /// to its own content (Auto) — so a wrapped paragraph without an
+    /// explicit cap flows to the available width. Auto-width text keeps
+    /// its content-driven intrinsic sizing.
+    fill_width: bool,
 }
 
 impl TextProbe {
-    fn from_node(t: &crate::node::NodeText, scale: f32) -> Self {
+    fn from_node(t: &crate::node::NodeText, width: &Len, scale: f32) -> Self {
         Self {
             content: t.content.clone(),
             size: t.font_size * scale,
             lh: t.line_height * scale,
             max_w: t.max_width.map(|w| w * scale),
             wrap: t.wrap,
+            fill_width: matches!(width, Len::Fill | Len::Pct(_) | Len::Fr(_)),
         }
     }
 
-    fn measure<M: Measurer>(&self, measurer: &mut M) -> [f32; 2] {
-        match (self.max_w, self.wrap) {
+    /// Measure the text. `wrap_avail` is the layout-available render width,
+    /// supplied only when the caller measures along the block (height)
+    /// axis — where the cross-available value *is* where the paragraph
+    /// will wrap. A wrapped, fill-width node with no explicit cap flows to
+    /// that width, so `.w(Fill).wrap()` fills its box and re-wraps as the
+    /// container resizes. An explicit `max_width_px` (any width) keeps its
+    /// fixed wrap width; Auto-width text keeps its content-driven size.
+    fn measure<M: Measurer>(&self, measurer: &mut M, wrap_avail: Option<f32>) -> [f32; 2] {
+        // Only fill-width nodes wrap to the available width; Auto-width
+        // text sizes to content (its own intrinsic/max cap).
+        let avail = wrap_avail.filter(|_| self.fill_width);
+        let wrap_w = if self.wrap {
+            match (self.max_w, avail) {
+                // Explicit cap wins and is width-agnostic (unchanged).
+                (Some(mx), _) => Some(mx),
+                // Fill-width, no cap → flow to the available width (new).
+                (None, Some(av)) => Some(av),
+                // No cap and no fill width → nothing to wrap at.
+                (None, None) => None,
+            }
+        } else {
+            self.max_w
+        };
+        match (wrap_w, self.wrap) {
             (Some(w), true) => measurer.measure_text_wrapped(&self.content, self.size, self.lh, w),
             (Some(w), false) => {
                 measurer.measure_text_constrained(&self.content, self.size, self.lh, w)
@@ -280,7 +308,10 @@ fn layout_root<M: Measurer>(
         return;
     }
     let style = node.layout.clone();
-    let kind_text = node.text.as_ref().map(|t| TextProbe::from_node(t, scale));
+    let kind_text = node
+        .text
+        .as_ref()
+        .map(|t| TextProbe::from_node(t, &node.layout.width, scale));
 
     let w = resolve_main_size(
         &style.width, viewport[0], measurer, tree, id, &kind_text, true, scale,
@@ -353,7 +384,7 @@ fn layout_children<M: Measurer>(
                 Axis::Row => (n.layout.width, n.layout.height),
                 Axis::Col => (n.layout.height, n.layout.width),
             };
-            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, scale));
+            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, &n.layout.width, scale));
             (len, cross_len, n.layout.aspect_ratio, text)
         };
         // In a Col parent an aspect-ratio child's height derives from its
@@ -489,7 +520,7 @@ fn layout_children<M: Measurer>(
                 Axis::Row => n.layout.height,
                 Axis::Col => n.layout.width,
             };
-            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, scale));
+            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, &n.layout.width, scale));
             (len, text)
         };
         let cross = resolve_cross_size(
@@ -546,7 +577,7 @@ fn layout_children<M: Measurer>(
         let (width_len, height_len, abs_off, text) = {
             let n = tree.get(c).expect("abs child");
             let off = n.layout.abs.unwrap_or([0.0, 0.0]);
-            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, scale));
+            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, &n.layout.width, scale));
             (n.layout.width, n.layout.height, off, text)
         };
         let w = match width_len {
@@ -659,7 +690,11 @@ fn intrinsic_main<M: Measurer>(
         return 0.0;
     }
     if let Some(probe) = text {
-        let m = probe.measure(measurer);
+        // Measuring height (Col): the cross-available value is the render
+        // width, so a wrapped paragraph flows to it. Measuring width (Row):
+        // no known render width yet — keep the intrinsic/max-capped shape.
+        let wrap_avail = matches!(probe_axis, Axis::Col).then_some(cross_avail);
+        let m = probe.measure(measurer, wrap_avail);
         return match probe_axis {
             Axis::Row => m[0],
             Axis::Col => m[1],
@@ -683,7 +718,8 @@ fn intrinsic_main_from_node<M: Measurer>(
 ) -> f32 {
     let Some(n) = tree.get(id) else { return 0.0 };
     if let Some(probe) = self_text {
-        let m = probe.measure(measurer);
+        let wrap_avail = matches!(probe_axis, Axis::Col).then_some(cross_avail);
+        let m = probe.measure(measurer, wrap_avail);
         return match probe_axis {
             Axis::Row => m[0],
             Axis::Col => m[1],
@@ -762,7 +798,7 @@ fn intrinsic_child_size<M: Measurer>(
     scale: f32,
 ) -> f32 {
     let Some(cn) = tree.get(c) else { return 0.0 };
-    let text = cn.text.as_ref().map(|t| TextProbe::from_node(t, scale));
+    let text = cn.text.as_ref().map(|t| TextProbe::from_node(t, &cn.layout.width, scale));
     if matches!(probe_axis, Axis::Col)
         && let Some(ratio) = cn.layout.aspect_ratio
     {
@@ -828,6 +864,61 @@ fn _suppress() {
 mod tests {
     use super::*;
     use crate::node::Node;
+
+    /// Deterministic wrapping measurer: every char is `size*0.5` wide, a
+    /// paragraph breaks into `ceil(natural / max_width)` lines.
+    struct WrapMeasurer;
+    impl Measurer for WrapMeasurer {
+        fn measure_text(&mut self, content: &str, font_size: f32, line_height: f32) -> [f32; 2] {
+            [content.chars().count() as f32 * font_size * 0.5, line_height]
+        }
+        fn measure_text_wrapped(
+            &mut self,
+            content: &str,
+            font_size: f32,
+            line_height: f32,
+            max_width: f32,
+        ) -> [f32; 2] {
+            let natural = content.chars().count() as f32 * font_size * 0.5;
+            let lines = (natural / max_width).ceil().max(1.0);
+            [natural.min(max_width), lines * line_height]
+        }
+    }
+
+    /// A `.w(Fill).wrap()` paragraph with no explicit cap flows to the
+    /// container width: narrower box ⇒ more lines ⇒ taller, and the text
+    /// box spans the full available width. This is the dynamic-wrap path
+    /// (fixed-width panes would leave the old fixed `max_width` stranded).
+    #[test]
+    fn fill_width_wrap_flows_to_container() {
+        let build = |container_w: f32| {
+            let mut tree = NodeTree::new();
+            // Auto-height col so the root height reflects the wrapped text.
+            let root = tree.add_root(
+                Node::rect()
+                    .layout_axis(Axis::Col)
+                    .layout_width(Len::Px(container_w))
+                    .layout_height(Len::Auto)
+                    .build(),
+            );
+            let mut text = Node::text("aaaa aaaa aaaa aaaa", 10.0)
+                .layout_width(Len::Fill)
+                .build();
+            text.text.as_mut().unwrap().wrap = true;
+            let tid = tree.add_child(root, text);
+            compute_layout(&mut tree, [1000.0, 1000.0], &mut WrapMeasurer, 1.0);
+            let r = tree.get(tid).unwrap().rect;
+            (r[2], r[3]) // (width, height)
+        };
+        // natural width = 19 chars * 10 * 0.5 = 95.
+        let (wide_w, wide_h) = build(100.0); // fits on 1 line
+        let (narrow_w, narrow_h) = build(40.0); // wraps to 3 lines
+        // Text box spans the container width in both cases.
+        assert_eq!(wide_w, 100.0);
+        assert_eq!(narrow_w, 40.0);
+        // Narrower container ⇒ more wrapped lines ⇒ taller.
+        assert!(narrow_h > wide_h, "narrow {narrow_h} should exceed wide {wide_h}");
+    }
 
     #[test]
     fn root_fills_viewport() {

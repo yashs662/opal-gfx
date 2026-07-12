@@ -3059,6 +3059,20 @@ impl NodeTree {
             }
             ShapeKind::Text => {
                 if let Some(t) = node.text.as_ref() {
+                    // A wrapped, fill-width paragraph with no explicit cap
+                    // wraps at its resolved box width so it fills and
+                    // re-wraps on resize — mirrors the measurement in
+                    // `layout::TextProbe::measure`. `size[0]` is physical;
+                    // TextRef.max_width is logical (scaled later), so divide
+                    // back out. Explicit `max_width_px` keeps its fixed cap.
+                    let fill_width =
+                        matches!(node.layout.width, Len::Fill | Len::Pct(_) | Len::Fr(_));
+                    let wrap_width = if t.wrap && t.max_width.is_none() && fill_width && scale > 0.0
+                    {
+                        Some(size[0] / scale)
+                    } else {
+                        t.max_width
+                    };
                     events.push(FlatEvent::Text(TextRef {
                         position: abs,
                         color: node.style.color,
@@ -3066,7 +3080,7 @@ impl NodeTree {
                         content: t.content.clone(),
                         font_size: t.font_size,
                         line_height: t.line_height,
-                        max_width: t.max_width,
+                        max_width: wrap_width,
                         wrap: t.wrap,
                         clip_rect: clip,
                     }));

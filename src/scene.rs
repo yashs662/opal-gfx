@@ -887,11 +887,16 @@ impl<'a> NodeBuilderRef<'a> {
     /// when the unconstrained shape exceeds it, the layout pass and
     /// glyph builder both substitute `prefix + "…"` truncation. No-op
     /// on non-text nodes.
-    /// Word-wrap this text node at its `max_width_px` constraint —
-    /// multi-line paragraph form (bios, descriptions) instead of the
-    /// default single-line ellipsis truncation. The node's Auto height
-    /// grows to cover every wrapped line. No-op without a prior/later
-    /// [`max_width_px`](Self::max_width_px) or on non-text nodes.
+    /// Word-wrap this text node into multi-line paragraph form (bios,
+    /// descriptions) instead of the default single-line ellipsis
+    /// truncation; the node's Auto height grows to cover every wrapped
+    /// line. The wrap width is the node's resolved render width — pair
+    /// with `.w(Fill)` (or `Pct`) to flow to the container and re-wrap on
+    /// resize, or with [`max_width_px`](Self::max_width_px) to cap it at a
+    /// fixed width (an explicit cap and a Fill box combine as the smaller
+    /// of the two). No-op on non-text nodes. With neither a Fill/Pct width
+    /// nor a `max_width_px`, there's no width to wrap at and it stays a
+    /// single line.
     pub fn wrap(&mut self) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
             && let Some(t) = n.text.as_mut()
