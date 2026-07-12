@@ -393,23 +393,53 @@ impl From<Computed<Option<ImageHandle>>> for ImageBind {
     }
 }
 
+/// A string derived from a reactive [`Source`] via a format closure —
+/// the reactive-text answer to `Computed`, which can't hold a non-`Copy`
+/// `Rc<str>`. Carries a reader (source value → formatted string) and a
+/// version passthrough so [`text_bound`](crate::scene::Scene::text_bound)
+/// re-reads only when the underlying source changes.
+#[derive(Clone)]
+pub struct DerivedText {
+    read: std::rc::Rc<dyn Fn() -> std::rc::Rc<str>>,
+    version: std::rc::Rc<dyn Fn() -> u64>,
+}
+
 /// Reactive text-content prop, accepted by [`crate::scene::Scene::text_bound`].
 ///
 /// Like [`ImageBind`], it's separate from [`Bind`] — a string can't be
 /// interpolated and `String`/`Rc<str>` aren't `Copy`, so it can't ride
-/// the `Lerp`/`Source` machinery. No `Computed` variant: the `Source`
-/// trait is `Copy`-bound, so a computed string isn't expressible; pass a
-/// [`TextSignal`] (or update it from a closure) for derived text.
+/// the `Lerp`/`Source` machinery. For text derived from a `Signal`/
+/// `Computed` value (a live number, a formatted state), use
+/// [`TextBind::derived`] — it formats the source per read and tracks its
+/// version, so the label re-renders exactly when the value changes (no
+/// scene rebuild, no per-frame `TextSignal` sync).
 pub enum TextBind {
     Value(std::rc::Rc<str>),
     Signal(TextSignal),
+    Derived(DerivedText),
 }
 
 impl TextBind {
+    /// Build a reactive label from any [`Source`] (a `Signal<T>` or
+    /// `Computed<T>`) plus a formatter. Re-reads when the source's version
+    /// advances — e.g. `TextBind::derived(gain_signal, |db| format!("{db:+.0}"))`.
+    pub fn derived<S>(source: S, fmt: impl Fn(S::Value) -> String + 'static) -> Self
+    where
+        S: Source + 'static,
+    {
+        let src_read = source.clone();
+        let src_ver = source;
+        TextBind::Derived(DerivedText {
+            read: std::rc::Rc::new(move || std::rc::Rc::from(fmt(src_read.read()).as_str())),
+            version: std::rc::Rc::new(move || src_ver.version()),
+        })
+    }
+
     pub fn read(&self) -> std::rc::Rc<str> {
         match self {
             TextBind::Value(v) => v.clone(),
             TextBind::Signal(s) => s.get(),
+            TextBind::Derived(d) => (d.read)(),
         }
     }
 
@@ -417,11 +447,12 @@ impl TextBind {
         match self {
             TextBind::Value(_) => 0,
             TextBind::Signal(s) => s.version(),
+            TextBind::Derived(d) => (d.version)(),
         }
     }
 
     pub fn is_reactive(&self) -> bool {
-        matches!(self, TextBind::Signal(_))
+        !matches!(self, TextBind::Value(_))
     }
 }
 
