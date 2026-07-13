@@ -11,6 +11,19 @@ use bytemuck::{Pod, Zeroable};
 pub const SHAPE_KIND_MASK: u32 = 0xFF;
 pub const SHAPE_KIND_RECT: u32 = 0;
 pub const SHAPE_KIND_GLASS: u32 = 1;
+/// Procedural **effect** shape: a single quad whose fragment shader runs a
+/// custom effect selected by [`ShapeInstance::effect_id`], reading generic
+/// float params packed into the otherwise-unused visual fields
+/// (`border_color`/`shadow_color`/`border_radius`/`backdrop_uv_rect` = up to
+/// 16 floats). The scaffold for bespoke shader effects (the first is the EQ
+/// response curve); add an effect by adding a shader case + an id.
+pub const SHAPE_KIND_EFFECT: u32 = 4;
+
+/// Effect ids for [`SHAPE_KIND_EFFECT`] (mirror `shape.wgsl`).
+/// Filled, anti-aliased area under a curve through N control points
+/// (y in [0,1] from the bottom); `roughness` carries N, the 16 param
+/// floats carry the points. Used by the equaliser response graph.
+pub const EFFECT_CURVE: f32 = 0.0;
 /// Glyph blit: samples the `R8Unorm` glyph atlas at
 /// `backdrop_uv_rect` (repurposed as atlas `(u0, v0, w, h)`),
 /// multiplied by `color`. Shadows/borders disabled; `position`+`size`
@@ -87,8 +100,10 @@ pub struct ShapeInstance {
     /// fragment shader rounds the scissor by this radius (rounded overflow
     /// clipping). 0 = square clip. Set by the flatten pass.
     pub clip_radius: f32,
-    /// Padding to align Rust `size_of` with WGSL array stride (160).
-    pub _pad1: f32,
+    /// [`SHAPE_KIND_EFFECT`]-only: which effect the fragment shader runs
+    /// (e.g. [`EFFECT_CURVE`]). Ignored by other kinds. Also closes the
+    /// struct to the 160-byte WGSL array stride (was `_pad1`).
+    pub effect_id: f32,
 }
 
 #[cfg(test)]
@@ -152,7 +167,7 @@ impl Default for ShapeInstance {
             opacity: 1.0,
             scale: [1.0, 1.0],
             clip_radius: 0.0,
-            _pad1: 0.0,
+            effect_id: 0.0,
         }
     }
 }

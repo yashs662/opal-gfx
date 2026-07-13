@@ -1522,6 +1522,7 @@ impl<S> App<S> {
             now,
         );
         process_image_binds(&mut self.ctx.binds.image, &mut self.ctx.tree);
+        process_effect_binds(&mut self.ctx.binds.effect, &mut self.ctx.tree);
         process_text_binds(&mut self.ctx.binds.text, &mut self.ctx.tree);
         process_width_pct_binds(&mut self.ctx.binds.width_pct, &mut self.ctx.tree);
         process_width_px_binds(&mut self.ctx.binds.width_px, &mut self.ctx.tree);
@@ -3119,7 +3120,7 @@ fn expand_events_into(
     scale: f32,
     event_inst_start: &mut Vec<u32>,
 ) -> u32 {
-    use crate::gpu::{SHAPE_KIND_GLASS, SHAPE_KIND_MASK};
+    use crate::gpu::{SHAPE_KIND_EFFECT, SHAPE_KIND_GLASS, SHAPE_KIND_MASK};
     let mut glass_count: u32 = 0;
     // Prefix map event index → first instance index it produces, so a
     // promoted subtree's event range maps to an instance range (events
@@ -3138,16 +3139,20 @@ fn expand_events_into(
                 }
                 // border_radius/border_width/shadow_offset/shadow_blur
                 // are stored in logical px on the style. Position +
-                // size already came out of layout in physical px.
-                s.border_radius = [
-                    s.border_radius[0] * scale,
-                    s.border_radius[1] * scale,
-                    s.border_radius[2] * scale,
-                    s.border_radius[3] * scale,
-                ];
-                s.border_width *= scale;
-                s.shadow_offset = [s.shadow_offset[0] * scale, s.shadow_offset[1] * scale];
-                s.shadow_blur *= scale;
+                // size already came out of layout in physical px. Effect
+                // nodes pack raw float DATA into these geometry fields
+                // (`border_radius` etc.), which must NOT be display-scaled.
+                if kind != SHAPE_KIND_EFFECT {
+                    s.border_radius = [
+                        s.border_radius[0] * scale,
+                        s.border_radius[1] * scale,
+                        s.border_radius[2] * scale,
+                        s.border_radius[3] * scale,
+                    ];
+                    s.border_width *= scale;
+                    s.shadow_offset = [s.shadow_offset[0] * scale, s.shadow_offset[1] * scale];
+                    s.shadow_blur *= scale;
+                }
                 if kind == SHAPE_KIND_GLASS {
                     // For glass: x = blur_amount (px), y = refraction (px).
                     // Both authored in logical px, scaled to physical.
@@ -3519,6 +3524,25 @@ fn process_image_binds(slots: &mut [Option<ImageBindSlot>], tree: &mut crate::no
         slot.last_version = v;
         tree.set_image(slot.node_id, slot.bind.read());
         log::debug!("[binds] image slot updated -> {:?}", slot.bind.read());
+    }
+}
+
+/// Effect-data binds snap: on a version bump, push the source's fresh
+/// float params onto the effect node (`set_effect_data` re-flattens, no
+/// relayout). Lets a shader effect animate from tweened signals without a
+/// scene rebuild.
+fn process_effect_binds(
+    slots: &mut [Option<crate::scene::EffectBindSlot>],
+    tree: &mut crate::node::NodeTree,
+) {
+    for opt in slots.iter_mut() {
+        let Some(slot) = opt.as_mut() else { continue };
+        let v = (slot.version)();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        tree.set_effect_data(slot.node_id, (slot.read)());
     }
 }
 
@@ -3952,6 +3976,7 @@ impl<'a> HeadlessHelper<'a> {
             self.timeline,
             now,
         );
+        process_effect_binds(&mut self.ctx.binds.effect, &mut self.ctx.tree);
         for slot in self.ctx.binds.color.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_color(slot.node_id, disp.get());

@@ -14,8 +14,8 @@ pub use context::{GpuContext, MemoryReport};
 pub use glyph_atlas::{AtlasEntry, GlyphAtlas};
 pub use image_atlas::{ImageAtlas, ImageEntry, ImageHandle};
 pub use instance::{
-    FrameUniform, NO_CLIP, ShapeInstance, SHAPE_KIND_GLASS, SHAPE_KIND_GLYPH, SHAPE_KIND_IMAGE,
-    SHAPE_KIND_MASK, SHAPE_KIND_RECT,
+    EFFECT_CURVE, FrameUniform, NO_CLIP, SHAPE_KIND_EFFECT, SHAPE_KIND_GLASS, SHAPE_KIND_GLYPH,
+    SHAPE_KIND_IMAGE, SHAPE_KIND_MASK, SHAPE_KIND_RECT, ShapeInstance,
 };
 pub use layer::{LayerDraw, LayerResources, ScrollWindow};
 pub use overdraw::{OverdrawResources, OVERDRAW_FORMAT};

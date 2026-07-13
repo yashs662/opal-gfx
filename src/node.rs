@@ -7,7 +7,8 @@
 //! invalidate when the specific slot they refer to is reused.
 
 use crate::gpu::{
-    ImageHandle, NO_CLIP, SHAPE_KIND_GLASS, SHAPE_KIND_IMAGE, SHAPE_KIND_RECT, ShapeInstance,
+    ImageHandle, NO_CLIP, SHAPE_KIND_EFFECT, SHAPE_KIND_GLASS, SHAPE_KIND_IMAGE, SHAPE_KIND_RECT,
+    ShapeInstance,
 };
 use crate::layout::{Align, Axis, Justify, LayoutStyle, Len};
 use crate::signal::Signal;
@@ -359,6 +360,9 @@ pub enum ShapeKind {
     Glass,
     Text,
     Image,
+    /// Procedural effect — a custom fragment shader chosen by the node's
+    /// [`NodeEffect::id`]. See [`SHAPE_KIND_EFFECT`].
+    Effect,
 }
 
 impl ShapeKind {
@@ -368,6 +372,7 @@ impl ShapeKind {
             ShapeKind::Glass => SHAPE_KIND_GLASS,
             ShapeKind::Text => SHAPE_KIND_RECT,
             ShapeKind::Image => SHAPE_KIND_IMAGE,
+            ShapeKind::Effect => SHAPE_KIND_EFFECT,
         }
     }
 }
@@ -552,6 +557,17 @@ impl NodeInteract {
     pub fn is_any(&self) -> bool {
         self.hover.is_some() || self.pressed.is_some() || self.focused.is_some()
     }
+}
+
+/// Procedural-effect state for a [`ShapeKind::Effect`] node: which effect
+/// the shader runs + its float params (e.g. the equaliser curve's control
+/// points). The params are packed into the instance's unused visual fields
+/// by flatten (up to 16 floats), so an effect that needs more must pack
+/// differently.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeEffect {
+    pub id: f32,
+    pub data: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -782,6 +798,10 @@ pub struct Node {
     pub interact: NodeInteract,
     pub text: Option<NodeText>,
     pub image: Option<ImageHandle>,
+    /// Procedural-effect params (`ShapeKind::Effect`): the effect id + its
+    /// float data, packed into the instance by flatten. `None` for every
+    /// other kind. See [`crate::scene::NodeBuilderRef::effect`].
+    pub effect: Option<NodeEffect>,
     /// Fallback fill (rounded by `border_radius`) painted by *this* image
     /// node when it has no resolved handle — a built-in loading placeholder.
     /// Folding the placeholder into the image node (instead of stacking a
@@ -938,6 +958,7 @@ impl Node {
                 interact: NodeInteract::default(),
                 text: None,
                 image: None,
+                effect: None,
                 placeholder_color: None,
                 window_action: None,
                 on_click: None,
@@ -2564,6 +2585,20 @@ impl NodeTree {
         }
     }
 
+    /// Replace a [`ShapeKind::Effect`] node's float params (e.g. the EQ
+    /// curve's control points) without a scene rebuild — the reactive
+    /// `effect_data` bind calls this each frame the source changes.
+    /// Flags `VISUAL` (re-flatten, no re-layout).
+    pub fn set_effect_data(&mut self, id: NodeId, data: Vec<f32>) {
+        if let Some(n) = self.get_mut_raw(id)
+            && let Some(e) = n.effect.as_mut()
+            && e.data != data
+        {
+            e.data = data;
+            self.dirty |= dirty::VISUAL;
+        }
+    }
+
     pub fn set_opacity(&mut self, id: NodeId, opacity: f32) {
         if let Some(n) = self.get_mut_raw(id)
             && n.style.opacity != opacity
@@ -3053,7 +3088,7 @@ impl NodeTree {
                         opacity,
                         scale: node.style.scale,
                         clip_radius,
-                        _pad1: 0.0,
+                        effect_id: 0.0,
                     }));
                 }
             }
@@ -3123,7 +3158,39 @@ impl NodeTree {
                         opacity,
                         scale: node.style.scale,
                         clip_radius,
-                        _pad1: 0.0,
+                        effect_id: 0.0,
+                    }));
+                }
+            }
+            ShapeKind::Effect => {
+                if let Some(e) = node.effect.as_ref() {
+                    // Pack up to 16 param floats into the unused visual
+                    // vec4s; the count rides `roughness`, the effect id
+                    // rides `effect_id`. The shader reads them back per
+                    // `effect_param`.
+                    let mut p = [0.0f32; 16];
+                    for (i, v) in e.data.iter().take(16).enumerate() {
+                        p[i] = *v;
+                    }
+                    events.push(FlatEvent::Shape(ShapeInstance {
+                        color: node.style.color,
+                        border_color: [p[0], p[1], p[2], p[3]],
+                        shadow_color: [p[4], p[5], p[6], p[7]],
+                        border_radius: [p[8], p[9], p[10], p[11]],
+                        backdrop_uv_rect: [p[12], p[13], p[14], p[15]],
+                        clip_rect: clip,
+                        position: abs,
+                        size,
+                        shadow_offset: [0.0; 2],
+                        shape_kind: ShapeKind::Effect.as_u32(),
+                        roughness: e.data.len().min(16) as f32,
+                        border_width: 0.0,
+                        shadow_blur: 0.0,
+                        shadow_opacity: 0.0,
+                        opacity,
+                        scale: [1.0, 1.0],
+                        clip_radius,
+                        effect_id: e.id,
                     }));
                 }
             }
@@ -3622,7 +3689,7 @@ fn bar_quad(
         opacity: 1.0,
         scale: [1.0, 1.0],
         clip_radius: 0.0,
-        _pad1: 0.0,
+        effect_id: 0.0,
     }));
 }
 
@@ -3681,7 +3748,7 @@ fn emit_scroll_thumb(
         opacity: 1.0,
         scale: [1.0, 1.0],
         clip_radius: 0.0,
-        _pad1: 0.0,
+        effect_id: 0.0,
     }));
     spans.push(LayerSpan {
         node: node_id,

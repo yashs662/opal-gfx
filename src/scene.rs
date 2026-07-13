@@ -66,8 +66,8 @@ impl<T: IntoNodeName> IntoNodeName for Option<T> {
     }
 }
 use crate::layout::{Align, Axis, Justify, Len, Overflow};
-use crate::node::{Node, NodeId, NodeInteract, NodeTree, WindowAction};
-use crate::reactive::{Bind, ImageBind, TextBind};
+use crate::node::{Node, NodeEffect, NodeId, NodeInteract, NodeTree, ShapeKind, WindowAction};
+use crate::reactive::{Bind, Computed, ImageBind, TextBind};
 use crate::signal::Signal;
 use crate::text::TextResources;
 
@@ -172,6 +172,9 @@ impl SceneCtx {
             |s| dropped_set.contains(&s.node_id),
         );
         let _ = tombstone_matching(&mut self.binds.opacity, &mut self.binds.opacity_free, |s| {
+            dropped_set.contains(&s.node_id)
+        });
+        let _ = tombstone_matching(&mut self.binds.effect, &mut self.binds.effect_free, |s| {
             dropped_set.contains(&s.node_id)
         });
 
@@ -293,6 +296,13 @@ pub struct BindRegistry {
     pub opacity: Vec<Option<OpacityBindSlot>>,
     /// Tombstoned `opacity` indices available for reuse.
     pub opacity_free: Vec<u32>,
+    /// Effect-data binds. Each slot drives a `ShapeKind::Effect` node's
+    /// float params via `set_effect_data` (re-flatten, no relayout). No
+    /// tween — the source is expected to already carry animated values
+    /// (e.g. a `Computed` over tweened band signals).
+    pub effect: Vec<Option<EffectBindSlot>>,
+    /// Tombstoned `effect` indices available for reuse.
+    pub effect_free: Vec<u32>,
 }
 
 /// Store `slot`, reusing a tombstoned index from `free` if one exists
@@ -331,6 +341,18 @@ pub struct SizeBindSlot {
 pub struct ImageBindSlot {
     pub node_id: NodeId,
     pub bind: ImageBind,
+    pub last_version: u64,
+}
+
+/// A reactive effect-data bind: reads a `Vec<f32>` of params from a
+/// `Computed`/`Signal` source and pushes it onto a `ShapeKind::Effect`
+/// node when the source's version advances. Type-erased (the source's
+/// value type is hidden behind the closures) so any `Computed<[f32; N]>`
+/// can drive it.
+pub struct EffectBindSlot {
+    pub node_id: NodeId,
+    pub read: std::rc::Rc<dyn Fn() -> Vec<f32>>,
+    pub version: std::rc::Rc<dyn Fn() -> u64>,
     pub last_version: u64,
 }
 
@@ -419,6 +441,26 @@ impl<'a> Scene<'a> {
     /// Frosted glass rect. Pass `()` for anon.
     pub fn glass(&mut self, name: impl IntoNodeName) -> NodeBuilderRef<'_> {
         self.spawn(name.into_node_name(), SpawnKind::Glass, Axis::Col)
+    }
+
+    /// A procedural-effect quad, painted by a custom fragment shader
+    /// selected via [`effect_id`](NodeBuilderRef::effect_id). Feed params
+    /// with [`effect_data`](NodeBuilderRef::effect_data) or the reactive
+    /// [`effect_data_bind`](NodeBuilderRef::effect_data_bind). Pass `()`
+    /// for anon. The scaffold for bespoke shader effects.
+    pub fn effect(&mut self, name: impl IntoNodeName) -> NodeBuilderRef<'_> {
+        self.spawn(name.into_node_name(), SpawnKind::Effect, Axis::Col)
+    }
+
+    /// A filled, anti-aliased response-curve effect (a Catmull-Rom spline
+    /// through the control points, filled below with `color` + a crisp
+    /// stroke on the curve). Feed the point ys (0..1 from the bottom) via
+    /// [`effect_data`](NodeBuilderRef::effect_data) / a reactive
+    /// [`effect_data_bind`](NodeBuilderRef::effect_data_bind).
+    pub fn curve(&mut self, name: impl IntoNodeName) -> NodeBuilderRef<'_> {
+        let mut r = self.effect(name);
+        r.effect_id(crate::gpu::EFFECT_CURVE);
+        r
     }
 
     /// Text child. Default size is `Len::Auto` on both axes — the
@@ -731,6 +773,12 @@ impl<'a> Scene<'a> {
             SpawnKind::Glass => Node::glass().build(),
             SpawnKind::Text(content, size) => Node::text(content, size).build(),
             SpawnKind::Image(handle) => Node::image(handle).build(),
+            SpawnKind::Effect => {
+                let mut n = Node::rect().build();
+                n.style.kind = ShapeKind::Effect;
+                n.effect = Some(NodeEffect::default());
+                n
+            }
         };
         node.layout.axis = axis;
         let id = match self.parent {
@@ -749,6 +797,7 @@ enum SpawnKind {
     Glass,
     Text(String, f32),
     Image(ImageHandle),
+    Effect,
 }
 
 pub struct NodeBuilderRef<'a> {
@@ -912,6 +961,50 @@ impl<'a> NodeBuilderRef<'a> {
         {
             t.max_width = Some(px);
         }
+        self
+    }
+
+    /// Select which effect a [`Scene::effect`] node's shader runs. No-op on
+    /// non-effect nodes.
+    pub fn effect_id(&mut self, id: f32) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
+            && let Some(e) = n.effect.as_mut()
+        {
+            e.id = id;
+        }
+        self
+    }
+
+    /// Set an effect node's float params (static). For a `curve`, the
+    /// control-point ys (0..1 from the bottom). No-op on non-effect nodes.
+    pub fn effect_data(&mut self, data: &[f32]) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
+            && let Some(e) = n.effect.as_mut()
+        {
+            e.data = data.to_vec();
+        }
+        self
+    }
+
+    /// Bind an effect node's params to a reactive `Computed<[f32; N]>` — the
+    /// engine pushes the fresh values onto the node whenever the source
+    /// changes (no scene rebuild), so an effect driven by tweened signals
+    /// animates smoothly. Seeds the current value immediately.
+    pub fn effect_data_bind<const N: usize>(&mut self, source: Computed<[f32; N]>) -> &mut Self {
+        let init = source.read();
+        self.effect_data(&init);
+        let read_src = source.clone();
+        let ver_src = source.clone();
+        alloc_slot(
+            &mut self.ctx.binds.effect,
+            &mut self.ctx.binds.effect_free,
+            EffectBindSlot {
+                node_id: self.id,
+                read: std::rc::Rc::new(move || Vec::from(read_src.read())),
+                version: std::rc::Rc::new(move || ver_src.version()),
+                last_version: source.version(),
+            },
+        );
         self
     }
 

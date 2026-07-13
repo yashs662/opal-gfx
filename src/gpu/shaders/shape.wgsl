@@ -15,6 +15,11 @@ const SHAPE_KIND_RECT: u32  = 0u;
 const SHAPE_KIND_GLASS: u32 = 1u;
 const SHAPE_KIND_GLYPH: u32 = 2u;
 const SHAPE_KIND_IMAGE: u32 = 3u;
+// Procedural effect: a fragment shader selected by `effect_id`, reading
+// float params from the otherwise-unused visual fields. Scaffold for
+// bespoke shader effects — add one by adding a case in `effect_frag` + an id.
+const SHAPE_KIND_EFFECT: u32 = 4u;
+const EFFECT_CURVE: u32 = 0u;
 const SHAPE_KIND_MASK: u32  = 0xFFu;
 // Border-side bits stored in `shape_kind >> 8`. 0b1111 = all (default).
 const BORDER_SIDE_TOP: u32    = 0x1u;
@@ -53,7 +58,7 @@ struct ShapeInstance {
     /// Corner radius (px) of the clip rect — rounds the scissor (rounded
     /// overflow clipping). 0 = square clip.
     clip_radius: f32,
-    _pad1: f32,
+    effect_id: f32,
 }
 
 // Signed distance to a rounded rect with min `lo`, max `hi`, corner
@@ -327,6 +332,87 @@ fn compute_shadow(inst: ShapeInstance, px: vec2<f32>, center: vec2<f32>,
     return s;
 }
 
+// --- Procedural effects (SHAPE_KIND_EFFECT) -----------------------------
+// Effect params are packed into the unused visual fields: up to 16 floats
+// across border_color/shadow_color/border_radius/backdrop_uv_rect.
+
+fn effect_param(inst: ShapeInstance, i: u32) -> f32 {
+    if (i < 4u) { return inst.border_color[i]; }
+    if (i < 8u) { return inst.shadow_color[i - 4u]; }
+    if (i < 12u) { return inst.border_radius[i - 8u]; }
+    return inst.backdrop_uv_rect[i - 12u];
+}
+
+fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    return 0.5 * (2.0 * p1
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+}
+
+// Curve height (0..1 from the bottom) at `x` in [0,1]. `n` control points
+// sit at x = (i + 0.5)/n; a Catmull-Rom spline smooths between them and the
+// ends hold flat. Roughness carries `n`; the params carry the point ys.
+fn curve_height(inst: ShapeInstance, n: u32, x: f32) -> f32 {
+    if (n == 0u) { return 0.0; }
+    if (n == 1u) { return effect_param(inst, 0u); }
+    let fx = x * f32(n) - 0.5; // fractional control-point index
+    if (fx <= 0.0) { return effect_param(inst, 0u); }
+    if (fx >= f32(n - 1u)) { return effect_param(inst, n - 1u); }
+    let i = u32(floor(fx));
+    let t = fx - f32(i);
+    let i0 = select(i - 1u, 0u, i == 0u);
+    let i3 = min(i + 2u, n - 1u);
+    return clamp(catmull_rom(
+        effect_param(inst, i0),
+        effect_param(inst, i),
+        effect_param(inst, i + 1u),
+        effect_param(inst, i3),
+        t,
+    ), 0.0, 1.0);
+}
+
+// Premultiplied rgba for the EQ response curve: a translucent-`color` fill
+// under the spline, with a crisp full-alpha stroke on the curve itself,
+// both anti-aliased via screen-space derivatives. `rel` = fragment position
+// in the quad, (0,0) top-left .. (1,1) bottom-right.
+fn effect_curve_frag(inst: ShapeInstance, rel: vec2<f32>) -> vec4<f32> {
+    let n = u32(inst.roughness + 0.5);
+    let h = curve_height(inst, n, rel.x);
+    // Work in pixels within the quad so the stroke has a real px width.
+    let edge_y_px = (1.0 - h) * inst.size.y; // curve position from the top
+    let frag_y_px = rel.y * inst.size.y;
+    let d_vert = frag_y_px - edge_y_px; // + below the curve
+    // Perpendicular distance = vertical / sqrt(1 + slope²), so a steep part
+    // of the curve keeps the *same* line width instead of thinning. The
+    // slope is the curve's screen-space y-derivative (px-y per px-x).
+    let slope = dpdx(edge_y_px);
+    let inv_len = inverseSqrt(1.0 + slope * slope);
+    let d_perp = d_vert * inv_len;
+    // Fill below the curve (AA the boundary perpendicular to it).
+    let fill_cov = clamp(d_perp + 0.5, 0.0, 1.0);
+    // Even-width stroke centred on the curve (~1.5 px half-width + 1 px AA).
+    let stroke = 1.0 - smoothstep(1.5, 2.5, abs(d_perp));
+    let rgb_lin = srgb_to_linear(inst.color.rgb);
+    let a = max(inst.color.a * fill_cov, stroke);
+    return vec4<f32>(rgb_lin * a, a);
+}
+
+fn effect_frag(inst: ShapeInstance, px: vec2<f32>) -> vec4<f32> {
+    let size = max(inst.size, vec2<f32>(1.0));
+    let rel = (px - inst.position) / size;
+    if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
+        return vec4<f32>(0.0);
+    }
+    let eff = u32(inst.effect_id + 0.5);
+    if (eff == EFFECT_CURVE) {
+        return effect_curve_frag(inst, rel);
+    }
+    return vec4<f32>(0.0);
+}
+
 // Fragment entry for the backdrop (opaque) pass. Group 1 (the
 // blurred backdrop sampler) is omitted — glass would feedback-loop on
 // the texture being written. Glyph + image atlases (groups 2 and 3)
@@ -385,6 +471,10 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
         let a = sample.a * inst.color.a * inst.opacity * comp_alpha;
         let rgb = sample.rgb * tint_lin * a;
         return vec4<f32>(rgb, a);
+    }
+
+    if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_EFFECT) {
+        return effect_frag(inst, px) * inst.opacity;
     }
 
     let center = inst.position + inst.size * 0.5;
@@ -467,6 +557,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let a = sample.a * inst.color.a * inst.opacity * comp_alpha;
         let rgb = sample.rgb * tint_lin * a;
         return vec4<f32>(rgb, a) * win_cov;
+    }
+
+    if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_EFFECT) {
+        return effect_frag(inst, px) * inst.opacity * win_cov;
     }
 
     let center = inst.position + inst.size * 0.5;
