@@ -40,9 +40,8 @@ fn build(s: &mut Scene) {
             // The lazy list itself is a scroll container — chain
             // builder methods on it directly. The render closure runs
             // once per visible row at flush time.
-            let items: Rc<Vec<String>> = Rc::new(
-                (0..ROWS).map(|i| format!("Track #{i:05}")).collect(),
-            );
+            let items: Rc<Vec<String>> =
+                Rc::new((0..ROWS).map(|i| format!("Track #{i:05}")).collect());
             let items_for_render = items.clone();
             p.lazy_list("playlist", ROWS, ROW_H, move |row, i| {
                 let label = &items_for_render[i as usize];

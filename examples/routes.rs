@@ -125,8 +125,12 @@ fn build(s: &mut Scene, view: View, on_library: Rc<dyn Fn()>, on_search: Rc<dyn 
                             .rgba(0.18, 0.20, 0.24, 1.0)
                             .radius(20.0)
                             .border(1.0, [1.0, 1.0, 1.0, 0.10]);
-                        b.text("search_lbl", "Search — try the text_input demo for editing.", 18.0)
-                            .color([1.0, 1.0, 1.0, 0.95]);
+                        b.text(
+                            "search_lbl",
+                            "Search — try the text_input demo for editing.",
+                            18.0,
+                        )
+                        .color([1.0, 1.0, 1.0, 0.95]);
                         b.rect("search_result_1")
                             .w(Len::Fill)
                             .h_px(60.0)

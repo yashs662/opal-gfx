@@ -76,25 +76,26 @@ pub use app::{App, AppConfig, HeadlessHelper, WakeHandle};
 #[cfg(feature = "automation")]
 pub use automation::{Script, Step};
 pub use editor::{EditOp, EditOutcome, EditorState};
-pub use lazy_list::LazyListState;
 pub use event::{
-    handler, DragCtx, DragHandler, DropCtx, DropHandler, EventCtx, EventHandler, HoverCtx,
-    HoverHandler, WheelCtx, WheelHandler,
+    DragCtx, DragHandler, DropCtx, DropHandler, EventCtx, EventHandler, HoverCtx, HoverHandler,
+    WheelCtx, WheelHandler, handler,
 };
+pub use frame_sink::FrameSink;
 pub use gpu::{
     FrameStats, FrameTiming, FrameUniform, GpuContext, ImageAtlas, ImageEntry, ImageHandle,
     MemoryReport, ShapeInstance,
 };
 pub use input::{InputChange, InputState};
 pub use layer::{Damage, ExternalRect, Layer, LayerTree};
-pub use overlay::Overlay;
 pub use layout::{Align, Axis, Justify, LayoutStyle, Len, Measurer, NullMeasurer, Overflow};
+pub use lazy_list::LazyListState;
 pub use node::{
-    dirty, BarSide, BorderSides, HitEntry, ImageRef, Node, NodeBuilder, NodeId, NodeTree,
-    ScrollAxis, ScrollHit, ScrollState, ScrollbarHit, ScrollbarStyle, ShapeKind, ShapeStyle,
-    TextRef, WindowAction,
+    BarSide, BorderSides, HitEntry, ImageRef, Node, NodeBuilder, NodeId, NodeTree, ScrollAxis,
+    ScrollHit, ScrollState, ScrollbarHit, ScrollbarStyle, ShapeKind, ShapeStyle, TextRef,
+    WindowAction, dirty,
 };
-pub use reactive::{animated, AnimatedBind, Bind, Computed, DepTuple, ImageBind, Source, TextBind};
+pub use overlay::Overlay;
+pub use reactive::{AnimatedBind, Bind, Computed, DepTuple, ImageBind, Source, TextBind, animated};
 pub use scene::{
     BindRegistry, ColorBindSlot, HeightPxBindSlot, ImageBindSlot, IntoNodeName, NodeBuilderRef,
     PositionBindSlot, Scene, SceneCtx, SizeBindSlot, SubtreeRemoval, TextBindSlot,
@@ -102,8 +103,7 @@ pub use scene::{
 };
 pub use signal::{Signal, TextSignal};
 pub use splash::{Splash, SplashBitmap, SplashConfig};
-pub use winit::window::CursorIcon;
 pub use svg::{rasterize_svg, rasterize_svg_to};
 pub use text::{RasterizedGlyph, ShapedGlyph, TextMetrics, TextResources};
-pub use frame_sink::FrameSink;
 pub use uploader::Uploader;
+pub use winit::window::CursorIcon;

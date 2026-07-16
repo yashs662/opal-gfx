@@ -48,7 +48,33 @@ use crate::signal::Signal;
 const WIDGET_TWEEN_BASE: u32 = 0xF000_0000;
 static NEXT_WIDGET_KEY: AtomicU32 = AtomicU32::new(WIDGET_TWEEN_BASE);
 
-/// A modal overlay. Cheap to clone (an `Rc`-backed signal + a few `Copy`
+/// Default morph spring — a quick, decisive move into the new height with a
+/// damping ratio just under critical (ζ≈0.77) for a barely-there bounce at
+/// the tail. Snappy, not springy.
+const MORPH_SPRING: Curve = Curve::Spring {
+    stiffness: 380.0,
+    damping: 30.0,
+};
+const MORPH_MS: u64 = 450;
+
+/// Optional "morph" behaviour: the overlay owns a panel-height signal and
+/// springs it between `collapsed` and a caller-set target on open / close /
+/// dismiss, so a modal grows open and shrinks closed with no per-app
+/// plumbing. Bound by the panel via [`crate::scene::NodeBuilderRef::height_px_bind`].
+#[derive(Clone)]
+struct Morph {
+    /// Panel height (logical px). Springs collapsed ↔ target.
+    height: Signal<f32>,
+    /// The shrunk height the panel opens *out from* and closes back *to*.
+    collapsed: f32,
+    /// Own timeline key (distinct from the opacity fade) so re-targets
+    /// interrupt smoothly.
+    key: u32,
+    curve: Curve,
+    duration: Duration,
+}
+
+/// A modal overlay. Cheap to clone (`Rc`-backed signals + a few `Copy`
 /// fields) — clone it into button handlers freely.
 #[derive(Clone)]
 pub struct Overlay {
@@ -62,6 +88,14 @@ pub struct Overlay {
     tween_key: u32,
     fade: Duration,
     curve: Curve,
+    /// Vertical placement of the panel within the scrim. `Center` (default)
+    /// is the classic dialog; `Start` top-anchors it (e.g. a search modal
+    /// that drops from the top bar). Horizontal is always centred.
+    anchor: Justify,
+    /// Height-morph state, if [`Self::with_morph`] enabled it. The overlay
+    /// springs this on open/close/dismiss so the panel grows/shrinks; `None`
+    /// = a plain fade modal.
+    morph: Option<Morph>,
 }
 
 impl Default for Overlay {
@@ -78,6 +112,8 @@ impl Overlay {
             tween_key: NEXT_WIDGET_KEY.fetch_add(1, Ordering::Relaxed),
             fade: Duration::from_millis(160),
             curve: Curve::EaseInOut,
+            anchor: Justify::Center,
+            morph: None,
         }
     }
 
@@ -87,10 +123,73 @@ impl Overlay {
         self
     }
 
+    /// Anchor the panel vertically — `Justify::Start` top-anchors it
+    /// (default is `Center`). Horizontal centring is unchanged.
+    pub fn with_anchor(mut self, anchor: Justify) -> Self {
+        self.anchor = anchor;
+        self
+    }
+
     /// Override the fade easing curve.
     pub fn with_curve(mut self, curve: Curve) -> Self {
         self.curve = curve;
         self
+    }
+
+    /// Enable height-morph: the overlay owns a panel-height signal that
+    /// springs between `collapsed` and a target on open / close / dismiss, so
+    /// the modal grows open and shrinks closed by itself. Bind the panel's
+    /// height to [`Self::morph_height`] and drive it with [`Self::morph_open`]
+    /// / [`Self::morph_close`] / [`Self::morph_to`]; the built-in scrim
+    /// dismiss shrinks it back with no extra wiring. The height starts at
+    /// `collapsed` (never seen while closed).
+    pub fn with_morph(mut self, collapsed: f32) -> Self {
+        self.morph = Some(Morph {
+            height: Signal::new(collapsed),
+            collapsed,
+            key: NEXT_WIDGET_KEY.fetch_add(1, Ordering::Relaxed),
+            curve: MORPH_SPRING,
+            duration: Duration::from_millis(MORPH_MS),
+        });
+        self
+    }
+
+    /// The panel-height signal to bind (`height_px_bind`). Only meaningful
+    /// when [`Self::with_morph`] was used; otherwise a throwaway constant.
+    pub fn morph_height(&self) -> Signal<f32> {
+        match &self.morph {
+            Some(m) => m.height.clone(),
+            None => Signal::new(0.0),
+        }
+    }
+
+    /// Fade in **and** spring the panel height up to `target` — the open
+    /// morph. Interruptible: reopening mid-close reverses smoothly.
+    pub fn morph_open(&self, timeline: &mut Timeline, now: Instant, target: f32) {
+        self.open(timeline, now);
+        self.spring_height(timeline, now, target);
+    }
+
+    /// Fade out **and** spring the panel height back to `collapsed` — the
+    /// close morph, mirroring the open. Same as a scrim dismiss.
+    pub fn morph_close(&self, timeline: &mut Timeline, now: Instant) {
+        self.close(timeline, now);
+        if let Some(m) = &self.morph {
+            self.spring_height(timeline, now, m.collapsed);
+        }
+    }
+
+    /// Re-spring the panel height to a new `target` while open (e.g. content
+    /// grew/shrank). No opacity change.
+    pub fn morph_to(&self, timeline: &mut Timeline, now: Instant, target: f32) {
+        self.spring_height(timeline, now, target);
+    }
+
+    /// Start the height spring toward `target` on the morph's own key.
+    fn spring_height(&self, timeline: &mut Timeline, now: Instant, target: f32) {
+        if let Some(m) = &self.morph {
+            timeline.start(m.key, m.height.clone(), target, m.curve, m.duration, now);
+        }
     }
 
     /// Whether the overlay is logically open (more than half faded in).
@@ -102,12 +201,26 @@ impl Overlay {
     /// Fade in. Idempotent + interruptible: re-targets the same tween, so
     /// opening mid-close smoothly reverses from wherever it is.
     pub fn open(&self, timeline: &mut Timeline, now: Instant) {
-        timeline.start(self.tween_key, self.opacity.clone(), 1.0, self.curve, self.fade, now);
+        timeline.start(
+            self.tween_key,
+            self.opacity.clone(),
+            1.0,
+            self.curve,
+            self.fade,
+            now,
+        );
     }
 
     /// Fade out. Same interruptible semantics as [`Self::open`].
     pub fn close(&self, timeline: &mut Timeline, now: Instant) {
-        timeline.start(self.tween_key, self.opacity.clone(), 0.0, self.curve, self.fade, now);
+        timeline.start(
+            self.tween_key,
+            self.opacity.clone(),
+            0.0,
+            self.curve,
+            self.fade,
+            now,
+        );
     }
 
     /// Open if closed, close if open.
@@ -145,31 +258,47 @@ impl Overlay {
     /// layers on top. For stacked modals, render them back-to-front.
     /// Always safe to call every frame: when closed it's skipped by the
     /// opacity-visibility gate.
-    pub fn render<F: FnOnce(&mut Scene)>(
-        &self,
-        s: &mut Scene,
-        scrim_color: [f32; 4],
-        content: F,
-    ) {
+    pub fn render<F: FnOnce(&mut Scene)>(&self, s: &mut Scene, scrim_color: [f32; 4], content: F) {
         let opacity = self.opacity.clone();
         let key = self.tween_key;
         let fade = self.fade;
         let curve = self.curve;
+        // Scrim dismiss shrinks the height back too (if morphing) — captured
+        // so the click handler is self-contained (no app callback needed).
+        let morph = self.morph.clone();
         s.col(())
             .abs(0.0, 0.0)
             .w(Len::Fill)
             .h(Len::Fill)
-            .rgba(scrim_color[0], scrim_color[1], scrim_color[2], scrim_color[3])
+            .rgba(
+                scrim_color[0],
+                scrim_color[1],
+                scrim_color[2],
+                scrim_color[3],
+            )
             // Fades the whole subtree; at ~0 it also drops the scrim from
             // flatten, so a closed modal neither draws nor eats input.
             .opacity_bind(opacity.clone())
             .align(Align::Center)
-            .justify(Justify::Center)
+            .justify(self.anchor)
             // Click outside the panel dismisses. (Topmost-wins hit-testing
             // means this only fires when the cursor isn't over the panel.)
             .on_click(move |ctx| {
                 ctx.timeline
                     .start(key, opacity.clone(), 0.0, curve, fade, ctx.now);
+                // Inverse-morph the height back to collapsed alongside the
+                // fade — self-contained, so a click-outside close animates
+                // with no app-side plumbing.
+                if let Some(m) = &morph {
+                    ctx.timeline.start(
+                        m.key,
+                        m.height.clone(),
+                        m.collapsed,
+                        m.curve,
+                        m.duration,
+                        ctx.now,
+                    );
+                }
             })
             // The dim area is click-to-dismiss but shouldn't read as a
             // button — keep the normal arrow over it (overrides the

@@ -182,8 +182,8 @@ impl LazyListState {
             self.prefix.resize(target_len, 0.0);
             self.first_dirty_row = 0;
         }
-        let clean = self.last_heights_version == self.heights_version
-            && self.first_dirty_row == u32::MAX;
+        let clean =
+            self.last_heights_version == self.heights_version && self.first_dirty_row == u32::MAX;
         if clean {
             return;
         }
@@ -234,16 +234,12 @@ impl LazyListState {
 
         // first row containing scroll_top_l:
         //   largest i with prefix[i] <= scroll_top_l
-        let upper = self
-            .prefix
-            .partition_point(|&v| v <= scroll_top_l);
+        let upper = self.prefix.partition_point(|&v| v <= scroll_top_l);
         let first = (upper.saturating_sub(1)) as u32;
 
         // last row visible: smallest i with prefix[i] >= bottom_l, then
         // include up to that row.
-        let upper_b = self
-            .prefix
-            .partition_point(|&v| v < bottom_l);
+        let upper_b = self.prefix.partition_point(|&v| v < bottom_l);
         let last_inclusive = (upper_b.saturating_sub(1)) as u32;
         // partition_point returns 0..=len, but row indices are 0..count.
         let last_inclusive = last_inclusive.min(count.saturating_sub(1));

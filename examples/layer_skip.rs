@@ -89,7 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 win.raster_count,
                 win.composite_count
             );
-            assert_eq!(win.raster_count, 0, "composite-only move must skip ALL rasters");
+            assert_eq!(
+                win.raster_count, 0,
+                "composite-only move must skip ALL rasters"
+            );
             assert_eq!(win.composite_count, layers, "every layer still composites");
 
             // (2) Content change: recolor the promoted node, flush, render.

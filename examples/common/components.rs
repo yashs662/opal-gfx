@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use opal_gfx::{
-    animated, deps, Align, Computed, Curve, ImageHandle, Len, Scene, Signal, WindowAction,
+    Align, Computed, Curve, ImageHandle, Len, Scene, Signal, WindowAction, animated, deps,
 };
 
 // --- title-bar dot ---
@@ -90,33 +90,34 @@ pub struct HeroProps {
 /// (toggles `lit` from inside the closure). All five reactive concepts
 /// in one place.
 pub fn hero(s: &mut Scene, props: HeroProps) {
-    let color = Computed::new(
-        deps!(props.lit, props.hover, props.pressed),
-        |(l, h, p)| {
-            let base = if l {
-                [0.20, 0.95, 0.55, 1.0]
-            } else {
-                [0.95, 0.25, 0.55, 1.0]
-            };
-            let lerped = if h {
-                [
-                    (base[0] + 0.18_f32).min(1.0),
-                    (base[1] + 0.18_f32).min(1.0),
-                    (base[2] + 0.18_f32).min(1.0),
-                    base[3],
-                ]
-            } else {
-                base
-            };
-            let pf = if p { 0.55_f32 } else { 1.0 };
-            [lerped[0] * pf, lerped[1] * pf, lerped[2] * pf, lerped[3]]
-        },
-    );
+    let color = Computed::new(deps!(props.lit, props.hover, props.pressed), |(l, h, p)| {
+        let base = if l {
+            [0.20, 0.95, 0.55, 1.0]
+        } else {
+            [0.95, 0.25, 0.55, 1.0]
+        };
+        let lerped = if h {
+            [
+                (base[0] + 0.18_f32).min(1.0),
+                (base[1] + 0.18_f32).min(1.0),
+                (base[2] + 0.18_f32).min(1.0),
+                base[3],
+            ]
+        } else {
+            base
+        };
+        let pf = if p { 0.55_f32 } else { 1.0 };
+        [lerped[0] * pf, lerped[1] * pf, lerped[2] * pf, lerped[3]]
+    });
     let click_lit = props.lit.clone();
     s.rect("hero")
         .w_px(380.0)
         .h_px(70.0)
-        .color(animated(color, Curve::EaseInOut, Duration::from_millis(220)))
+        .color(animated(
+            color,
+            Curve::EaseInOut,
+            Duration::from_millis(220),
+        ))
         .radius(20.0)
         .border(2.0, [1.0, 1.0, 1.0, 0.85])
         .shadow([0.0, 0.0], 22.0, [0.95, 0.25, 0.55, 1.0], 0.45)
@@ -307,7 +308,11 @@ pub fn blob(s: &mut Scene, props: BlobProps) {
     let pos_rect = props.pos.clone();
     let pos_label = props.pos.clone();
     s.rect("blob")
-        .pos(animated(pos_rect, Curve::EaseInOut, Duration::from_millis(260)))
+        .pos(animated(
+            pos_rect,
+            Curve::EaseInOut,
+            Duration::from_millis(260),
+        ))
         .size_bind(animated(
             props.size,
             Curve::EaseInOut,

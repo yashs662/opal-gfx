@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::node::{dirty, NodeId, ScrollSpan};
+use crate::node::{NodeId, ScrollSpan, dirty};
 
 /// Two-level damage classification derived from a tree dirty mask — the
 /// core compositor idea. P3 acts on it to skip rasterization; P1 only
@@ -146,7 +146,12 @@ impl Default for PromotedState {
     }
 }
 
-fn root_segment(instances: std::ops::Range<usize>, viewport: [u32; 2], z: i32, epoch: u64) -> Layer {
+fn root_segment(
+    instances: std::ops::Range<usize>,
+    viewport: [u32; 2],
+    z: i32,
+    epoch: u64,
+) -> Layer {
     Layer {
         root: None,
         instances,
@@ -362,28 +367,46 @@ mod tests {
     fn classify_content_vs_composite() {
         assert_eq!(
             Damage::classify(dirty::VISUAL),
-            Damage { content: true, composite: false }
+            Damage {
+                content: true,
+                composite: false
+            }
         );
         assert_eq!(
             Damage::classify(dirty::BACKDROP),
-            Damage { content: true, composite: false }
+            Damage {
+                content: true,
+                composite: false
+            }
         );
         assert_eq!(
             Damage::classify(dirty::TREE),
-            Damage { content: true, composite: false }
+            Damage {
+                content: true,
+                composite: false
+            }
         );
         assert_eq!(
             Damage::classify(dirty::TRANSFORM),
-            Damage { content: false, composite: true }
+            Damage {
+                content: false,
+                composite: true
+            }
         );
         assert_eq!(
             Damage::classify(dirty::SCROLL),
-            Damage { content: false, composite: true }
+            Damage {
+                content: false,
+                composite: true
+            }
         );
         // Mixed mask flags both axes.
         assert_eq!(
             Damage::classify(dirty::VISUAL | dirty::SCROLL),
-            Damage { content: true, composite: true }
+            Damage {
+                content: true,
+                composite: true
+            }
         );
         assert_eq!(Damage::classify(dirty::NONE), Damage::default());
         assert!(!Damage::classify(dirty::NONE).any());
@@ -435,9 +458,18 @@ mod tests {
         lt.rebuild(&pr(p, 30..60), 100, [10, 10], Damage::classify(dirty::TREE));
         let ls = lt.layers();
         assert_eq!(ls.len(), 3);
-        assert_eq!((ls[0].root, ls[0].instances.clone(), ls[0].z), (None, 0..30, 0));
-        assert_eq!((ls[1].root, ls[1].instances.clone(), ls[1].z), (Some(p), 30..60, 1));
-        assert_eq!((ls[2].root, ls[2].instances.clone(), ls[2].z), (None, 60..100, 2));
+        assert_eq!(
+            (ls[0].root, ls[0].instances.clone(), ls[0].z),
+            (None, 0..30, 0)
+        );
+        assert_eq!(
+            (ls[1].root, ls[1].instances.clone(), ls[1].z),
+            (Some(p), 30..60, 1)
+        );
+        assert_eq!(
+            (ls[2].root, ls[2].instances.clone(), ls[2].z),
+            (None, 60..100, 2)
+        );
     }
 
     #[test]
@@ -456,7 +488,12 @@ mod tests {
     fn promotion_at_tail_has_no_trailing_segment() {
         let mut lt = LayerTree::single_root();
         let p = node(0);
-        lt.rebuild(&pr(p, 60..100), 100, [10, 10], Damage::classify(dirty::TREE));
+        lt.rebuild(
+            &pr(p, 60..100),
+            100,
+            [10, 10],
+            Damage::classify(dirty::TREE),
+        );
         let ls = lt.layers();
         assert_eq!(ls.len(), 2);
         assert_eq!(ls[0].root, None);
@@ -474,7 +511,12 @@ mod tests {
         assert!(lt.take_composite_dirty());
         assert!(!lt.take_composite_dirty()); // consumed
         // A re-flatten (content change) must NOT reset the animated offset.
-        lt.rebuild(&pr(p, 0..40), 100, [10, 10], Damage::classify(dirty::VISUAL));
+        lt.rebuild(
+            &pr(p, 0..40),
+            100,
+            [10, 10],
+            Damage::classify(dirty::VISUAL),
+        );
         let promoted = lt.layers().iter().find(|l| l.root == Some(p)).unwrap();
         assert_eq!(promoted.offset, [5.0, 7.0]);
         assert_eq!(promoted.opacity, 0.5);
@@ -496,14 +538,39 @@ mod tests {
         let mut lt = LayerTree::single_root();
         let p = node(0);
         lt.rebuild(&pr(p, 0..40), 100, [10, 10], Damage::classify(dirty::TREE));
-        let e0 = lt.layers().iter().find(|l| l.root == Some(p)).unwrap().content_epoch;
+        let e0 = lt
+            .layers()
+            .iter()
+            .find(|l| l.root == Some(p))
+            .unwrap()
+            .content_epoch;
         // Composite-only frame → epoch unchanged.
-        lt.rebuild(&pr(p, 0..40), 100, [10, 10], Damage::classify(dirty::TRANSFORM));
-        let e1 = lt.layers().iter().find(|l| l.root == Some(p)).unwrap().content_epoch;
+        lt.rebuild(
+            &pr(p, 0..40),
+            100,
+            [10, 10],
+            Damage::classify(dirty::TRANSFORM),
+        );
+        let e1 = lt
+            .layers()
+            .iter()
+            .find(|l| l.root == Some(p))
+            .unwrap()
+            .content_epoch;
         assert_eq!(e0, e1);
         // Content frame → epoch bumps.
-        lt.rebuild(&pr(p, 0..40), 100, [10, 10], Damage::classify(dirty::VISUAL));
-        let e2 = lt.layers().iter().find(|l| l.root == Some(p)).unwrap().content_epoch;
+        lt.rebuild(
+            &pr(p, 0..40),
+            100,
+            [10, 10],
+            Damage::classify(dirty::VISUAL),
+        );
+        let e2 = lt
+            .layers()
+            .iter()
+            .find(|l| l.root == Some(p))
+            .unwrap()
+            .content_epoch;
         assert_eq!(e2, e1 + 1);
     }
 

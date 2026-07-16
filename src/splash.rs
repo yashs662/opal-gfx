@@ -84,20 +84,36 @@ impl SplashBitmap {
         // Mark, vertically centered at x=0.
         let logo_y = (total_h - logo_phys) / 2;
         blit_over(
-            &mut canvas, total_w, total_h,
-            &logo_rgba, logo_phys, logo_phys, 0, logo_y,
+            &mut canvas,
+            total_w,
+            total_h,
+            &logo_rgba,
+            logo_phys,
+            logo_phys,
+            0,
+            logo_y,
         );
         // Wordmark, vertically centered after the gap.
         if word_w > 0 {
             let word_x = logo_phys + gap_phys;
             let word_y = (total_h.saturating_sub(word_h)) / 2;
             blit_over(
-                &mut canvas, total_w, total_h,
-                &word_rgba, word_w, word_h, word_x, word_y,
+                &mut canvas,
+                total_w,
+                total_h,
+                &word_rgba,
+                word_w,
+                word_h,
+                word_x,
+                word_y,
             );
         }
 
-        Some(Self { w: total_w, h: total_h, rgba: canvas })
+        Some(Self {
+            w: total_w,
+            h: total_h,
+            rgba: canvas,
+        })
     }
 
     /// Premultiplied BGRA, the byte order `UpdateLayeredWindow` expects
@@ -150,7 +166,9 @@ fn build_wordmark(cfg: &SplashConfig, text: &mut TextResources, scale: f32) -> (
     let mut placed = Vec::new();
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
     for g in &glyphs {
-        let Some(r) = text.rasterize(g.cache_key) else { continue };
+        let Some(r) = text.rasterize(g.cache_key) else {
+            continue;
+        };
         if r.width == 0 || r.height == 0 {
             continue;
         }
@@ -200,8 +218,14 @@ fn build_wordmark(cfg: &SplashConfig, text: &mut TextResources, scale: f32) -> (
 /// Splash regions don't overlap, but a proper over keeps soft edges clean
 /// where they meet.
 fn blit_over(
-    dst: &mut [u8], dst_w: u32, dst_h: u32,
-    src: &[u8], src_w: u32, src_h: u32, at_x: u32, at_y: u32,
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    at_x: u32,
+    at_y: u32,
 ) {
     for sy in 0..src_h {
         let dy = at_y + sy;
@@ -283,19 +307,19 @@ impl Splash {
 mod windows_impl {
     use super::SplashBitmap;
     use std::sync::Once;
-    use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-        SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-        DIB_RGB_COLORS, HBITMAP, HDC,
+        AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
+        CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, ReleaseDC,
+        SelectObject,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, ShowWindow,
-        UpdateLayeredWindow, HMENU, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, HMENU, RegisterClassW, SW_SHOWNOACTIVATE,
+        ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
+    use windows::core::{PCWSTR, w};
 
     const CLASS: PCWSTR = w!("OpalSplashWindow");
     static REGISTER: Once = Once::new();
@@ -335,7 +359,10 @@ mod windows_impl {
                     CLASS,
                     w!("Opal"),
                     WS_POPUP,
-                    x, y, w, h,
+                    x,
+                    y,
+                    w,
+                    h,
                     None,
                     None::<HMENU>,
                     hinst.map(|m| m.into()),
@@ -359,17 +386,22 @@ mod windows_impl {
                     ..Default::default()
                 };
                 let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-                let hbitmap =
-                    match CreateDIBSection(Some(screen_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
-                    {
-                        Ok(b) if !bits.is_null() => b,
-                        _ => {
-                            ReleaseDC(None, screen_dc);
-                            let _ = DeleteDC(hdc_mem);
-                            let _ = DestroyWindow(hwnd);
-                            return None;
-                        }
-                    };
+                let hbitmap = match CreateDIBSection(
+                    Some(screen_dc),
+                    &bmi,
+                    DIB_RGB_COLORS,
+                    &mut bits,
+                    None,
+                    0,
+                ) {
+                    Ok(b) if !bits.is_null() => b,
+                    _ => {
+                        ReleaseDC(None, screen_dc);
+                        let _ = DeleteDC(hdc_mem);
+                        let _ = DestroyWindow(hwnd);
+                        return None;
+                    }
+                };
                 std::ptr::copy_nonoverlapping(premul.as_ptr(), bits as *mut u8, premul.len());
                 let old = SelectObject(hdc_mem, hbitmap.into());
 
@@ -405,7 +437,11 @@ mod windows_impl {
                 }
 
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                Some(Self { hwnd, hdc_mem, hbitmap })
+                Some(Self {
+                    hwnd,
+                    hdc_mem,
+                    hbitmap,
+                })
             }
         }
     }
@@ -474,7 +510,10 @@ mod other_impl {
             buf.copy_from_slice(&pixels);
             buf.present().ok()?;
 
-            Some(Self { _surface: surface, _window: window })
+            Some(Self {
+                _surface: surface,
+                _window: window,
+            })
         }
     }
 }

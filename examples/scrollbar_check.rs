@@ -11,30 +11,28 @@ const W: u32 = 540;
 const H: u32 = 540;
 
 fn build(s: &mut Scene) {
-    s.col("root").fill().rgba(0.06, 0.07, 0.09, 1.0).child(|root| {
-        root.col("list")
-            .w(Len::Fill)
-            .h(Len::Fill)
-            .pad(12.0)
-            .gap(8.0)
-            .scroll_y()
-            .child(|list| {
-                for i in 0..30u32 {
-                    list.row(format!("row{i}"))
-                        .w(Len::Fill)
-                        .h_px(36.0)
-                        .pad_xy(12.0, 6.0)
-                        .justify(Justify::Start)
-                        .rgba(
-                            0.3 + (i as f32 * 0.02) % 0.4,
-                            0.4,
-                            0.55,
-                            1.0,
-                        )
-                        .radius(6.0);
-                }
-            });
-    });
+    s.col("root")
+        .fill()
+        .rgba(0.06, 0.07, 0.09, 1.0)
+        .child(|root| {
+            root.col("list")
+                .w(Len::Fill)
+                .h(Len::Fill)
+                .pad(12.0)
+                .gap(8.0)
+                .scroll_y()
+                .child(|list| {
+                    for i in 0..30u32 {
+                        list.row(format!("row{i}"))
+                            .w(Len::Fill)
+                            .h_px(36.0)
+                            .pad_xy(12.0, 6.0)
+                            .justify(Justify::Start)
+                            .rgba(0.3 + (i as f32 * 0.02) % 0.4, 0.4, 0.55, 1.0)
+                            .radius(6.0);
+                    }
+                });
+        });
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,12 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .headless(|h| {
             // Push the outer list partway down then settle so the bar
             // is at full alpha and the thumb is mid-track.
-            let id = h
-                .ctx
-                .names
-                .get("list")
-                .copied()
-                .expect("list node missing");
+            let id = h.ctx.names.get("list").copied().expect("list node missing");
             h.ctx.tree.set_scroll_target(id, [0.0, 200.0]);
             // Snap the spring so capture shows the settled state.
             for _ in 0..30 {

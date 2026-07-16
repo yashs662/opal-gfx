@@ -45,7 +45,7 @@ use winit::event::ElementState;
 use winit::keyboard::KeyCode;
 
 use common::components::{
-    blob, hero, sidebar, title_bar, BlobProps, DotProps, HeroProps, SidebarProps, TitleBarProps,
+    BlobProps, DotProps, HeroProps, SidebarProps, TitleBarProps, blob, hero, sidebar, title_bar,
 };
 use common::image::make_demo_image;
 
@@ -338,7 +338,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 key_sigs.lit.set(!key_sigs.lit.get());
             }
             KeyCode::ArrowLeft | KeyCode::ArrowRight => {
-                let delta = if code == KeyCode::ArrowLeft { -40.0 } else { 40.0 };
+                let delta = if code == KeyCode::ArrowLeft {
+                    -40.0
+                } else {
+                    40.0
+                };
                 let cur = key_sigs.blob_pos.get();
                 key_sigs.blob_pos.set([cur[0] + delta, cur[1]]);
             }

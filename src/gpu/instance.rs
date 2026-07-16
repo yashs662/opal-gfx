@@ -173,12 +173,7 @@ impl Default for ShapeInstance {
 }
 
 impl ShapeInstance {
-    pub fn rounded_rect(
-        position: [f32; 2],
-        size: [f32; 2],
-        radius: f32,
-        color: [f32; 4],
-    ) -> Self {
+    pub fn rounded_rect(position: [f32; 2], size: [f32; 2], radius: f32, color: [f32; 4]) -> Self {
         Self {
             color,
             position,

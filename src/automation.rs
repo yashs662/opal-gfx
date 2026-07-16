@@ -48,6 +48,10 @@ pub enum Step {
     Scroll([f32; 2], [f32; 2]),
     /// Press at `from`, move to `to`, release (drag a slider/splitter).
     Drag([f32; 2], [f32; 2]),
+    /// Insert text into the focused text field (as if typed). Click the
+    /// field first to focus it; a no-op (with a warning) when nothing
+    /// editable is focused.
+    Type(String),
 }
 
 /// An ordered list of [`Step`]s. Built by the consumer (e.g. from a TOML

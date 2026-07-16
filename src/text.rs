@@ -459,7 +459,12 @@ mod tests {
         assert!(s.ends_with('\u{2026}'), "expected ellipsis suffix: {s:?}");
         assert!(s.chars().count() < "hello world".chars().count() + 1);
         let new_w = t.measure(&s, 16.0, 20.0).width;
-        assert!(new_w <= full_w * 0.5 + 0.5, "truncated width {} exceeds cap {}", new_w, full_w * 0.5);
+        assert!(
+            new_w <= full_w * 0.5 + 0.5,
+            "truncated width {} exceeds cap {}",
+            new_w,
+            full_w * 0.5
+        );
     }
 
     #[test]

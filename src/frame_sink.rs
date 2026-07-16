@@ -98,7 +98,11 @@ impl FrameSink {
     pub fn submit(&self, node: NodeId, width: u32, height: u32, rgba: Vec<u8>) {
         self.push_cmd(FrameCmd::Frame {
             node,
-            frame: PendingFrame { width, height, rgba },
+            frame: PendingFrame {
+                width,
+                height,
+                rgba,
+            },
         });
     }
 
@@ -110,7 +114,11 @@ impl FrameSink {
         self.push_cmd(FrameCmd::Push {
             node,
             epoch,
-            frame: PendingFrame { width, height, rgba },
+            frame: PendingFrame {
+                width,
+                height,
+                rgba,
+            },
         });
     }
 

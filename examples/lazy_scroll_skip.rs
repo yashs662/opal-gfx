@@ -21,10 +21,12 @@ fn build_scene(s: &mut Scene) {
     s.col("root").w(Len::Fill).h(Len::Fill).child(|p| {
         p.lazy_list("list", ROWS, ROW_H, |row, i| {
             let t = (i % 32) as f32 / 32.0;
-            row.rect(())
-                .w(Len::Fill)
-                .h_px(ROW_H - 4.0)
-                .rgba(0.12 + t * 0.4, 0.2, 0.5 - t * 0.3, 1.0);
+            row.rect(()).w(Len::Fill).h_px(ROW_H - 4.0).rgba(
+                0.12 + t * 0.4,
+                0.2,
+                0.5 - t * 0.3,
+                1.0,
+            );
         })
         .w(Len::Fill)
         .h(Len::Fill)

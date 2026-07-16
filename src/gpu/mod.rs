@@ -9,7 +9,7 @@ pub mod pipeline;
 pub mod timing;
 pub mod window_round;
 
-pub use blur::{BlurResources, BACKDROP_FORMAT};
+pub use blur::{BACKDROP_FORMAT, BlurResources};
 pub use context::{GpuContext, MemoryReport};
 pub use glyph_atlas::{AtlasEntry, GlyphAtlas};
 pub use image_atlas::{ImageAtlas, ImageEntry, ImageHandle};
@@ -18,6 +18,6 @@ pub use instance::{
     SHAPE_KIND_IMAGE, SHAPE_KIND_MASK, SHAPE_KIND_RECT, ShapeInstance,
 };
 pub use layer::{LayerDraw, LayerResources, ScrollWindow};
-pub use overdraw::{OverdrawResources, OVERDRAW_FORMAT};
+pub use overdraw::{OVERDRAW_FORMAT, OverdrawResources};
 pub use pipeline::ShapePipeline;
 pub use timing::{FrameStats, FrameTiming, Timing};

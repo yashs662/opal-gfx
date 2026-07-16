@@ -121,9 +121,7 @@ impl OverdrawResources {
         // Compose pipeline: fullscreen quad sampling the count texture.
         let compose_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("opal.overdraw.compose shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/overdraw_compose.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/overdraw_compose.wgsl").into()),
         });
 
         let compose_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

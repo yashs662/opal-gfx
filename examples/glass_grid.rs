@@ -76,9 +76,7 @@ fn build_scene(s: &mut Scene, art: ImageHandle) {
     s.col("root").w(Len::Fill).h(Len::Fill).child(|p| {
         // Layer 1: full-window checker. Declared first so it lands in
         // the backdrop pass and every glass panel blurs it.
-        p.image("bg", art)
-            .abs(0.0, 0.0)
-            .size_px(W as f32, H as f32);
+        p.image("bg", art).abs(0.0, 0.0).size_px(W as f32, H as f32);
 
         // Header label.
         p.text("hdr", "blur →   refraction ↓", 16.0)
@@ -123,6 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `OPAL_AUTOCAPTURE=1` writes one frame to `debug_captures/` and
     // exits — the deterministic root-layer-parity capture gate. Without
     // it the example runs interactively for eyeballing glass params.
-    let app = app.scene(move |s, _| build_scene(s, art)).capture_from_env();
+    let app = app
+        .scene(move |s, _| build_scene(s, art))
+        .capture_from_env();
     app.run()
 }

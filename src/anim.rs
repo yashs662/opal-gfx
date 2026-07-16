@@ -362,7 +362,14 @@ impl Timeline {
         duration: Duration,
         now: Instant,
     ) {
-        self.start(signal_tween_key(signal.id()), signal.clone(), to, curve, duration, now);
+        self.start(
+            signal_tween_key(signal.id()),
+            signal.clone(),
+            to,
+            curve,
+            duration,
+            now,
+        );
     }
 
     /// Stop the identity-keyed animation for `signal` (if any). The `stop`
@@ -541,7 +548,10 @@ mod tests {
         tl.tick(now + Duration::from_millis(90));
         let after = s.get();
         let expected = mid_val * 0.5;
-        assert!((after - expected).abs() < 0.05, "after={after} expected~{expected}");
+        assert!(
+            (after - expected).abs() < 0.05,
+            "after={after} expected~{expected}"
+        );
     }
 
     #[test]
@@ -558,7 +568,13 @@ mod tests {
         tl.animate(&b, 1.0, Curve::Linear, Duration::from_millis(100), now);
         assert_eq!(tl.len(), 2, "distinct signal → distinct tween");
         // A clone keys identically to its source.
-        tl.animate(&a.clone(), 3.0, Curve::Linear, Duration::from_millis(100), now);
+        tl.animate(
+            &a.clone(),
+            3.0,
+            Curve::Linear,
+            Duration::from_millis(100),
+            now,
+        );
         assert_eq!(tl.len(), 2, "clone shares identity → still interrupts a");
         // stop_for removes only that signal's tween.
         tl.stop_for(&a);
@@ -574,7 +590,13 @@ mod tests {
         tl.tick(now + Duration::from_millis(40));
         let mid = s.get();
         assert!(mid > 0.3 && mid < 0.5);
-        tl.animate(&s, 0.0, Curve::Linear, Duration::from_millis(100), now + Duration::from_millis(40));
+        tl.animate(
+            &s,
+            0.0,
+            Curve::Linear,
+            Duration::from_millis(100),
+            now + Duration::from_millis(40),
+        );
         assert_eq!(tl.len(), 1);
         tl.tick(now + Duration::from_millis(90));
         // Halfway through the reverse from `mid` → ~mid/2.

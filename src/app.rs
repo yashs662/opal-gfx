@@ -1204,7 +1204,6 @@ impl<S> App<S> {
         }
     }
 
-
     /// Build a numeric-label HUD from the most recent frame stats and
     /// upload it as overlay instances. Cleared when `hud_enabled` flips
     /// off. Throttled to ~10 Hz: cpu/gpu_ms jitter would otherwise
@@ -1257,8 +1256,13 @@ impl<S> App<S> {
         self.active_hint = Some(node);
         self.hint_visible = true;
         let fade = self.hint_fade.clone();
-        self.timeline
-            .animate(&fade, 1.0, crate::anim::Curve::EaseInOut, HINT_FADE, Instant::now());
+        self.timeline.animate(
+            &fade,
+            1.0,
+            crate::anim::Curve::EaseInOut,
+            HINT_FADE,
+            Instant::now(),
+        );
         self.paint_hint();
     }
 
@@ -1271,8 +1275,13 @@ impl<S> App<S> {
         }
         self.hint_visible = false;
         let fade = self.hint_fade.clone();
-        self.timeline
-            .animate(&fade, 0.0, crate::anim::Curve::EaseInOut, HINT_FADE, Instant::now());
+        self.timeline.animate(
+            &fade,
+            0.0,
+            crate::anim::Curve::EaseInOut,
+            HINT_FADE,
+            Instant::now(),
+        );
     }
 
     /// (Re)render the active hint tooltip into the overlay buffer at the
@@ -1631,10 +1640,7 @@ impl<S> App<S> {
             return false;
         }
         // A drag/capture owns the pointer — hover is moot until it releases.
-        if self.input.captured.is_some()
-            || self.bar_drag.is_some()
-            || self.drag_origin.is_some()
-        {
+        if self.input.captured.is_some() || self.bar_drag.is_some() || self.drag_origin.is_some() {
             self.next_hover_recheck = Some(now + HOVER_RECHECK);
             return false;
         }
@@ -1969,7 +1975,9 @@ impl<S> App<S> {
         else {
             return (false, None);
         };
-        let elapsed_ms = now.saturating_duration_since(self.caret_blink_anchor).as_millis();
+        let elapsed_ms = now
+            .saturating_duration_since(self.caret_blink_anchor)
+            .as_millis();
         let on = (elapsed_ms / HALF.as_millis()).is_multiple_of(2);
         let changed = on != self.caret_blink_on;
         if changed {
@@ -1992,7 +2000,12 @@ impl<S> App<S> {
             let ed = self.ctx.tree.get(node_id).and_then(|n| n.editor.as_ref())?;
             (ed.value.clone(), ed.font_size, ed.text_node)
         };
-        let origin_x = self.ctx.tree.get(text_node).map(|n| n.rect[0]).unwrap_or(0.0);
+        let origin_x = self
+            .ctx
+            .tree
+            .get(text_node)
+            .map(|n| n.rect[0])
+            .unwrap_or(0.0);
         let scale = self.scale_factor;
         let mut best_idx = 0usize;
         let mut best_dist = f32::MAX;
@@ -2037,7 +2050,12 @@ impl<S> App<S> {
         let Some(idx) = self.caret_index_at_x(node_id, click_x) else {
             return;
         };
-        if let Some(ed) = self.ctx.tree.get_mut_raw(node_id).and_then(|n| n.editor.as_mut()) {
+        if let Some(ed) = self
+            .ctx
+            .tree
+            .get_mut_raw(node_id)
+            .and_then(|n| n.editor.as_mut())
+        {
             ed.cursor = idx;
             // Anchor here; a plain click leaves an empty (invisible)
             // selection, a drag extends it.
@@ -2055,7 +2073,12 @@ impl<S> App<S> {
         let Some(idx) = self.caret_index_at_x(node_id, x) else {
             return false;
         };
-        let changed = match self.ctx.tree.get_mut_raw(node_id).and_then(|n| n.editor.as_mut()) {
+        let changed = match self
+            .ctx
+            .tree
+            .get_mut_raw(node_id)
+            .and_then(|n| n.editor.as_mut())
+        {
             Some(ed) if ed.cursor != idx => {
                 // First drag motion seeds an anchor if the press didn't.
                 ed.selection_anchor.get_or_insert(ed.cursor);
@@ -2538,7 +2561,11 @@ impl<S> App<S> {
             if !e.contains(x, y) {
                 return None;
             }
-            let h = self.ctx.tree.get(e.node_id).and_then(|n| n.on_wheel.clone())?;
+            let h = self
+                .ctx
+                .tree
+                .get(e.node_id)
+                .and_then(|n| n.on_wheel.clone())?;
             let b = e.bounds;
             Some((e.node_id, [b[0], b[1], b[2] - b[0], b[3] - b[1]], h))
         }) else {
@@ -2807,6 +2834,21 @@ impl<S> App<S> {
             .filter(|&id| self.ctx.tree.get(id).map(|n| n.external).unwrap_or(false))
             .filter_map(|id| scroll_identity(&self.ctx, id).map(|key| (key, id)))
             .collect();
+        // 0c. Snapshot the focused text field's identity so focus survives the
+        //     rebuild. Without this, a rebuild driven by the field's own
+        //     `on_change` (e.g. search-as-you-type) wipes `input.focused`
+        //     below, defocusing the field after every keystroke. Restored
+        //     after flush by matching the identity in the fresh tree. Only
+        //     editable nodes — transient focus on a button needn't persist.
+        let saved_focus: Option<String> = self.input.focused.and_then(|id| {
+            let has_editor = self
+                .ctx
+                .tree
+                .get(id)
+                .map(|n| n.editor.is_some())
+                .unwrap_or(false);
+            has_editor.then(|| scroll_identity(&self.ctx, id)).flatten()
+        });
         // 1. Snapshot the root list, then drop each subtree. Iterating
         //    `tree.roots()` directly while removing would alias the
         //    same Vec.
@@ -2910,6 +2952,23 @@ impl<S> App<S> {
             }
             if restored && self.flush_tree() {
                 self.request_redraw();
+            }
+        }
+        // 4c. Re-focus the text field that was focused before the rebuild,
+        //     matched by identity in the fresh tree (keeps the caret + key
+        //     routing alive across an `on_change`-driven rebuild).
+        if let Some(key) = saved_focus {
+            // Bind first so the `iter_ids` borrow drops before `set_focus`.
+            let found = self.ctx.tree.iter_ids().find(|&id| {
+                self.ctx
+                    .tree
+                    .get(id)
+                    .map(|n| n.editor.is_some())
+                    .unwrap_or(false)
+                    && scroll_identity(&self.ctx, id).as_deref() == Some(key.as_str())
+            });
+            if let Some(id) = found {
+                self.set_focus(Some(id));
             }
         }
         // 5. Re-derive hover from the preserved cursor against the
@@ -3462,12 +3521,7 @@ fn scroll_identity(ctx: &SceneCtx, id: crate::node::NodeId) -> Option<String> {
         }
         match ctx.tree.parent(cur) {
             Some(p) => {
-                let idx = ctx
-                    .tree
-                    .get(p)?
-                    .children
-                    .iter()
-                    .position(|&c| c == cur)?;
+                let idx = ctx.tree.get(p)?.children.iter().position(|&c| c == cur)?;
                 segments.push(idx.to_string());
                 cur = p;
             }
@@ -4920,6 +4974,39 @@ impl<S> ApplicationHandler for App<S> {
                 // may have shifted what's under a still cursor.
                 self.arm_hover_recheck();
             }
+            // Drain a pending programmatic field-value set (e.g. clearing a
+            // persistent modal's field so it reopens empty) now that the node
+            // exists. Writes the editor value + text node directly; does not
+            // fire `on_change` (this is not user input).
+            if let Some((name, value)) = self.ctx.field_set_request.take()
+                && let Some(&id) = self.ctx.names.get(&name)
+            {
+                let text_node = self.ctx.tree.get_mut_raw(id).and_then(|n| {
+                    n.editor.as_mut().map(|ed| {
+                        ed.value = value.clone();
+                        ed.cursor = value.len();
+                        ed.selection_anchor = None;
+                        ed.text_node
+                    })
+                });
+                if let Some(text_node) = text_node {
+                    self.ctx.tree.set_text(text_node, value.as_str());
+                }
+            }
+            // Drain a pending autofocus request now that the tree (incl. any
+            // just-built modal) exists and has fresh node names.
+            if let Some(name) = self.ctx.focus_request.take() {
+                let target = self.ctx.names.get(&name).copied().filter(|&id| {
+                    self.ctx
+                        .tree
+                        .get(id)
+                        .map(|n| n.editor.is_some())
+                        .unwrap_or(false)
+                });
+                if let Some(id) = target {
+                    self.set_focus(Some(id));
+                }
+            }
         }
         // Debug-only scripted-input driver (REMOVABLE — `automation`
         // feature). Executes any due step (synthetic move/click/scroll +
@@ -5290,6 +5377,26 @@ impl<S> App<S> {
                     self.inject_left(false);
                     state.advance_now(now);
                 }
+                Step::Type(text) => {
+                    // Insert into the focused field (click it first to focus).
+                    // Fires the editor's `on_change`, exactly like real typing.
+                    match self.input.focused {
+                        Some(f)
+                            if self
+                                .ctx
+                                .tree
+                                .get(f)
+                                .map(|n| n.editor.is_some())
+                                .unwrap_or(false) =>
+                        {
+                            self.apply_edit(f, crate::editor::EditOp::Insert(text));
+                        }
+                        _ => {
+                            log::warn!("[automation] Type: no focused text field (click it first)")
+                        }
+                    }
+                    state.advance_now(now);
+                }
                 Step::Screenshot(path) => {
                     self.render_once();
                     self.capture_to(path);
@@ -5372,7 +5479,11 @@ impl<S> App<S> {
             self.input.on_right_released(&self.hits, &self.ctx.tree)
         };
         if let Some(target) = change.right_click_target {
-            let handler = self.ctx.tree.get(target).and_then(|n| n.on_right_click.clone());
+            let handler = self
+                .ctx
+                .tree
+                .get(target)
+                .and_then(|n| n.on_right_click.clone());
             if let Some(h) = handler {
                 let mut ectx = crate::event::EventCtx {
                     tree: &mut self.ctx.tree,
@@ -5630,7 +5741,10 @@ mod tests {
             });
         }
         let named_id = ctx.node("named_scroll").unwrap();
-        assert_eq!(scroll_identity(&ctx, named_id).as_deref(), Some("named_scroll"));
+        assert_eq!(
+            scroll_identity(&ctx, named_id).as_deref(),
+            Some("named_scroll")
+        );
         let anon = ctx
             .tree
             .scrollables()

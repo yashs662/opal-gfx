@@ -175,7 +175,13 @@ impl WindowRound {
         let (tex, view) = make_frame_tex(device, width, height, surface_format);
         self.frame_tex = tex;
         self.frame_view = view;
-        self.bg = make_bg(device, &self.bgl, &self.frame_view, &self.sampler, &self.uniform);
+        self.bg = make_bg(
+            device,
+            &self.bgl,
+            &self.frame_view,
+            &self.sampler,
+            &self.uniform,
+        );
         self.width = width;
         self.height = height;
     }

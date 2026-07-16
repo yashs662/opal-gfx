@@ -13,8 +13,8 @@
 
 mod common;
 
-use common::components::{modal, ModalProps};
-use opal_gfx::{App, Align, Scene, Signal};
+use common::components::{ModalProps, modal};
+use opal_gfx::{Align, App, Scene, Signal};
 
 const W: u32 = 640;
 const H: u32 = 480;
@@ -54,8 +54,7 @@ fn build(s: &mut Scene, visible: Signal<bool>, rebuild: std::rc::Rc<std::cell::C
             s,
             ModalProps {
                 title: "Delete playlist?".into(),
-                body: "This can't be undone. Click outside or Esc to cancel."
-                    .into(),
+                body: "This can't be undone. Click outside or Esc to cancel.".into(),
             },
         );
     }

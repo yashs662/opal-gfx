@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use cosmic_text::CacheKey;
-use etagere::{size2, AtlasAllocator};
+use etagere::{AtlasAllocator, size2};
 
 use crate::text::TextResources;
 
@@ -27,7 +27,6 @@ pub struct AtlasEntry {
     /// Vertical bearing (pen → top edge of bitmap, positive = above baseline).
     pub top: i32,
 }
-
 
 pub struct GlyphAtlas {
     size: u32,

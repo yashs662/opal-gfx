@@ -38,15 +38,14 @@ fn build_scene(s: &mut Scene) {
 /// Upload a `w×h` solid-colour texture in the surface format and return a
 /// view (what a decoder would hand the compositor each frame). Colour is
 /// premultiplied straight bytes (opaque → rgb as-is).
-fn solid_view(
-    gpu: &opal_gfx::gpu::GpuContext,
-    w: u32,
-    h: u32,
-    rgba: [u8; 4],
-) -> wgpu::TextureView {
+fn solid_view(gpu: &opal_gfx::gpu::GpuContext, w: u32, h: u32, rgba: [u8; 4]) -> wgpu::TextureView {
     let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("external solid"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -56,7 +55,9 @@ fn solid_view(
     });
     // Surface is BGRA — swap R/B for the upload bytes.
     let px = [rgba[2], rgba[1], rgba[0], rgba[3]];
-    let data: Vec<u8> = std::iter::repeat_n(px, (w * h) as usize).flatten().collect();
+    let data: Vec<u8> = std::iter::repeat_n(px, (w * h) as usize)
+        .flatten()
+        .collect();
     gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &tex,
@@ -70,7 +71,11 @@ fn solid_view(
             bytes_per_row: Some(w * 4),
             rows_per_image: Some(h),
         },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
     );
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
@@ -107,9 +112,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let video = h.ctx.node("video").expect("video node");
             // The external node must be a promoted layer carrying an
             // external rect (no instances).
-            let has_ext = h.layer_tree.layers().iter().any(|l| {
-                l.root == Some(video) && l.external.is_some()
-            });
+            let has_ext = h
+                .layer_tree
+                .layers()
+                .iter()
+                .any(|l| l.root == Some(video) && l.external.is_some());
             assert!(has_ext, "expected an external-texture layer for `video`");
 
             let (tw, th) = (
@@ -124,7 +131,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (rgba, cw, ch) = h.gpu.capture_rgba();
             let (r1, g1, b1) = avg_center(&rgba, cw, ch);
             log::info!("frame red   → center = ({r1:.0}, {g1:.0}, {b1:.0})");
-            assert!(r1 > 150.0 && g1 < 90.0 && b1 < 90.0, "external red not composited");
+            assert!(
+                r1 > 150.0 && g1 < 90.0 && b1 < 90.0,
+                "external red not composited"
+            );
 
             // Frame 2: green. Swap the texture only — composite-only, the
             // scene tree is untouched (no flush).
@@ -134,9 +144,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (rgba, cw, ch) = h.gpu.capture_rgba();
             let (r2, g2, b2) = avg_center(&rgba, cw, ch);
             log::info!("frame green → center = ({r2:.0}, {g2:.0}, {b2:.0})");
-            assert!(g2 > 130.0 && r2 < 110.0, "external green frame not composited");
+            assert!(
+                g2 > 130.0 && r2 < 110.0,
+                "external green frame not composited"
+            );
 
-            log::info!("PASS: external-texture layer composites caller frames (composite-only swap)");
+            log::info!(
+                "PASS: external-texture layer composites caller frames (composite-only swap)"
+            );
         });
     app.run()
 }

@@ -594,7 +594,11 @@ mod tests {
     fn bind_computed_tracks_chain() {
         let lit = Signal::new(false);
         let color = Computed::new((lit.clone(),), |(l,)| {
-            if l { [0.0, 1.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0, 1.0] }
+            if l {
+                [0.0, 1.0, 0.0, 1.0]
+            } else {
+                [1.0, 0.0, 0.0, 1.0]
+            }
         });
         let bind: Bind<[f32; 4]> = color.clone().into();
         assert_eq!(bind.read(), [1.0, 0.0, 0.0, 1.0]);

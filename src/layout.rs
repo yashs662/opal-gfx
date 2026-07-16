@@ -20,8 +20,7 @@ use crate::node::{NodeId, NodeTree};
 /// the same `Len::Px(100.0)` produces a 100×100 on-screen footprint
 /// on a 100% 1080p monitor and 200×200 physical pixels on a 200% 4K
 /// monitor.
-#[derive(Copy, Clone, Debug, PartialEq)]
-#[derive(Default)]
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub enum Len {
     /// Fixed length in px.
     Px(f32),
@@ -40,7 +39,6 @@ pub enum Len {
     /// the parent's cross `align` is `Stretch`.
     Fill,
 }
-
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Axis {
@@ -314,12 +312,29 @@ fn layout_root<M: Measurer>(
         .map(|t| TextProbe::from_node(t, &node.layout.width, scale));
 
     let w = resolve_main_size(
-        &style.width, viewport[0], measurer, tree, id, &kind_text, true, scale,
+        &style.width,
+        viewport[0],
+        measurer,
+        tree,
+        id,
+        &kind_text,
+        true,
+        scale,
     );
     let h = resolve_main_size(
-        &style.height, viewport[1], measurer, tree, id, &kind_text, false, scale,
+        &style.height,
+        viewport[1],
+        measurer,
+        tree,
+        id,
+        &kind_text,
+        false,
+        scale,
     );
-    let origin = style.abs.map(|a| [a[0] * scale, a[1] * scale]).unwrap_or([0.0, 0.0]);
+    let origin = style
+        .abs
+        .map(|a| [a[0] * scale, a[1] * scale])
+        .unwrap_or([0.0, 0.0]);
 
     if let Some(n) = tree.get_mut_raw(id) {
         n.rect = [origin[0], origin[1], w, h];
@@ -327,12 +342,7 @@ fn layout_root<M: Measurer>(
     layout_children(tree, id, measurer, scale);
 }
 
-fn layout_children<M: Measurer>(
-    tree: &mut NodeTree,
-    parent: NodeId,
-    measurer: &mut M,
-    scale: f32,
-) {
+fn layout_children<M: Measurer>(tree: &mut NodeTree, parent: NodeId, measurer: &mut M, scale: f32) {
     let Some(p) = tree.get(parent) else { return };
     let parent_rect = p.rect;
     let style = p.layout.clone();
@@ -384,7 +394,10 @@ fn layout_children<M: Measurer>(
                 Axis::Row => (n.layout.width, n.layout.height),
                 Axis::Col => (n.layout.height, n.layout.width),
             };
-            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, &n.layout.width, scale));
+            let text = n
+                .text
+                .as_ref()
+                .map(|t| TextProbe::from_node(t, &n.layout.width, scale));
             (len, cross_len, n.layout.aspect_ratio, text)
         };
         // In a Col parent an aspect-ratio child's height derives from its
@@ -520,7 +533,10 @@ fn layout_children<M: Measurer>(
                 Axis::Row => n.layout.height,
                 Axis::Col => n.layout.width,
             };
-            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, &n.layout.width, scale));
+            let text = n
+                .text
+                .as_ref()
+                .map(|t| TextProbe::from_node(t, &n.layout.width, scale));
             (len, text)
         };
         let cross = resolve_cross_size(
@@ -577,7 +593,10 @@ fn layout_children<M: Measurer>(
         let (width_len, height_len, abs_off, text) = {
             let n = tree.get(c).expect("abs child");
             let off = n.layout.abs.unwrap_or([0.0, 0.0]);
-            let text = n.text.as_ref().map(|t| TextProbe::from_node(t, &n.layout.width, scale));
+            let text = n
+                .text
+                .as_ref()
+                .map(|t| TextProbe::from_node(t, &n.layout.width, scale));
             (n.layout.width, n.layout.height, off, text)
         };
         let w = match width_len {
@@ -669,7 +688,14 @@ fn resolve_main_size<M: Measurer>(
             let axis = tree.get(id).map(|n| n.layout.axis).unwrap_or(Axis::Col);
             let probe_axis = if is_width_axis { Axis::Row } else { Axis::Col };
             intrinsic_main_from_node(
-                tree, id, axis, probe_axis, parent_extent, text, measurer, scale,
+                tree,
+                id,
+                axis,
+                probe_axis,
+                parent_extent,
+                text,
+                measurer,
+                scale,
             )
         }
     }
@@ -702,7 +728,14 @@ fn intrinsic_main<M: Measurer>(
     }
     // Container intrinsic.
     intrinsic_main_from_node(
-        tree, id, n.layout.axis, probe_axis, cross_avail, text, measurer, scale,
+        tree,
+        id,
+        n.layout.axis,
+        probe_axis,
+        cross_avail,
+        text,
+        measurer,
+        scale,
     )
 }
 
@@ -798,7 +831,10 @@ fn intrinsic_child_size<M: Measurer>(
     scale: f32,
 ) -> f32 {
     let Some(cn) = tree.get(c) else { return 0.0 };
-    let text = cn.text.as_ref().map(|t| TextProbe::from_node(t, &cn.layout.width, scale));
+    let text = cn
+        .text
+        .as_ref()
+        .map(|t| TextProbe::from_node(t, &cn.layout.width, scale));
     if matches!(probe_axis, Axis::Col)
         && let Some(ratio) = cn.layout.aspect_ratio
     {
@@ -870,7 +906,10 @@ mod tests {
     struct WrapMeasurer;
     impl Measurer for WrapMeasurer {
         fn measure_text(&mut self, content: &str, font_size: f32, line_height: f32) -> [f32; 2] {
-            [content.chars().count() as f32 * font_size * 0.5, line_height]
+            [
+                content.chars().count() as f32 * font_size * 0.5,
+                line_height,
+            ]
         }
         fn measure_text_wrapped(
             &mut self,
@@ -917,7 +956,10 @@ mod tests {
         assert_eq!(wide_w, 100.0);
         assert_eq!(narrow_w, 40.0);
         // Narrower container ⇒ more wrapped lines ⇒ taller.
-        assert!(narrow_h > wide_h, "narrow {narrow_h} should exceed wide {wide_h}");
+        assert!(
+            narrow_h > wide_h,
+            "narrow {narrow_h} should exceed wide {wide_h}"
+        );
     }
 
     #[test]
@@ -1070,7 +1112,9 @@ mod tests {
             let mut b = Node::rect()
                 .layout_width(Len::Px(20.0))
                 .layout_height(Len::Px(40.0));
-            if i == 1 { b = b.push_end(); }
+            if i == 1 {
+                b = b.push_end();
+            }
             tree.add_child(root, b.build());
         }
         compute_layout(&mut tree, [1000.0, 1000.0], &mut NullMeasurer, 1.0);
@@ -1090,8 +1134,21 @@ mod tests {
                 .layout_height(Len::Px(40.0))
                 .build(),
         );
-        let c0 = tree.add_child(root, Node::rect().layout_width(Len::Px(20.0)).layout_height(Len::Px(40.0)).push_end().build());
-        let c1 = tree.add_child(root, Node::rect().layout_width(Len::Px(20.0)).layout_height(Len::Px(40.0)).build());
+        let c0 = tree.add_child(
+            root,
+            Node::rect()
+                .layout_width(Len::Px(20.0))
+                .layout_height(Len::Px(40.0))
+                .push_end()
+                .build(),
+        );
+        let c1 = tree.add_child(
+            root,
+            Node::rect()
+                .layout_width(Len::Px(20.0))
+                .layout_height(Len::Px(40.0))
+                .build(),
+        );
         compute_layout(&mut tree, [1000.0, 1000.0], &mut NullMeasurer, 1.0);
         assert_eq!(tree.get(c0).unwrap().rect[0], 0.0);
         assert_eq!(tree.get(c1).unwrap().rect[0], 20.0);
@@ -1108,8 +1165,21 @@ mod tests {
                 .layout_justify(Justify::Center)
                 .build(),
         );
-        let c0 = tree.add_child(root, Node::rect().layout_width(Len::Px(20.0)).layout_height(Len::Px(40.0)).build());
-        let c1 = tree.add_child(root, Node::rect().layout_width(Len::Px(20.0)).layout_height(Len::Px(40.0)).push_end().build());
+        let c0 = tree.add_child(
+            root,
+            Node::rect()
+                .layout_width(Len::Px(20.0))
+                .layout_height(Len::Px(40.0))
+                .build(),
+        );
+        let c1 = tree.add_child(
+            root,
+            Node::rect()
+                .layout_width(Len::Px(20.0))
+                .layout_height(Len::Px(40.0))
+                .push_end()
+                .build(),
+        );
         compute_layout(&mut tree, [1000.0, 1000.0], &mut NullMeasurer, 1.0);
         // Center: slack 160, leading 80, children at 80 and 100.
         assert_eq!(tree.get(c0).unwrap().rect[0], 80.0);

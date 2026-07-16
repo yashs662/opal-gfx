@@ -56,12 +56,8 @@ fn build(s: &mut Scene, echo: Rc<RefCell<String>>) {
             // `on_change` writing into the shared RefCell and the
             // scene-level rebuild-token; the simpler path here is
             // just to print + leave the label static for v1.
-            p.text(
-                "echo_label",
-                format!("(value: {})", echo.borrow()),
-                14.0,
-            )
-            .color([1.0, 1.0, 1.0, 0.55]);
+            p.text("echo_label", format!("(value: {})", echo.borrow()), 14.0)
+                .color([1.0, 1.0, 1.0, 0.55]);
         });
 }
 

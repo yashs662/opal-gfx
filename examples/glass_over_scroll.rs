@@ -37,7 +37,11 @@ fn build_scene(s: &mut Scene) {
             .child(|c| {
                 for i in 0..ROWS {
                     let bright = i % 2 == 0;
-                    let (r, g, b) = if bright { (0.1, 0.9, 0.3) } else { (0.06, 0.06, 0.08) };
+                    let (r, g, b) = if bright {
+                        (0.1, 0.9, 0.3)
+                    } else {
+                        (0.06, 0.06, 0.08)
+                    };
                     c.rect(format!("row{i}"))
                         .w(Len::Fill)
                         .h_px(ROW_H)
@@ -71,7 +75,9 @@ fn avg_under_glass(rgba: &[u8], w: u32, h: u32) -> (f32, f32, f32) {
             n += 1.0;
         }
     }
-    if n == 0.0 { return (0.0, 0.0, 0.0); }
+    if n == 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
     ((r / n) as f32, (g / n) as f32, (b / n) as f32)
 }
 
@@ -92,7 +98,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .layers()
                 .iter()
                 .any(|l| l.root == Some(list) && l.window.is_some());
-            assert!(has_scroll_layer, "expected a windowed scroll layer for `list`");
+            assert!(
+                has_scroll_layer,
+                "expected a windowed scroll layer for `list`"
+            );
 
             h.render();
             let (rgba, cw, ch) = h.gpu.capture_rgba();

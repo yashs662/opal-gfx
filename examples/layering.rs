@@ -55,7 +55,10 @@ fn build(s: &mut Scene, art: opal_gfx::ImageHandle) {
                         .rgba(0.95, 0.20, 0.55, 1.0)
                         .radius(18.0);
                     // Layer 2: image over the rect.
-                    c.image("art", art).abs(120.0, 70.0).size_px(96.0, 96.0).radius(12.0);
+                    c.image("art", art)
+                        .abs(120.0, 70.0)
+                        .size_px(96.0, 96.0)
+                        .radius(12.0);
                     // Layer 3: text over the image. Should appear
                     // blurred through the glass below.
                     c.text("under_glass", "BEHIND GLASS", 28.0)

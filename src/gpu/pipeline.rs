@@ -93,12 +93,7 @@ impl ShapePipeline {
         // backdrop and appear blurred behind glass panels.
         let opaque_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("opal.shape.opaque pl"),
-            bind_group_layouts: &[
-                Some(&shape_bgl),
-                None,
-                Some(glyph_bgl),
-                Some(image_bgl),
-            ],
+            bind_group_layouts: &[Some(&shape_bgl), None, Some(glyph_bgl), Some(image_bgl)],
             immediate_size: 0,
         });
 
@@ -167,8 +162,12 @@ impl ShapePipeline {
             })
         };
 
-        let opaque_pipeline =
-            make_pipeline("opal.shape.opaque", &opaque_layout, "fs_opaque", BACKDROP_FORMAT);
+        let opaque_pipeline = make_pipeline(
+            "opal.shape.opaque",
+            &opaque_layout,
+            "fs_opaque",
+            BACKDROP_FORMAT,
+        );
         let final_pipeline =
             make_pipeline("opal.shape.final", &final_layout, "fs_main", surface_format);
 

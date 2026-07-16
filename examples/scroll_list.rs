@@ -120,13 +120,10 @@ fn build(s: &mut Scene) {
                             .child(|r| {
                                 r.text(format!("row{i}_label"), format!("row {i:>02}"), 14.0)
                                     .color([0.0, 0.0, 0.0, 0.85]);
-                            }
-                        );
+                            });
                     }
-                }
-            );
-        }
-    );
+                });
+        });
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

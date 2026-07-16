@@ -8,8 +8,8 @@
 use std::fs::File;
 use std::io::BufWriter;
 
-use opal_gfx::splash::{SplashBitmap, SplashConfig};
 use opal_gfx::TextResources;
+use opal_gfx::splash::{SplashBitmap, SplashConfig};
 
 fn main() {
     let cfg = SplashConfig {

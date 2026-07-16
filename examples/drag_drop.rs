@@ -16,8 +16,8 @@
 
 mod common;
 
-use common::components::{slider, SliderProps};
-use opal_gfx::{App, Align, Len, Scene, Signal};
+use common::components::{SliderProps, slider};
+use opal_gfx::{Align, App, Len, Scene, Signal};
 
 const W: u32 = 640;
 const H: u32 = 460;

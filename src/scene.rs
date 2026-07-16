@@ -90,6 +90,19 @@ pub struct SceneCtx {
     /// app shell's per-frame tick drives their auto-pan. Rebuilt with the
     /// scene; dead ids are skipped by the tick.
     pub(crate) marquees: Vec<NodeId>,
+    /// Pending programmatic focus target (a node name). Set from an
+    /// `on_frame` hook via [`Self::request_focus`]; the app resolves it to a
+    /// node + focuses it **after** the rebuild, so opening a modal can focus
+    /// its freshly-built text field without a click. Drained each frame.
+    pub(crate) focus_request: Option<String>,
+    /// Pending programmatic text-field value set (`node name`, `value`). Set
+    /// via [`Self::set_field_value`]; the app writes it into the named
+    /// editor **after** the rebuild (so the node exists), replacing whatever
+    /// the user had typed. Used to clear/seed a persistent field — e.g. a
+    /// modal that stays mounted while closed and must reopen empty. The
+    /// field's `on_change` does **not** fire (this is a programmatic set,
+    /// not user input). Drained each frame.
+    pub(crate) field_set_request: Option<(String, String)>,
 }
 
 impl Default for SceneCtx {
@@ -107,7 +120,26 @@ impl SceneCtx {
             text: TextResources::new(),
             scale: 1.0,
             marquees: Vec::new(),
+            focus_request: None,
+            field_set_request: None,
         }
+    }
+
+    /// Request keyboard focus on the named text field after this frame's
+    /// rebuild (autofocus). No-op if the name doesn't resolve to an editable
+    /// node. Call from an `on_frame` hook when opening an input modal.
+    pub fn request_focus(&mut self, name: impl Into<String>) {
+        self.focus_request = Some(name.into());
+    }
+
+    /// Programmatically set the named text field's value after this frame's
+    /// rebuild, moving the cursor to the end and clearing any selection. Used
+    /// to clear/seed a field whose node outlives its visibility (a modal that
+    /// stays mounted while closed), so it reopens showing the intended text
+    /// rather than the last thing typed. The field's `on_change` does **not**
+    /// fire. No-op if the name doesn't resolve to an editable node.
+    pub fn set_field_value(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.field_set_request = Some((name.into(), value.into()));
     }
 
     /// Look up a previously-named node.
@@ -636,7 +668,9 @@ impl<'a> Scene<'a> {
         name: impl IntoNodeName,
         build: impl FnOnce(&mut Scene),
     ) -> NodeBuilderRef<'_> {
-        let root_id = self.spawn(name.into_node_name(), SpawnKind::Rect, Axis::Row).id();
+        let root_id = self
+            .spawn(name.into_node_name(), SpawnKind::Rect, Axis::Row)
+            .id();
         self.ctx
             .tree
             .set_layout_overflow(root_id, Overflow::Scroll, Overflow::Hidden);

@@ -92,13 +92,11 @@ fn build(
                         // Snap any other expanded row back to default
                         // before starting a new animation.
                         if let Some(prev_row) = expanded.get()
-                            && prev_row != i {
-                                ctx.tree.set_lazy_list_row_height(
-                                    list_id,
-                                    prev_row,
-                                    COLLAPSED_H,
-                                );
-                            }
+                            && prev_row != i
+                        {
+                            ctx.tree
+                                .set_lazy_list_row_height(list_id, prev_row, COLLAPSED_H);
+                        }
 
                         let (initial, target) = if was_expanded {
                             (EXPANDED_H, COLLAPSED_H)
@@ -114,19 +112,12 @@ fn build(
                             ANIM_DUR,
                             ctx.now,
                         );
-                        *anim_state.borrow_mut() = Some(AnimSlot {
-                            row: i,
-                            height_sig,
-                        });
+                        *anim_state.borrow_mut() = Some(AnimSlot { row: i, height_sig });
                         expanded.set(if was_expanded { None } else { Some(i) });
                     })
                     .child(|r| {
-                        r.text(
-                            format!("row_title_{i}"),
-                            format!("Track #{i:04}"),
-                            14.0,
-                        )
-                        .color([0.0, 0.0, 0.0, 0.9]);
+                        r.text(format!("row_title_{i}"), format!("Track #{i:04}"), 14.0)
+                            .color([0.0, 0.0, 0.0, 0.9]);
                         r.text(
                             format!("row_detail_{i}"),
                             "click to expand · album · 3:42",
@@ -185,7 +176,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // moving and the no-op path returns false.
             let state = frame_anim.borrow();
             let Some(slot) = state.as_ref() else { return };
-            let Some(list_id) = find_list(ctx) else { return };
+            let Some(list_id) = find_list(ctx) else {
+                return;
+            };
             ctx.tree
                 .set_lazy_list_row_height(list_id, slot.row, slot.height_sig.get());
         });
