@@ -31,12 +31,25 @@ use std::sync::{Arc, Mutex};
 use crate::WakeHandle;
 use crate::node::NodeId;
 
-/// A decoded frame awaiting upload: tightly-packed `width * height * 4`
-/// RGBA8 (sRGB-encoded) bytes.
+/// A decoded frame awaiting upload.
 pub(crate) struct PendingFrame {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub pixels: FramePixels,
+}
+
+/// The frame's pixel payload. NV12 is the lean path for video: 12 bits
+/// per pixel instead of RGBA's 32 (a resident Canvas loop drops ~2.7×
+/// in VRAM), and the YUV→RGB conversion moves into the composite
+/// fragment shader — plain WGSL + standard `R8Unorm`/`Rg8Unorm`
+/// textures, identical on every backend.
+pub(crate) enum FramePixels {
+    /// Tightly-packed `width * height * 4` RGBA8 (sRGB-encoded) bytes.
+    Rgba(Vec<u8>),
+    /// Biplanar YUV (BT.709 limited range): `y` is `width * height`
+    /// luma bytes; `uv` is `(width/2) * (height/2) * 2` interleaved
+    /// chroma pairs. `width`/`height` must be even.
+    Nv12 { y: Vec<u8>, uv: Vec<u8> },
 }
 
 /// One queued action, applied in order on the UI thread.
@@ -101,7 +114,7 @@ impl FrameSink {
             frame: PendingFrame {
                 width,
                 height,
-                rgba,
+                pixels: FramePixels::Rgba(rgba),
             },
         });
     }
@@ -117,7 +130,32 @@ impl FrameSink {
             frame: PendingFrame {
                 width,
                 height,
-                rgba,
+                pixels: FramePixels::Rgba(rgba),
+            },
+        });
+    }
+
+    /// [`push_frame`](Self::push_frame), but with biplanar NV12 planes
+    /// (BT.709 limited range) — the lean path for video loops: 12 bpp
+    /// resident instead of 32, converted to RGB in the composite shader.
+    /// `y` is `width * height` bytes; `uv` is interleaved half-res chroma
+    /// (`(width/2) * (height/2) * 2` bytes). Dims must be even.
+    pub fn push_frame_nv12(
+        &self,
+        node: NodeId,
+        epoch: u64,
+        width: u32,
+        height: u32,
+        y: Vec<u8>,
+        uv: Vec<u8>,
+    ) {
+        self.push_cmd(FrameCmd::Push {
+            node,
+            epoch,
+            frame: PendingFrame {
+                width,
+                height,
+                pixels: FramePixels::Nv12 { y, uv },
             },
         });
     }

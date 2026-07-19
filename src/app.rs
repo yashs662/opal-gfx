@@ -1353,7 +1353,7 @@ impl<S> App<S> {
     pub fn log_memory_report(&self) {
         if let Some(mem) = self.memory_report() {
             log::info!(
-                "gpu memory: total={} KiB (instance={} overlay={} blur={} overdraw={} glyph_atlas={} image_atlas={} canvas_frames={} img_src_cpu={} timing={} prev_cpu={})",
+                "gpu memory: total={} KiB (instance={} overlay={} blur={} overdraw={} glyph_atlas={} image_atlas={} canvas_frames={} timing={} prev_cpu={})",
                 mem.total() / 1024,
                 mem.instance_buffer,
                 mem.overlay_buffer,
@@ -1362,7 +1362,6 @@ impl<S> App<S> {
                 mem.glyph_atlas,
                 mem.image_atlas,
                 mem.external_frames,
-                mem.image_sources_cpu,
                 mem.timing,
                 mem.prev_instances_cpu,
             );
@@ -1402,13 +1401,26 @@ impl<S> App<S> {
             return false;
         };
         for cmd in pending {
+            use crate::frame_sink::FramePixels;
             match cmd {
-                crate::frame_sink::FrameCmd::Frame { node, frame } => {
-                    gpu.upload_external_frame(node, &frame.rgba, frame.width, frame.height);
-                }
-                crate::frame_sink::FrameCmd::Push { node, epoch, frame } => {
-                    gpu.push_external_frame(node, epoch, &frame.rgba, frame.width, frame.height);
-                }
+                crate::frame_sink::FrameCmd::Frame { node, frame } => match &frame.pixels {
+                    FramePixels::Rgba(rgba) => {
+                        gpu.upload_external_frame(node, rgba, frame.width, frame.height);
+                    }
+                    // Streaming NV12 has no engine path (submit() only
+                    // builds RGBA) — resident loops are the NV12 shape.
+                    FramePixels::Nv12 { .. } => {
+                        log::warn!("[frame-sink] streaming NV12 frame dropped (unsupported)");
+                    }
+                },
+                crate::frame_sink::FrameCmd::Push { node, epoch, frame } => match &frame.pixels {
+                    FramePixels::Rgba(rgba) => {
+                        gpu.push_external_frame(node, epoch, rgba, frame.width, frame.height);
+                    }
+                    FramePixels::Nv12 { y, uv } => {
+                        gpu.push_external_frame_nv12(node, epoch, y, uv, frame.width, frame.height);
+                    }
+                },
                 crate::frame_sink::FrameCmd::Select { node, epoch, index } => {
                     gpu.select_external_frame(node, epoch, index);
                 }
@@ -5334,9 +5346,7 @@ impl<S> App<S> {
     /// next scheduled wake (so the loop doesn't park past it). Exits the
     /// app once the script is exhausted.
     fn automation_tick(&mut self, event_loop: &ActiveEventLoop, now: Instant) -> Option<Instant> {
-        let Some(mut state) = self.automation.take() else {
-            return None;
-        };
+        let mut state = self.automation.take()?;
         if state.finished() {
             // Honor the last step's schedule before exiting — a trailing
             // `Wait` sets `next_at` past the end of the list, and any stray
@@ -5413,6 +5423,10 @@ impl<S> App<S> {
                 Step::Screenshot(path) => {
                     self.render_once();
                     self.capture_to(path);
+                    state.advance_now(now);
+                }
+                Step::MemReport => {
+                    self.log_memory_report();
                     state.advance_now(now);
                 }
             }

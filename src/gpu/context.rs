@@ -20,13 +20,31 @@ use super::timing::{
     FrameTiming, PASS_FINAL, PASS_OD_COMPOSE, PASS_OD_COUNT, PASS_OPAQUE, PassAlloc, Timing,
 };
 
+/// The view(s) the composite pass samples for one external frame.
+/// `Nv12` carries the two plane views (R8 luma + RG8 chroma) consumed by
+/// the `fs_nv12` composite pipeline — 12 bpp resident instead of RGBA's
+/// 32, so a whole Canvas loop is ~2.7× smaller in VRAM.
+#[derive(Clone)]
+enum ExternalShown {
+    Rgba(wgpu::TextureView),
+    Nv12 {
+        luma: wgpu::TextureView,
+        chroma: wgpu::TextureView,
+    },
+}
+
+/// One resident frame: the shown view(s) plus the textures that keep the
+/// GPU allocations alive.
+struct ExternalFrame {
+    _textures: Vec<wgpu::Texture>,
+    shown: ExternalShown,
+}
+
 /// A node's resident Canvas frames: every frame of the loop uploaded once
-/// into its own VRAM texture, replayed by re-binding one of `views`. The
-/// `textures` are kept alongside their `views` to keep them alive.
+/// into VRAM, replayed by re-binding the node's shown view(s).
 #[derive(Default)]
 struct ExternalFrameSet {
-    textures: Vec<wgpu::Texture>,
-    views: Vec<wgpu::TextureView>,
+    frames: Vec<ExternalFrame>,
     /// Sum of frame sizes (bytes) for the memory report.
     bytes: u64,
     /// Decode-session generation that owns these frames. A push from a newer
@@ -46,7 +64,10 @@ pub struct GpuContext {
 
     pub shape: ShapePipeline,
     pub blur: BlurResources,
-    pub overdraw: OverdrawResources,
+    /// Overdraw-heatmap resources — debug-only, so allocated lazily on
+    /// the first `set_overdraw(true)` (the Rgba16Float accumulator is
+    /// ~32 MB at 2.5k×1.5k; sessions that never press F4 pay nothing).
+    pub overdraw: Option<OverdrawResources>,
     /// Offscreen frame target + final corner-round pass. The whole frame
     /// composites into its texture, then one pass blits it to the swapchain
     /// rounding the window corners — so stacked translucent layers (glass over
@@ -65,7 +86,7 @@ pub struct GpuContext {
     /// composite pass samples these for external layers instead of the
     /// slot's own raster texture. We keep the view (composite sampling)
     /// alongside the texture (keeps it alive).
-    external_textures: std::collections::HashMap<crate::node::NodeId, wgpu::TextureView>,
+    external_textures: std::collections::HashMap<crate::node::NodeId, ExternalShown>,
     /// Engine-owned frame textures backing [`Self::upload_external_frame`].
     /// Reused across frames (re-created only when the frame size changes)
     /// so a 30fps video doesn't re-allocate a texture every frame.
@@ -240,11 +261,13 @@ impl GpuContext {
         // none "never load" from a dangling/evicted handle. VRAM is the
         // cheap axis here (the compositor doctrine); 256 MiB holds ~1700
         // 300 px covers, far past any real playlist's working set.
-        let atlas_size = device.limits().max_texture_dimension_2d.min(8192);
+        // Start small — the atlas grows on demand (doubling, GPU-blit
+        // repack; see `ImageAtlas::upload_rgba_growing`), so an empty
+        // scene commits 4 MiB instead of pre-reserving 256 MiB.
+        let atlas_size = device.limits().max_texture_dimension_2d.min(1024);
         let image_atlas = ImageAtlas::new(&device, atlas_size);
         let shape = ShapePipeline::new(&device, format, glyph_atlas.layout(), image_atlas.layout());
         let blur = BlurResources::new(&device, width, height);
-        let overdraw = OverdrawResources::new(&device, width, height, format, &shape.shape_bgl);
         let window_round = super::window_round::WindowRound::new(&device, width, height, format);
         let timing = if want_timing {
             Some(Timing::new(&device, &queue))
@@ -307,7 +330,7 @@ impl GpuContext {
             window,
             shape,
             blur,
-            overdraw,
+            overdraw: None,
             window_round,
             layers,
             layer_draws: Vec::new(),
@@ -364,11 +387,13 @@ impl GpuContext {
         );
         // Blurred view changed — rebuild the glass bind group.
         self.glass_bg = make_glass_bg(&self.device, &self.shape, &self.blur);
-        self.overdraw.resize(
-            &self.device,
-            self.surface_config.width,
-            self.surface_config.height,
-        );
+        if let Some(od) = self.overdraw.as_mut() {
+            od.resize(
+                &self.device,
+                self.surface_config.width,
+                self.surface_config.height,
+            );
+        }
         self.window_round.resize(
             &self.device,
             self.surface_config.width,
@@ -394,7 +419,8 @@ impl GpuContext {
     /// (and request a redraw to recomposite). Unregistered external nodes
     /// composite empty until set.
     pub fn set_external_texture(&mut self, node: crate::node::NodeId, view: wgpu::TextureView) {
-        self.external_textures.insert(node, view);
+        self.external_textures
+            .insert(node, ExternalShown::Rgba(view));
     }
 
     /// Drop a node's external texture + any resident frame set (e.g. video
@@ -431,28 +457,95 @@ impl GpuContext {
         height: u32,
     ) {
         debug_assert_eq!(rgba.len(), (width * height * 4) as usize);
-        // First frame of a new decode session: drop the previous clip's
-        // frames so they can never be looped into this one. Keyed by epoch,
-        // so this is correct regardless of node-id reuse or command ordering.
-        match self.external_frame_sets.get(&node) {
-            Some(set) if set.epoch != epoch => {
-                self.external_frame_sets.remove(&node);
-                self.external_textures.remove(&node);
-            }
-            _ => {}
-        }
+        let tex = self.plane_texture(
+            "canvas frame",
+            width,
+            height,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            rgba,
+            width * 4,
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        self.push_external_common(
+            node,
+            epoch,
+            ExternalFrame {
+                _textures: vec![tex],
+                shown: ExternalShown::Rgba(view),
+            },
+            (width as u64) * (height as u64) * 4,
+        );
+    }
+
+    /// [`push_external_frame`](Self::push_external_frame) with biplanar
+    /// NV12 planes (BT.709 limited range): `y` is `width × height` R8
+    /// luma, `uv` is `(width/2) × (height/2)` interleaved RG8 chroma.
+    /// 12 bpp resident instead of 32 — a whole Canvas loop stays ~2.7×
+    /// smaller in VRAM; the composite `fs_nv12` pipeline converts to RGB
+    /// per fragment. Dims must be even.
+    pub fn push_external_frame_nv12(
+        &mut self,
+        node: crate::node::NodeId,
+        epoch: u64,
+        y: &[u8],
+        uv: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        debug_assert_eq!(y.len(), (width * height) as usize);
+        debug_assert_eq!(uv.len(), ((width / 2) * (height / 2) * 2) as usize);
+        let luma_tex = self.plane_texture(
+            "canvas luma",
+            width,
+            height,
+            wgpu::TextureFormat::R8Unorm,
+            y,
+            width,
+        );
+        let chroma_tex = self.plane_texture(
+            "canvas chroma",
+            width / 2,
+            height / 2,
+            wgpu::TextureFormat::Rg8Unorm,
+            uv,
+            width,
+        );
+        let luma = luma_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let chroma = chroma_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        self.push_external_common(
+            node,
+            epoch,
+            ExternalFrame {
+                _textures: vec![luma_tex, chroma_tex],
+                shown: ExternalShown::Nv12 { luma, chroma },
+            },
+            (y.len() + uv.len()) as u64,
+        );
+    }
+
+    /// Create + fill one plane texture (shared by the RGBA and NV12 push
+    /// paths). `bytes_per_row` is the tightly-packed source pitch.
+    fn plane_texture(
+        &self,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        data: &[u8],
+        bytes_per_row: u32,
+    ) -> wgpu::Texture {
         let size = wgpu::Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("canvas frame"),
+            label: Some(label),
             size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -463,22 +556,42 @@ impl GpuContext {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            rgba,
+            data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(width * 4),
+                bytes_per_row: Some(bytes_per_row),
                 rows_per_image: Some(height),
             },
             size,
         );
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        tex
+    }
+
+    /// Epoch-reset + append + show for a freshly-uploaded resident frame.
+    fn push_external_common(
+        &mut self,
+        node: crate::node::NodeId,
+        epoch: u64,
+        frame: ExternalFrame,
+        bytes: u64,
+    ) {
+        // First frame of a new decode session: drop the previous clip's
+        // frames so they can never be looped into this one. Keyed by epoch,
+        // so this is correct regardless of node-id reuse or command ordering.
+        match self.external_frame_sets.get(&node) {
+            Some(set) if set.epoch != epoch => {
+                self.external_frame_sets.remove(&node);
+                self.external_textures.remove(&node);
+            }
+            _ => {}
+        }
+        let shown = frame.shown.clone();
         let set = self.external_frame_sets.entry(node).or_default();
         set.epoch = epoch;
-        set.bytes += (width as u64) * (height as u64) * 4;
-        set.views.push(view.clone());
-        set.textures.push(tex);
+        set.bytes += bytes;
+        set.frames.push(frame);
         // Show the just-uploaded frame.
-        self.external_textures.insert(node, view);
+        self.external_textures.insert(node, shown);
     }
 
     /// Bind `node`'s shown texture to frame `index` of its resident set.
@@ -488,9 +601,9 @@ impl GpuContext {
     pub fn select_external_frame(&mut self, node: crate::node::NodeId, epoch: u64, index: usize) {
         if let Some(set) = self.external_frame_sets.get(&node)
             && set.epoch == epoch
-            && let Some(view) = set.views.get(index)
+            && let Some(frame) = set.frames.get(index)
         {
-            self.external_textures.insert(node, view.clone());
+            self.external_textures.insert(node, frame.shown.clone());
         }
     }
 
@@ -509,7 +622,7 @@ impl GpuContext {
             let shown = self
                 .external_textures
                 .remove(&old)
-                .or_else(|| set.views.last().cloned());
+                .or_else(|| set.frames.last().map(|f| f.shown.clone()));
             // `new` may hold a set: keep it only if it belongs to the *same*
             // decode session (a mid-build node-id reassign split this clip's
             // frames across two ids — merge so the loop stays complete, old
@@ -520,8 +633,7 @@ impl GpuContext {
                 && existing.epoch == set.epoch
             {
                 set.bytes += existing.bytes;
-                set.views.extend(existing.views);
-                set.textures.extend(existing.textures);
+                set.frames.extend(existing.frames);
             }
             if let Some(view) = shown {
                 self.external_textures.insert(new, view);
@@ -585,7 +697,8 @@ impl GpuContext {
             size,
         );
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        self.external_textures.insert(node, view);
+        self.external_textures
+            .insert(node, ExternalShown::Rgba(view));
     }
 
     pub fn set_layers(&mut self, draws: &[super::layer::LayerDraw]) {
@@ -646,6 +759,15 @@ impl GpuContext {
 
     pub fn set_overdraw(&mut self, on: bool) {
         self.overdraw_mode = on;
+        if on && self.overdraw.is_none() {
+            self.overdraw = Some(OverdrawResources::new(
+                &self.device,
+                self.surface_config.width,
+                self.surface_config.height,
+                self.surface_config.format,
+                &self.shape.shape_bgl,
+            ));
+        }
     }
 
     /// Set the window-level corner radius (logical px). `0.0` disables
@@ -1294,9 +1416,13 @@ impl GpuContext {
             .enumerate()
             .map(|(i, d)| match d.external {
                 Some(node) => match self.external_textures.get(&node) {
-                    Some(view) => {
+                    Some(ExternalShown::Rgba(view)) => {
                         CompositeBg::Owned(self.layers.external_bind_group(&self.device, i, view))
                     }
+                    Some(ExternalShown::Nv12 { luma, chroma }) => CompositeBg::OwnedNv12(
+                        self.layers
+                            .external_bind_group_nv12(&self.device, i, luma, chroma),
+                    ),
                     // No texture registered yet → composite the (empty)
                     // slot texture so the layer reads transparent.
                     None => CompositeBg::Slot(i),
@@ -1326,14 +1452,30 @@ impl GpuContext {
                 multiview_mask: None,
             });
             rpass.set_pipeline(self.layers.pipeline());
+            // Track which composite pipeline is bound — NV12 external
+            // layers swap to the yuv pipeline and back; a scene with no
+            // canvas never switches.
+            let mut nv12_bound = false;
             for &i in &order {
-                let bg = match &composite_bgs[i] {
-                    CompositeBg::Owned(b) => b,
-                    CompositeBg::Slot(s) => self.layers.bind_group(*s),
+                let (bg, want_nv12) = match &composite_bgs[i] {
+                    CompositeBg::Owned(b) => (b, false),
+                    CompositeBg::OwnedNv12(b) => (b, true),
+                    CompositeBg::Slot(s) => (self.layers.bind_group(*s), false),
                 };
+                if want_nv12 != nv12_bound {
+                    rpass.set_pipeline(if want_nv12 {
+                        self.layers.yuv_pipeline()
+                    } else {
+                        self.layers.pipeline()
+                    });
+                    nv12_bound = want_nv12;
+                }
                 rpass.set_bind_group(0, bg, &[]);
                 rpass.draw(0..6, 0..1);
                 drawcalls += 1;
+            }
+            if nv12_bound {
+                rpass.set_pipeline(self.layers.pipeline());
             }
             if self.overlay_count > 0 {
                 rpass.set_pipeline(&self.shape.final_pipeline);
@@ -1382,7 +1524,9 @@ impl GpuContext {
         // accumulator, then re-render the swapchain with a heatmap of the
         // count. The final pass already cleared and drew the scene; the
         // compose pass overwrites it with the heatmap (LoadOp::Clear).
-        if self.overdraw_mode {
+        if self.overdraw_mode
+            && let Some(od) = self.overdraw.as_ref()
+        {
             {
                 let od_count_ts = match (self.timing.as_ref(), od_count_begin.zip(od_count_end)) {
                     (Some(t), Some((b, e))) => Some(wgpu::RenderPassTimestampWrites {
@@ -1395,7 +1539,7 @@ impl GpuContext {
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("opal.overdraw count"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.overdraw.count_view,
+                        view: &od.count_view,
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {
@@ -1409,7 +1553,7 @@ impl GpuContext {
                     multiview_mask: None,
                 });
                 if self.instance_count > 0 {
-                    rpass.set_pipeline(&self.overdraw.count_pipeline);
+                    rpass.set_pipeline(&od.count_pipeline);
                     rpass.set_bind_group(0, &self.shape_bg, &[]);
                     rpass.draw(0..6, 0..self.instance_count);
                     drawcalls += 1;
@@ -1441,8 +1585,8 @@ impl GpuContext {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                rpass.set_pipeline(&self.overdraw.compose_pipeline);
-                rpass.set_bind_group(0, &self.overdraw.compose_bg, &[]);
+                rpass.set_pipeline(&od.compose_pipeline);
+                rpass.set_bind_group(0, &od.compose_bg, &[]);
                 rpass.draw(0..6, 0..1);
                 drawcalls += 1;
             }
@@ -1548,9 +1692,15 @@ impl GpuContext {
         // Mipmap pyramid: each level is 1/4 the previous. Geometric
         // series sum ≈ 4/3 of base. Rgba8Unorm = 4 B/px.
         let blur_textures = (blur_px * 4 * 4) / 3;
-        let (ow, oh) = self.overdraw.resolution();
-        // 1 texture, Rgba16Float → 8 B/px.
-        let overdraw_textures = (ow as u64) * (oh as u64) * 8;
+        // 1 texture, Rgba16Float → 8 B/px. Lazily allocated on first F4.
+        let overdraw_textures = self
+            .overdraw
+            .as_ref()
+            .map(|od| {
+                let (ow, oh) = od.resolution();
+                (ow as u64) * (oh as u64) * 8
+            })
+            .unwrap_or(0);
         let params_buffers: u64 = 0;
         // Timing: 1× resolve (256) + 2× readback (256 each) when active.
         let timing = if self.timing.is_some() { 256 * 3 } else { 0 };
@@ -1565,7 +1715,6 @@ impl GpuContext {
             params_buffers,
             glyph_atlas: self.glyph_atlas.memory_bytes(),
             image_atlas: self.image_atlas.memory_bytes(),
-            image_sources_cpu: self.image_atlas.source_bytes(),
             external_frames: self.external_frame_sets.values().map(|s| s.bytes).sum(),
         }
     }
@@ -1692,10 +1841,6 @@ pub struct MemoryReport {
     pub params_buffers: u64,
     pub glyph_atlas: u64,
     pub image_atlas: u64,
-    /// CPU-side cache of source bytes for every uploaded image
-    /// (`ImageAtlas::source_bytes()`). Required so the eviction path
-    /// can re-pack survivors when the atlas fills.
-    pub image_sources_cpu: u64,
     /// Resident Canvas frame sets in VRAM (whole loops uploaded once,
     /// replayed by view re-bind). 4 B/px × every cached frame.
     pub external_frames: u64,
@@ -1713,7 +1858,6 @@ impl MemoryReport {
             + self.params_buffers
             + self.glyph_atlas
             + self.image_atlas
-            + self.image_sources_cpu
             + self.external_frames
     }
 }
@@ -1725,6 +1869,8 @@ impl MemoryReport {
 enum CompositeBg {
     Slot(usize),
     Owned(wgpu::BindGroup),
+    /// NV12 external frame — pairs with the yuv composite pipeline.
+    OwnedNv12(wgpu::BindGroup),
 }
 
 fn make_shape_bg(

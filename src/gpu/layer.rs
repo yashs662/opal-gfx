@@ -195,7 +195,15 @@ pub struct LayerResources {
     /// `backdrop_tex` (blur input) with this; the premultiplied-over math
     /// is identical, only the render-target format differs.
     backdrop_pipeline: wgpu::RenderPipeline,
+    /// NV12 external-video composite (`fs_nv12`): samples the luma +
+    /// chroma planes of a resident Canvas frame and converts YUV→RGB in
+    /// the shader. Surface-format target only — the backdrop pass skips
+    /// external layers (their instance span is empty).
+    yuv_pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
+    /// Bind-group layout for [`Self::yuv_pipeline`]: uniform @0, luma @1,
+    /// sampler @2, chroma @3.
+    yuv_bgl: wgpu::BindGroupLayout,
     /// Shape bind-group layout (frame UBO + instance SSBO), cloned from
     /// the shape pipeline so per-layer raster bind groups can be (re)built
     /// here without threading it through every call.
@@ -274,6 +282,59 @@ impl LayerResources {
             immediate_size: 0,
         });
 
+        // NV12 external-video variant: same uniform + sampler, but two
+        // plane textures (R8 luma @1, RG8 chroma @3) and the `fs_nv12`
+        // entry point doing YUV→RGB in the shader. Plain unorm formats —
+        // no optional device features, identical on every backend.
+        let yuv_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("opal.composite bgl (nv12)"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<CompositeUniform>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let yuv_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("opal.composite pl (nv12)"),
+            bind_group_layouts: &[Some(&yuv_bgl)],
+            immediate_size: 0,
+        });
+
         // Premultiplied-over: layers stack; a single layer over a
         // transparent surface passes through unchanged.
         let blend = Some(wgpu::BlendState {
@@ -289,10 +350,13 @@ impl LayerResources {
             },
         });
 
-        let make_pipeline = |target: wgpu::TextureFormat, label: &str| {
+        let make_pipeline = |layout: &wgpu::PipelineLayout,
+                             entry: &str,
+                             target: wgpu::TextureFormat,
+                             label: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_main"),
@@ -301,7 +365,7 @@ impl LayerResources {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(entry),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: target,
@@ -324,12 +388,20 @@ impl LayerResources {
                 cache: None,
             })
         };
-        let pipeline = make_pipeline(format, "opal.composite pipeline");
+        let pipeline = make_pipeline(&layout, "fs_main", format, "opal.composite pipeline");
         // P4: composites below-glass content into the linear backdrop
         // texture (blur input). Unused until the segment walk lands.
         let backdrop_pipeline = make_pipeline(
+            &layout,
+            "fs_main",
             super::blur::BACKDROP_FORMAT,
             "opal.composite→backdrop pipeline",
+        );
+        let yuv_pipeline = make_pipeline(
+            &yuv_layout,
+            "fs_nv12",
+            format,
+            "opal.composite pipeline (nv12)",
         );
 
         // Nearest sampling: a 1:1-px composite window maps the quad to the
@@ -360,7 +432,9 @@ impl LayerResources {
         let mut res = LayerResources {
             pipeline,
             backdrop_pipeline,
+            yuv_pipeline,
             bgl,
+            yuv_bgl,
             shape_bgl: shape_bgl.clone(),
             sampler,
             linear_sampler,
@@ -626,8 +700,47 @@ impl LayerResources {
         })
     }
 
+    /// [`Self::external_bind_group`] for an NV12 frame: slot uniform @0,
+    /// luma plane @1, linear sampler @2, chroma plane @3 — paired with
+    /// [`Self::yuv_pipeline`] in the composite pass.
+    pub fn external_bind_group_nv12(
+        &self,
+        device: &wgpu::Device,
+        i: usize,
+        luma_view: &wgpu::TextureView,
+        chroma_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("opal.composite bg (nv12)"),
+            layout: &self.yuv_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.textures[i].uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(luma_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(chroma_view),
+                },
+            ],
+        })
+    }
+
     pub fn pipeline(&self) -> &wgpu::RenderPipeline {
         &self.pipeline
+    }
+
+    /// NV12 external-video composite pipeline (`fs_nv12`).
+    pub fn yuv_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.yuv_pipeline
     }
 
     /// Composite pipeline targeting the linear `BACKDROP_FORMAT` — P4

@@ -5,17 +5,17 @@
 //! upload PNG bytes via [`ImageAtlas::upload_png`] and stash the handle
 //! to reference the image in scene nodes.
 //!
-//! **Eviction model: snapshot-rebuild.** Every uploaded image's source
-//! bytes are cached in `sources` (cost: ~4 B/px × all uploads ever). On
-//! direct [`ImageAtlas::upload_rgba`] failure the caller can invoke
-//! [`ImageAtlas::rebuild_keeping`] with a `HashSet` of currently-live
-//! handles — the allocator resets, non-live sources are dropped from
-//! the cache, and the live set is re-uploaded into a fresh atlas
-//! layout. Each surviving handle's `ImageEntry::uv` is rewritten in
-//! place, so existing nodes that reference it pick up the new UVs on
-//! the next flatten pass. [`ImageAtlas::upload_rgba_or_evict`] is the
-//! convenience wrapper: try a normal upload, run a rebuild on failure
-//! using the supplied live set, retry once.
+//! **Eviction model: GPU repack.** Pixels live *only* in the atlas
+//! texture — no CPU-side source copies (an earlier snapshot-rebuild
+//! design cached every upload's bytes forever: ~4 B/px × all uploads,
+//! hundreds of MB of covers in a real session). On grow or evict a
+//! fresh texture is created, each survivor's rect is
+//! `copy_texture_to_texture`-blitted across into a fresh allocator
+//! layout, and the texture/bind group swap in place. Each surviving
+//! handle's `ImageEntry::uv` is rewritten, so existing nodes that
+//! reference it pick up the new UVs on the next flatten pass.
+//! [`ImageAtlas::rebuild_keeping`] drops any handle absent from the
+//! caller's live set before repacking.
 //!
 //! `Rgba8UnormSrgb` matches the shape pipeline convention: PNG bytes
 //! are sRGB-authored, the texture decode flag converts to linear when
@@ -49,6 +49,10 @@ pub struct ImageEntry {
     pub uv: [f32; 4],
     pub width: u32,
     pub height: u32,
+    /// Top-left texel of the image in the atlas (post-padding). The
+    /// repack path blits `origin_px + width×height` between textures —
+    /// kept in px so it never round-trips through the f32 UVs.
+    pub origin_px: [u32; 2],
 }
 
 pub struct ImageAtlas {
@@ -62,19 +66,15 @@ pub struct ImageAtlas {
     /// Transparent border around each image to keep linear filtering
     /// from bleeding across neighbours.
     padding: i32,
-    /// CPU-side source-byte cache. Populated on every `upload_rgba`
-    /// (including the re-uploads inside `rebuild_keeping`). Required
-    /// so `rebuild_keeping` can re-write each surviving handle's pixel
-    /// data into the fresh atlas layout. Drops entries on rebuild for
-    /// any handle absent from the supplied live set.
-    sources: HashMap<ImageHandle, ImageSource>,
+    sampler: wgpu::Sampler,
 }
 
-struct ImageSource {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-}
+/// Texture usage shared by the initial atlas and every repack target.
+/// `COPY_SRC` is what lets grow/evict blit pixels across on the GPU
+/// instead of retaining CPU source copies.
+const ATLAS_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
+    .union(wgpu::TextureUsages::COPY_DST)
+    .union(wgpu::TextureUsages::COPY_SRC);
 
 impl ImageAtlas {
     pub fn new(device: &wgpu::Device, size: u32) -> Self {
@@ -89,7 +89,7 @@ impl ImageAtlas {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: ATLAS_USAGE,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -148,7 +148,7 @@ impl ImageAtlas {
             occupants: HashMap::new(),
             next_handle: 0,
             padding: 1,
-            sources: HashMap::new(),
+            sampler,
         }
     }
 
@@ -218,8 +218,7 @@ impl ImageAtlas {
 
     /// Upload pre-decoded `Rgba8UnormSrgb` pixels (`w*h*4` bytes,
     /// row-major, top-left origin). Stricter than [`upload_png`] —
-    /// caller is responsible for color-space correctness. Caches the
-    /// source bytes so a later [`rebuild_keeping`] can re-pack them.
+    /// caller is responsible for color-space correctness.
     pub fn upload_rgba(
         &mut self,
         queue: &wgpu::Queue,
@@ -228,26 +227,6 @@ impl ImageAtlas {
         rgba: &[u8],
     ) -> Option<ImageHandle> {
         self.upload_internal(queue, w, h, rgba, None)
-    }
-
-    /// Convenience: try [`upload_rgba`]; on allocator failure, run
-    /// [`rebuild_keeping`] with `live` (dropping any non-live sources)
-    /// and retry once. Used by `App::upload_image_rgba` to handle
-    /// "atlas full while album art lands" without forcing every caller
-    /// to do the walk-tree-then-rebuild dance.
-    pub fn upload_rgba_or_evict(
-        &mut self,
-        queue: &wgpu::Queue,
-        w: u32,
-        h: u32,
-        rgba: &[u8],
-        live: &HashSet<ImageHandle>,
-    ) -> Option<ImageHandle> {
-        if let Some(h) = self.upload_rgba(queue, w, h, rgba) {
-            return Some(h);
-        }
-        self.rebuild_keeping(queue, live);
-        self.upload_rgba(queue, w, h, rgba)
     }
 
     /// Auto-managed upload — the recommended path for consumer apps. Try
@@ -310,7 +289,7 @@ impl ImageAtlas {
         // At this point we know `live` is the best signal we have, and
         // dropping anything not in it is the only way to make room. This
         // is the only path that needs the live set, so compute it now.
-        self.rebuild_keeping(queue, &live());
+        self.rebuild_keeping(device, queue, &live());
         self.upload_rgba(queue, w, h, rgba)
             .map(|handle| UploadOutcome {
                 handle,
@@ -318,14 +297,53 @@ impl ImageAtlas {
             })
     }
 
-    /// Replace the underlying GPU texture with one of `new_size` and
-    /// re-upload every cached source into a fresh allocator. Bind group
-    /// is rebuilt; render code reads [`Self::bind_group`] per pass, so
-    /// callers don't need to rebind. No-op (returns `false`) when
-    /// `new_size <= self.size`.
+    /// Replace the underlying GPU texture with one of `new_size`,
+    /// GPU-blitting every occupant across into a fresh allocator
+    /// layout. Bind group is rebuilt; render code reads
+    /// [`Self::bind_group`] per pass, so callers don't need to rebind.
+    /// No-op (returns `false`) when `new_size <= self.size`.
     pub fn grow(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, new_size: u32) -> bool {
         if new_size <= self.size {
             return false;
+        }
+        self.repack(device, queue, new_size, None);
+        true
+    }
+
+    /// Drop every occupant whose handle is missing from `live`, then
+    /// repack the survivors into a fresh same-size texture (GPU blits —
+    /// no CPU pixel copies exist). Each surviving handle keeps its
+    /// `ImageHandle` value; only its `ImageEntry::uv` changes, and
+    /// callers' instance buffers pick up the new UVs on their next
+    /// flatten.
+    ///
+    /// Failure cases (survivor no longer packs, OOM, etc.) drop the
+    /// offending handle entirely — partial rebuild is preferred to
+    /// all-or-nothing.
+    pub fn rebuild_keeping(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        live: &HashSet<ImageHandle>,
+    ) {
+        self.repack(device, queue, self.size, Some(live));
+    }
+
+    /// Shared grow/evict body: create a `new_size` texture, allocate
+    /// each survivor a slot in a fresh allocator, blit its pixels
+    /// old-texture → new-texture on the GPU, swap texture + bind group
+    /// in. `keep = None` keeps every occupant (grow); `Some(live)`
+    /// drops the rest first (evict). A survivor that fails to allocate
+    /// in the new layout is dropped rather than aborting the repack.
+    fn repack(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        new_size: u32,
+        keep: Option<&HashSet<ImageHandle>>,
+    ) {
+        if let Some(live) = keep {
+            self.occupants.retain(|h, _| live.contains(h));
         }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("opal-gfx image atlas"),
@@ -338,23 +356,70 @@ impl ImageAtlas {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: ATLAS_USAGE,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        // Sampler params don't depend on size; cheaper to recreate than
-        // to thread a stored sampler through the struct.
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("opal-gfx image sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
+        let mut allocator = AtlasAllocator::new(size2(new_size as i32, new_size as i32));
+        let pad = self.padding;
+        let inv = 1.0 / new_size as f32;
+        // Deterministic repack order (handle id) — packing outcome must
+        // not depend on HashMap iteration order.
+        let mut survivors: Vec<(ImageHandle, ImageEntry)> =
+            self.occupants.iter().map(|(h, e)| (*h, *e)).collect();
+        survivors.sort_by_key(|(h, _)| h.0);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("opal-gfx atlas repack"),
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        for (handle, entry) in survivors {
+            let (w, h) = (entry.width, entry.height);
+            let Some(alloc) = allocator.allocate(size2(w as i32 + 2 * pad, h as i32 + 2 * pad))
+            else {
+                self.occupants.remove(&handle);
+                continue;
+            };
+            let gx = (alloc.rectangle.min.x + pad) as u32;
+            let gy = (alloc.rectangle.min.y + pad) as u32;
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: entry.origin_px[0],
+                        y: entry.origin_px[1],
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: gx, y: gy, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.occupants.insert(
+                handle,
+                ImageEntry {
+                    uv: [
+                        gx as f32 * inv,
+                        gy as f32 * inv,
+                        (gx + w) as f32 * inv,
+                        (gy + h) as f32 * inv,
+                    ],
+                    width: w,
+                    height: h,
+                    origin_px: [gx, gy],
+                },
+            );
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("opal-gfx image atlas bg"),
             layout: &self.layout,
             entries: &[
@@ -364,78 +429,13 @@ impl ImageAtlas {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
         });
         self.size = new_size;
         self.texture = texture;
-        self.bind_group = bind_group;
-        self.allocator = AtlasAllocator::new(size2(new_size as i32, new_size as i32));
-        // Re-upload every source (live or not) — growing means we have
-        // room for all of them; cheaper than walking the tree to filter.
-        let snapshot: Vec<(ImageHandle, u32, u32, Vec<u8>)> = self
-            .sources
-            .iter()
-            .map(|(h, s)| (*h, s.width, s.height, s.rgba.clone()))
-            .collect();
-        self.occupants.clear();
-        for (handle, w, h, bytes) in snapshot {
-            if self
-                .upload_internal(queue, w, h, &bytes, Some(handle))
-                .is_none()
-            {
-                self.occupants.remove(&handle);
-                self.sources.remove(&handle);
-            }
-        }
-        true
-    }
-
-    /// Drop every cached source whose handle is missing from `live`,
-    /// reset the allocator, and re-upload the survivors into a fresh
-    /// atlas layout. Each surviving handle keeps its `ImageHandle`
-    /// value; only its `ImageEntry::uv` changes. Pure CPU + texture
-    /// writes — no GPU sync required, callers' instance buffers pick
-    /// up the new UVs on their next flatten.
-    ///
-    /// Failure cases (live source larger than atlas, OOM, etc.) drop
-    /// the offending handle entirely. The remaining live set still
-    /// packs — partial rebuild is preferred to all-or-nothing.
-    pub fn rebuild_keeping(&mut self, queue: &wgpu::Queue, live: &HashSet<ImageHandle>) {
-        // 1. Drop sources not in live set + their occupant entries.
-        self.sources.retain(|h, _| live.contains(h));
-        self.occupants.retain(|h, _| live.contains(h));
-
-        // 2. Fresh allocator. Old packing is discarded; the GPU texture
-        //    is left untouched (dead pixels at no-longer-allocated
-        //    coords are unreferenced and harmless — sampler never
-        //    addresses them).
-        self.allocator = AtlasAllocator::new(size2(self.size as i32, self.size as i32));
-
-        // 3. Re-upload each surviving source into a fresh slot. Snapshot
-        //    the (handle, w, h, bytes) tuples first to release the
-        //    sources borrow before calling upload_internal (which
-        //    mutates `self`).
-        let snapshot: Vec<(ImageHandle, u32, u32, Vec<u8>)> = self
-            .sources
-            .iter()
-            .map(|(h, s)| (*h, s.width, s.height, s.rgba.clone()))
-            .collect();
-
-        for (handle, w, h, bytes) in snapshot {
-            // upload_internal with fixed_handle = Some(handle) re-uses
-            // the existing handle id (no new mint, no source re-cache).
-            // Drops the occupant entry on packing failure rather than
-            // panicking — see method-level doc.
-            if self
-                .upload_internal(queue, w, h, &bytes, Some(handle))
-                .is_none()
-            {
-                self.occupants.remove(&handle);
-                self.sources.remove(&handle);
-            }
-        }
+        self.allocator = allocator;
     }
 
     /// Iterate every currently-live handle in the atlas. Useful for
@@ -444,28 +444,15 @@ impl ImageAtlas {
         self.occupants.keys().copied()
     }
 
-    /// CPU memory used by source-byte caches. GPU memory is separately
-    /// reported by [`memory_bytes`].
-    pub fn source_bytes(&self) -> u64 {
-        self.sources.values().map(|s| s.rgba.len() as u64).sum()
-    }
-
     /// Reported GPU bytes used by the atlas texture.
     pub fn memory_bytes(&self) -> u64 {
         self.size as u64 * self.size as u64 * 4
     }
 
-    /// Test hook: look up a source's cached bytes. None when no upload
-    /// has used that handle (or it was dropped by a rebuild).
-    #[cfg(test)]
-    pub(crate) fn source_size(&self, h: ImageHandle) -> Option<(u32, u32)> {
-        self.sources.get(&h).map(|s| (s.width, s.height))
-    }
-
-    /// Shared body for both new-handle uploads (`fixed_handle = None`)
-    /// and rebuild re-uploads (`fixed_handle = Some(h)` — reuses the
-    /// existing handle, skips source caching since the bytes are
-    /// already cached). Allocates, writes pixels, returns the handle.
+    /// Shared upload body. `fixed_handle = Some(h)` reuses an existing
+    /// handle id (test-only affordance today — repack blits on the GPU
+    /// instead of re-uploading). Allocates, writes pixels, returns the
+    /// handle.
     fn upload_internal(
         &mut self,
         queue: &wgpu::Queue,
@@ -520,22 +507,13 @@ impl ImageAtlas {
             ],
             width: w,
             height: h,
+            origin_px: [gx as u32, gy as u32],
         };
         let handle = match fixed_handle {
             Some(h) => h,
             None => {
                 let new = ImageHandle(self.next_handle);
                 self.next_handle = self.next_handle.wrapping_add(1);
-                // Cache source bytes only for net-new uploads. Rebuild
-                // re-uploads already have a live source entry.
-                self.sources.insert(
-                    new,
-                    ImageSource {
-                        width: w,
-                        height: h,
-                        rgba: rgba.to_vec(),
-                    },
-                );
                 new
             }
         };
@@ -581,16 +559,6 @@ mod tests {
     }
 
     #[test]
-    fn upload_rgba_caches_source_bytes() {
-        let (device, queue) = noop_device();
-        let mut atlas = ImageAtlas::new(&device, 64);
-        let bytes = solid_rgba(8, 8, [255, 0, 0, 255]);
-        let h = atlas.upload_rgba(&queue, 8, 8, &bytes).expect("upload");
-        assert_eq!(atlas.source_size(h), Some((8, 8)));
-        assert_eq!(atlas.source_bytes(), (8 * 8 * 4) as u64);
-    }
-
-    #[test]
     fn rebuild_keeping_empty_drops_everything() {
         let (device, queue) = noop_device();
         let mut atlas = ImageAtlas::new(&device, 64);
@@ -600,10 +568,9 @@ mod tests {
         let b = atlas
             .upload_rgba(&queue, 8, 8, &solid_rgba(8, 8, [2; 4]))
             .unwrap();
-        atlas.rebuild_keeping(&queue, &HashSet::new());
+        atlas.rebuild_keeping(&device, &queue, &HashSet::new());
         assert!(atlas.get(a).is_none(), "a should be evicted");
         assert!(atlas.get(b).is_none(), "b should be evicted");
-        assert_eq!(atlas.source_bytes(), 0, "source cache must be empty");
         assert_eq!(atlas.live_handles().count(), 0);
     }
 
@@ -617,44 +584,12 @@ mod tests {
         let _dead = atlas
             .upload_rgba(&queue, 8, 8, &solid_rgba(8, 8, [2; 4]))
             .unwrap();
-        let pre_uv = atlas.get(live).unwrap().uv;
         let keep: HashSet<_> = [live].into_iter().collect();
-        atlas.rebuild_keeping(&queue, &keep);
+        atlas.rebuild_keeping(&device, &queue, &keep);
         let post = atlas.get(live).expect("live handle survives");
         assert_eq!(post.width, 8);
         assert_eq!(post.height, 8);
-        // Live handle's UV is typically the same after rebuild (first
-        // alloc lands at the same spot) — just assert it's a valid
-        // entry rather than asserting identity, since etagere's
-        // packing order is an implementation detail.
-        let _ = pre_uv;
         assert_eq!(atlas.live_handles().count(), 1);
-        assert!(atlas.source_size(live).is_some());
-    }
-
-    #[test]
-    fn upload_rgba_or_evict_succeeds_after_rebuild() {
-        let (device, queue) = noop_device();
-        // Tiny atlas — first big upload fills it. Second upload
-        // would otherwise fail; with eviction it succeeds.
-        let mut atlas = ImageAtlas::new(&device, 32);
-        let bytes_a = solid_rgba(30, 30, [1; 4]);
-        let bytes_b = solid_rgba(30, 30, [2; 4]);
-        let a = atlas
-            .upload_rgba(&queue, 30, 30, &bytes_a)
-            .expect("first fits");
-        // Direct second upload fails — no room.
-        assert!(
-            atlas.upload_rgba(&queue, 30, 30, &bytes_b).is_none(),
-            "second upload must fail without eviction (atlas full)"
-        );
-        // Eviction path with empty live set drops `a` and succeeds.
-        let live = HashSet::new();
-        let b = atlas
-            .upload_rgba_or_evict(&queue, 30, 30, &bytes_b, &live)
-            .expect("retry after eviction");
-        assert!(atlas.get(a).is_none(), "a should have been evicted");
-        assert!(atlas.get(b).is_some());
     }
 
     #[test]
@@ -667,7 +602,7 @@ mod tests {
             .upload_rgba(&queue, 8, 8, &solid_rgba(8, 8, [1; 4]))
             .unwrap();
         let keep: HashSet<_> = [live].into_iter().collect();
-        atlas.rebuild_keeping(&queue, &keep);
+        atlas.rebuild_keeping(&device, &queue, &keep);
         // Same handle value; new entry.
         assert!(atlas.get(live).is_some());
         assert_eq!(atlas.live_handles().next(), Some(live));
@@ -686,7 +621,7 @@ mod tests {
             .unwrap();
         // Two 14x14 (padded 16x16) tiles fill the 32x32 atlas roughly.
         // Drop both via empty live + verify new uploads succeed.
-        atlas.rebuild_keeping(&queue, &HashSet::new());
+        atlas.rebuild_keeping(&device, &queue, &HashSet::new());
         assert!(atlas.get(h1).is_none());
         assert!(atlas.get(h2).is_none());
         let h3 = atlas.upload_rgba(&queue, 14, 14, &solid_rgba(14, 14, [3; 4]));

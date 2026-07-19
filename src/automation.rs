@@ -52,6 +52,10 @@ pub enum Step {
     /// field first to focus it; a no-op (with a warning) when nothing
     /// editable is focused.
     Type(String),
+    /// Dump the live memory split (VRAM vs system RAM) to the log — the
+    /// same report the F1 HUD toggle prints. Scripted perf runs read it
+    /// after covers/canvas land, not just the empty-scene boot baseline.
+    MemReport,
 }
 
 /// An ordered list of [`Step`]s. Built by the consumer (e.g. from a TOML
