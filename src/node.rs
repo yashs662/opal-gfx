@@ -168,6 +168,14 @@ pub struct ScrollSpan {
     /// Live scroll offset (physical px) — the window's sample origin
     /// (before subtracting `tex_origin`).
     pub scroll: [f32; 2],
+    /// Ancestor clip rect (physical px) at the promoted node — the
+    /// composite scissors to `viewport ∩ clip`. A promoted layer draws
+    /// as its own composite quad, so ancestor `overflow` clipping isn't
+    /// applied for free (same reason [`crate::layer::ExternalRect`]
+    /// carries one); without it a scroll layer nested in a scrolled
+    /// container (e.g. a marquee strip) paints outside — and therefore
+    /// on top of — its clipped ancestors. `NO_CLIP` when unclipped.
+    pub clip: [f32; 4],
 }
 
 /// One scrollable container discovered during flatten. Wheel input
@@ -3380,7 +3388,10 @@ impl NodeTree {
         let child_clip_radius = if is_scroll_layer {
             [0.0; 4]
         } else if node.layout.clips() && node.style.border_radius.iter().any(|&r| r > 0.0) {
-            node.style.border_radius
+            // Physical px: the clip rect is physical, and unlike
+            // `border_radius` (scaled at emit) nothing downstream scales
+            // clip radii — unscaled they'd under-round at scale > 1.
+            node.style.border_radius.map(|r| r * scale)
         } else if node.layout.clips() && child_clip != clip {
             [0.0; 4]
         } else {
@@ -3473,6 +3484,7 @@ impl NodeTree {
                         content: [tex_w, tex_h],
                         tex_origin,
                         scroll: s.current,
+                        clip,
                     }),
                     external: None,
                     edge_fade: node.edge_fade,
@@ -3766,6 +3778,7 @@ fn emit_scroll_thumb(
             content: thumb_size,
             tex_origin: [0.0, 0.0],
             scroll: [0.0, 0.0],
+            clip,
         }),
         external: None,
         edge_fade: [0.0; 4],
@@ -3942,7 +3955,7 @@ fn rubber_band_target(target: f32, delta: f32, min: f32, max: f32, limit: f32) -
     }
 }
 
-fn intersect_clip(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+pub(crate) fn intersect_clip(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [
         a[0].max(b[0]),
         a[1].max(b[1]),

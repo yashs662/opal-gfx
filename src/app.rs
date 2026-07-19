@@ -3267,12 +3267,17 @@ fn layer_to_draw(l: &crate::layer::Layer) -> crate::gpu::LayerDraw {
         // rows starting at `tex_origin`.
         src_origin: [s.scroll[0] - s.tex_origin[0], s.scroll[1] - s.tex_origin[1]],
         tex_size: s.content,
-        clip_rect: [
-            s.viewport_origin[0],
-            s.viewport_origin[1],
-            s.viewport_origin[0] + s.viewport[0],
-            s.viewport_origin[1] + s.viewport[1],
-        ],
+        // Scissor to viewport ∩ ancestor clip — a promoted layer isn't
+        // clipped by ancestor overflow for free (see `ScrollSpan::clip`).
+        clip_rect: crate::node::intersect_clip(
+            [
+                s.viewport_origin[0],
+                s.viewport_origin[1],
+                s.viewport_origin[0] + s.viewport[0],
+                s.viewport_origin[1] + s.viewport[1],
+            ],
+            s.clip,
+        ),
     });
     // External-texture layer: composite the caller's texture into the
     // node's screen rect (a full 1:1 blit, no clip). `window` carries the
@@ -5333,6 +5338,14 @@ impl<S> App<S> {
             return None;
         };
         if state.finished() {
+            // Honor the last step's schedule before exiting — a trailing
+            // `Wait` sets `next_at` past the end of the list, and any stray
+            // wake (worker response, cursor event) lands here early.
+            if !state.due(now) {
+                let next = state.next_at();
+                self.automation = Some(state);
+                return next;
+            }
             self.flush_pending_screenshot();
             log::info!("[automation] script finished — exiting");
             event_loop.exit();
