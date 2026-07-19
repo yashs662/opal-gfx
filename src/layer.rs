@@ -118,9 +118,10 @@ pub struct ExternalRect {
     /// `.external()` node otherwise ignores ancestor `overflow` clipping
     /// (it's a separate composite layer, not rastered into the parent).
     pub clip: [f32; 4],
-    /// Corner radius (physical px) to round the clipped region by, so the
-    /// video honours a rounded-rect container. 0 = square.
-    pub radius: f32,
+    /// Per-corner radii `[tl, tr, bl, br]` (physical px) to round the
+    /// clipped region by, so the video honours a rounded-rect container.
+    /// All-0 = square.
+    pub radius: [f32; 4],
 }
 
 /// Persistent composite state for one promoted layer, keyed by its

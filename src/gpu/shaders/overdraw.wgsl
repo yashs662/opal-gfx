@@ -7,6 +7,9 @@
 // Reuses the same vertex shader and shape buffer as `shape.wgsl`, so the
 // shape coverage exactly matches what the regular pipeline draws.
 
+// Must mirror `shape.wgsl`'s ShapeInstance FIELD-FOR-FIELD: both shaders
+// bind the same instance SSBO, so a truncated mirror changes the array
+// stride and skews every per-instance read past index 0.
 struct ShapeInstance {
     color: vec4<f32>,
     border_color: vec4<f32>,
@@ -14,6 +17,7 @@ struct ShapeInstance {
     border_radius: vec4<f32>,
     backdrop_uv_rect: vec4<f32>,
     clip_rect: vec4<f32>,
+    clip_radius: vec4<f32>,
     position: vec2<f32>,
     size: vec2<f32>,
     shadow_offset: vec2<f32>,
@@ -23,6 +27,9 @@ struct ShapeInstance {
     shadow_blur: f32,
     shadow_opacity: f32,
     opacity: f32,
+    scale: vec2<f32>,
+    effect_id: f32,
+    _pad: f32,
 }
 
 struct Frame {

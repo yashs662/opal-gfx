@@ -34,13 +34,14 @@ struct Composite {
     surface_size: vec2<f32>,
     // Screen-space scissor (min_x, min_y, max_x, max_y). NO_CLIP = ±1e30.
     clip_rect: vec4<f32>,
+    // Per-corner radii [TL, TR, BL, BR] rounding the clip rect's corners
+    // (physical px). All-0 = plain box scissor.
+    corner_radius: vec4<f32>,
     // Composite-time opacity multiplier (premultiplied: scales rgb+a).
     opacity: f32,
-    // Rounds the clip rect's corners (physical px). 0 = plain box scissor.
-    corner_radius: f32,
     // Falloff exponent for the edge fade (1 = linear).
     edge_fade_falloff: f32,
-    _p2: f32,
+    _p2: vec2<f32>,
     // Per-edge fade fractions [top, right, bottom, left] (0..1 of the dst
     // rect extent). Fade alpha to 0 near each edge. All-0 = no fade.
     edge_fade: vec4<f32>,
@@ -81,6 +82,25 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
     return out;
 }
 
+// Signed distance to a rounded rect with half-extents `xy` and per-corner
+// radii `r` = [TL, TR, BL, BR], `p` in centred y-down coords. Mirrors
+// `sd_rounded_rect` in `shape.wgsl` (WGSL has no includes) — keep in sync.
+fn sd_rounded_rect(p: vec2<f32>, xy: vec2<f32>, r: vec4<f32>) -> f32 {
+    let qx = select(0u, 1u, p.x > 0.0);
+    let qy = select(0u, 2u, p.y > 0.0);
+    let idx = qx + qy;
+    var s: f32;
+    switch idx {
+        case 0u: { s = r.x; }      // top-left
+        case 1u: { s = r.y; }      // top-right
+        case 2u: { s = r.z; }      // bottom-left
+        default: { s = r.w; }      // bottom-right
+    }
+    s = min(s, min(xy.x, xy.y));
+    let d = abs(p) - max(xy - vec2<f32>(s), vec2<f32>(0.0));
+    return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - s;
+}
+
 // Per-edge alpha ramp: 1 away from the edge, ramping to 0 at it over
 // `width` (fraction of the rect). `d` is the fragment's distance from the
 // edge as a fraction (0 at the edge, 1 at the far side).
@@ -114,13 +134,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let fade = edge_fade_alpha(in.scr);
     // Rounded-rect clip (external video layers honouring a rounded
     // container). The SDF subsumes the box scissor, with a 1px feather.
-    if c.corner_radius > 0.0 {
+    if any(c.corner_radius > vec4<f32>(0.0)) {
         let center = (lo + hi) * 0.5;
         let half = (hi - lo) * 0.5;
-        let p = in.scr - center;
-        let q = abs(p) - (half - vec2<f32>(c.corner_radius));
-        let dist = length(max(q, vec2<f32>(0.0)))
-            + min(max(q.x, q.y), 0.0) - c.corner_radius;
+        let dist = sd_rounded_rect(in.scr - center, half, c.corner_radius);
         if dist > 0.5 {
             discard;
         }

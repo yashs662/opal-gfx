@@ -56,13 +56,14 @@ struct CompositeUniform {
     tex_size: [f32; 2],
     surface_size: [f32; 2],
     clip_rect: [f32; 4],
+    /// Per-corner radii `[tl, tr, bl, br]` (physical px) rounding the clip
+    /// rect — external video layers / promoted raster layers honouring a
+    /// rounded container. All-0 = square (every other layer).
+    corner_radius: [f32; 4],
     opacity: f32,
-    /// Rounds the clip rect's corners (physical px) — external video
-    /// layers honouring a rounded container. 0 = square (every other layer).
-    corner_radius: f32,
     /// Edge-fade falloff exponent (1 = linear).
     edge_fade_falloff: f32,
-    _pad: f32,
+    _pad: [f32; 2],
     /// Per-edge fade fractions `[top, right, bottom, left]` (0..1 of the
     /// dst rect extent). Fade alpha to 0 near each edge. All-0 = no fade.
     edge_fade: [f32; 4],
@@ -116,10 +117,11 @@ pub struct LayerDraw {
     /// raster texture. The composite quad still uses `window` for its
     /// screen rect. `None` for every normal layer.
     pub external: Option<crate::node::NodeId>,
-    /// Corner radius (physical px) the composite rounds the clipped region
-    /// by — lets an external (video) layer, or a promoted raster layer with
-    /// `round_rect`, honour a rounded container. 0 = square.
-    pub corner_radius: f32,
+    /// Per-corner radii `[tl, tr, bl, br]` (physical px) the composite
+    /// rounds the clipped region by — lets an external (video) layer, or a
+    /// promoted raster layer with `round_rect`, honour a rounded container.
+    /// All-0 = square.
+    pub corner_radius: [f32; 4],
     /// `Some(rect)` (physical `[x0,y0,x1,y1]`) → round this **identity**
     /// (full-surface) layer's composite at `rect` with `corner_radius`,
     /// instead of compositing it square. Lets a `.layer()` card round its
@@ -144,7 +146,7 @@ impl Default for LayerDraw {
             z: 0,
             window: None,
             external: None,
-            corner_radius: 0.0,
+            corner_radius: [0.0; 4],
             round_rect: None,
             edge_fade: [0.0; 4],
             edge_fade_falloff: 1.0,
@@ -522,10 +524,10 @@ impl LayerResources {
                 tex_size: w.tex_size,
                 surface_size,
                 clip_rect: w.clip_rect,
-                opacity: draw.opacity,
                 corner_radius: draw.corner_radius,
+                opacity: draw.opacity,
                 edge_fade_falloff: draw.edge_fade_falloff,
-                _pad: 0.0,
+                _pad: [0.0; 2],
                 edge_fade: draw.edge_fade,
             },
             // Full-surface identity (P2/P3 parity): quad = offset +
@@ -544,14 +546,14 @@ impl LayerResources {
                 tex_size: surface_size,
                 surface_size,
                 clip_rect: draw.round_rect.unwrap_or(NO_CLIP),
-                opacity: draw.opacity,
                 corner_radius: if draw.round_rect.is_some() {
                     draw.corner_radius
                 } else {
-                    0.0
+                    [0.0; 4]
                 },
+                opacity: draw.opacity,
                 edge_fade_falloff: draw.edge_fade_falloff,
-                _pad: 0.0,
+                _pad: [0.0; 2],
                 edge_fade: draw.edge_fade,
             },
         };
@@ -673,12 +675,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn composite_uniform_is_96_bytes() {
+    fn composite_uniform_is_112_bytes() {
         // WGSL `Composite` struct must equal the Rust size (M2-style
         // stride landmine). Six leading vec2 (0..48) + vec4 clip_rect
-        // (48..64) + (opacity, corner_radius, edge_fade_falloff, pad)
-        // (64..80) + vec4 edge_fade (80..96) = 96 B, 16-aligned.
-        assert_eq!(std::mem::size_of::<CompositeUniform>(), 96);
+        // (48..64) + vec4 corner_radius (64..80) + (opacity,
+        // edge_fade_falloff, pad2) (80..96) + vec4 edge_fade (96..112)
+        // = 112 B, 16-aligned.
+        assert_eq!(std::mem::size_of::<CompositeUniform>(), 112);
     }
 
     #[test]

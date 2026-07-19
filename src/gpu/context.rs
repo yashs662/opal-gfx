@@ -817,8 +817,9 @@ impl GpuContext {
                     shadow_opacity: 0.0,
                     opacity: r.opacity,
                     scale: [1.0, 1.0],
-                    clip_radius: 0.0,
+                    clip_radius: [0.0; 4],
                     effect_id: 0.0,
+                    _pad: 0.0,
                 });
             }
         }
@@ -879,6 +880,7 @@ impl GpuContext {
                 scale: [1.0, 1.0],
                 clip_radius: r.clip_radius,
                 effect_id: 0.0,
+                _pad: 0.0,
             });
         }
         out

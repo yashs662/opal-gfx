@@ -77,9 +77,10 @@ pub struct ImageRef {
     /// crop overflow) instead of stretching it to fill. The visible region
     /// is a centred crop of the source matching the node's aspect.
     pub cover: bool,
-    /// Corner radius (physical px) of the rounded clip rect, when an
-    /// overflow container with a radius clips this image. 0 = square clip.
-    pub clip_radius: f32,
+    /// Per-corner radii `[tl, tr, bl, br]` (physical px) of the rounded
+    /// clip rect, when an overflow container with rounded corners clips
+    /// this image. All-0 = square clip.
+    pub clip_radius: [f32; 4],
 }
 
 /// One interactive rect in the hit-test cache. Produced by
@@ -2908,7 +2909,7 @@ impl NodeTree {
                 *root,
                 1.0,
                 NO_CLIP,
-                0.0,
+                [0.0; 4],
                 [0.0; 2],
                 NO_CLIP,
                 [0.0; 2],
@@ -2938,7 +2939,7 @@ impl NodeTree {
                 node,
                 1.0,
                 NO_CLIP,
-                0.0,
+                [0.0; 4],
                 [-dx, -dy],
                 NO_CLIP,
                 [-dx, -dy],
@@ -2968,10 +2969,11 @@ impl NodeTree {
         id: NodeId,
         parent_opacity: f32,
         clip: [f32; 4],
-        // Corner radius (physical px) of the rounded `clip` rect — set when
-        // an ancestor overflow container has a corner radius, so children
-        // clip to its rounded shape (not a square scissor). 0 = square clip.
-        clip_radius: f32,
+        // Per-corner radii [tl, tr, bl, br] (physical px) of the rounded
+        // `clip` rect — set when an ancestor overflow container has rounded
+        // corners, so children clip to its rounded shape (not a square
+        // scissor). All-0 = square clip.
+        clip_radius: [f32; 4],
         offset: [f32; 2],
         // Hit-space clip + offset, used for `HitEntry`/`ScrollHit` bounds
         // (input lives in screen space). Equal to `clip`/`offset`
@@ -3089,6 +3091,7 @@ impl NodeTree {
                         scale: node.style.scale,
                         clip_radius,
                         effect_id: 0.0,
+                        _pad: 0.0,
                     }));
                 }
             }
@@ -3159,6 +3162,7 @@ impl NodeTree {
                         scale: node.style.scale,
                         clip_radius,
                         effect_id: 0.0,
+                        _pad: 0.0,
                     }));
                 }
             }
@@ -3191,6 +3195,7 @@ impl NodeTree {
                         scale: [1.0, 1.0],
                         clip_radius,
                         effect_id: e.id,
+                        _pad: 0.0,
                     }));
                 }
             }
@@ -3362,22 +3367,22 @@ impl NodeTree {
         } else {
             hit_offset
         };
-        // Corner radius of the clip rect handed to children: when *this*
-        // node clips its overflow AND has a corner radius, children clip to
-        // its rounded rect (using the node's own radius). Scroll layers clip
-        // at composite time (children unclipped here), so they reset it.
-        // Otherwise the ancestor radius is inherited **only while the clip
-        // rect is unchanged**: the shader models one rounded rect, so once
-        // a radius-less descendant clipper shrinks the rect, keeping the
-        // ancestor's radius would re-anchor the rounding to the *smaller*
+        // Corner radii of the clip rect handed to children: when *this*
+        // node clips its overflow AND has rounded corners, children clip to
+        // its rounded rect (using the node's own per-corner radii). Scroll
+        // layers clip at composite time (children unclipped here), so they
+        // reset it. Otherwise the ancestor radii are inherited **only while
+        // the clip rect is unchanged**: the shader models one rounded rect,
+        // so once a radius-less descendant clipper shrinks the rect, keeping
+        // the ancestor's radii would re-anchor the rounding to the *smaller*
         // rect's corners — visibly rounding content (e.g. a full-bleed
         // image in a card) that sits nowhere near the rounded ancestor.
         let child_clip_radius = if is_scroll_layer {
-            0.0
-        } else if node.layout.clips() && node.style.border_radius[0] > 0.0 {
-            node.style.border_radius[0]
+            [0.0; 4]
+        } else if node.layout.clips() && node.style.border_radius.iter().any(|&r| r > 0.0) {
+            node.style.border_radius
         } else if node.layout.clips() && child_clip != clip {
-            0.0
+            [0.0; 4]
         } else {
             clip_radius
         };
@@ -3501,9 +3506,9 @@ impl NodeTree {
                     size,
                     // Clip the video to its ancestor overflow rect (it's a
                     // separate composite layer, so the parent's clip isn't
-                    // applied for free), rounded by the node's own radius.
+                    // applied for free), rounded by the node's own radii.
                     clip,
-                    radius: node.style.border_radius[0] * scale,
+                    radius: node.style.border_radius.map(|r| r * scale),
                 }),
                 edge_fade: node.edge_fade,
                 edge_fade_falloff: node.edge_fade_falloff,
@@ -3688,8 +3693,9 @@ fn bar_quad(
         shadow_opacity: 0.0,
         opacity: 1.0,
         scale: [1.0, 1.0],
-        clip_radius: 0.0,
+        clip_radius: [0.0; 4],
         effect_id: 0.0,
+        _pad: 0.0,
     }));
 }
 
@@ -3747,8 +3753,9 @@ fn emit_scroll_thumb(
         shadow_opacity: 0.0,
         opacity: 1.0,
         scale: [1.0, 1.0],
-        clip_radius: 0.0,
+        clip_radius: [0.0; 4],
         effect_id: 0.0,
+        _pad: 0.0,
     }));
     spans.push(LayerSpan {
         node: node_id,

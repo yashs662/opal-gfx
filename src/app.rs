@@ -1023,10 +1023,10 @@ impl<S> App<S> {
                 && let Some(id) = layer.root
                 && let Some(n) = self.ctx.tree.get(id)
             {
-                let r = n.style.border_radius[0];
-                if r > 0.0 {
+                let r = n.style.border_radius;
+                if r.iter().any(|&x| x > 0.0) {
                     let rect = n.rect; // physical [x, y, w, h]
-                    draw.corner_radius = r * scale;
+                    draw.corner_radius = r.map(|x| x * scale);
                     draw.round_rect =
                         Some([rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]]);
                 }
@@ -3288,7 +3288,7 @@ fn layer_to_draw(l: &crate::layer::Layer) -> crate::gpu::LayerDraw {
             };
             (Some(w), l.root, ext.radius)
         }
-        None => (window, None, 0.0),
+        None => (window, None, [0.0; 4]),
     };
     crate::gpu::LayerDraw {
         instances: (l.instances.start as u32)..(l.instances.end as u32),

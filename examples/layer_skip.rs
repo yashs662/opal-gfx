@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         z: l.z,
                         window: None,
                         external: None,
-                        corner_radius: 0.0,
+                        corner_radius: [0.0; 4],
                         round_rect: None,
                         edge_fade: [0.0; 4],
                         edge_fade_falloff: 1.0,

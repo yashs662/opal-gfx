@@ -52,10 +52,10 @@ pub(crate) fn first_glass_index(instances: &[ShapeInstance]) -> u32 {
 }
 
 /// GPU shape instance. Layout must match `ShapeInstance` in `shape.wgsl`.
-/// std430-compatible. **160 bytes, 16-aligned.** WGSL
+/// std430-compatible. **176 bytes, 16-aligned.** WGSL
 /// `array<ShapeInstance>` stride = roundUp(16, last_offset + last_size).
-/// With `scale: vec2<f32>` at offset 144 (size 8), stride rounds to 160.
-/// The Rust struct must equal that stride — the trailing `_pad: [f32; 2]`
+/// With `effect_id: f32` at offset 168 (size 4), stride rounds to 176.
+/// The Rust struct must equal that stride — the trailing `_pad: f32`
 /// closes the gap. Without it the stride-vs-size mismatch would corrupt
 /// per-instance reads (M2 landmine).
 #[repr(C)]
@@ -76,6 +76,12 @@ pub struct ShapeInstance {
     /// Default `NO_CLIP` = no clipping. Set by the flatten pass when the
     /// instance lives under a Scroll/Hidden overflow container.
     pub clip_rect: [f32; 4],
+    /// Per-corner radii `[tl, tr, bl, br]` (physical px) of the
+    /// [`Self::clip_rect`] — when an overflow container with rounded
+    /// corners clips this instance, the fragment shader rounds the
+    /// scissor by these radii (rounded overflow clipping). All-0 =
+    /// square clip. Set by the flatten pass.
+    pub clip_radius: [f32; 4],
     pub position: [f32; 2], // top-left, pixels
     pub size: [f32; 2],     // pixels
     pub shadow_offset: [f32; 2],
@@ -95,15 +101,11 @@ pub struct ShapeInstance {
     /// shader rescales SDF coords so border + radius scale together.
     /// Layout + hit-test are unaffected (style-level transform only).
     pub scale: [f32; 2],
-    /// Corner radius (physical px) of the [`Self::clip_rect`] — when an
-    /// overflow container with a corner radius clips this instance, the
-    /// fragment shader rounds the scissor by this radius (rounded overflow
-    /// clipping). 0 = square clip. Set by the flatten pass.
-    pub clip_radius: f32,
     /// [`SHAPE_KIND_EFFECT`]-only: which effect the fragment shader runs
-    /// (e.g. [`EFFECT_CURVE`]). Ignored by other kinds. Also closes the
-    /// struct to the 160-byte WGSL array stride (was `_pad1`).
+    /// (e.g. [`EFFECT_CURVE`]). Ignored by other kinds.
     pub effect_id: f32,
+    /// Closes the struct to the 176-byte WGSL array stride.
+    pub _pad: f32,
 }
 
 #[cfg(test)]
@@ -145,7 +147,7 @@ mod tests {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<ShapeInstance>() == 160);
+const _: () = assert!(std::mem::size_of::<ShapeInstance>() == 176);
 
 impl Default for ShapeInstance {
     fn default() -> Self {
@@ -156,6 +158,7 @@ impl Default for ShapeInstance {
             border_radius: [0.0; 4],
             backdrop_uv_rect: [0.0; 4],
             clip_rect: NO_CLIP,
+            clip_radius: [0.0; 4],
             position: [0.0; 2],
             size: [0.0; 2],
             shadow_offset: [0.0; 2],
@@ -166,8 +169,8 @@ impl Default for ShapeInstance {
             shadow_opacity: 0.0,
             opacity: 1.0,
             scale: [1.0, 1.0],
-            clip_radius: 0.0,
             effect_id: 0.0,
+            _pad: 0.0,
         }
     }
 }

@@ -37,6 +37,9 @@ struct ShapeInstance {
     /// Scissor rect in physical px: (min_x, min_y, max_x, max_y).
     /// Fragment is discarded if outside. Sentinel = ±1e30.
     clip_rect: vec4<f32>,
+    /// Per-corner radii [TL, TR, BL, BR] (px) of the clip rect — rounds
+    /// the scissor (rounded overflow clipping). All-0 = square clip.
+    clip_radius: vec4<f32>,
     position: vec2<f32>,        // top-left in pixels
     size: vec2<f32>,            // pixels
     shadow_offset: vec2<f32>,
@@ -55,20 +58,17 @@ struct ShapeInstance {
     /// purely a vertex/fragment-side transform), so hover-grow effects
     /// don't shift click boxes.
     scale: vec2<f32>,
-    /// Corner radius (px) of the clip rect — rounds the scissor (rounded
-    /// overflow clipping). 0 = square clip.
-    clip_radius: f32,
     effect_id: f32,
+    _pad: f32,
 }
 
-// Signed distance to a rounded rect with min `lo`, max `hi`, corner
-// radius `r`. <0 inside, >0 outside. Used for rounded scissor clipping.
-fn rounded_clip_sd(p: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>, r: f32) -> f32 {
-    let center = (lo + hi) * 0.5;
+// Signed distance to a rounded rect with min `lo`, max `hi`, per-corner
+// radii `r` = [TL, TR, BL, BR]. <0 inside, >0 outside. Used for rounded
+// scissor clipping; delegates to the shared per-corner SDF (which also
+// clamps each radius to the half extents).
+fn rounded_clip_sd(p: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>, r: vec4<f32>) -> f32 {
     let half = (hi - lo) * 0.5;
-    let rr = min(r, min(half.x, half.y));
-    let q = abs(p - center) - (half - vec2<f32>(rr));
-    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - rr;
+    return sd_rounded_rect(p - (lo + half), half, r);
 }
 
 struct Frame {
@@ -428,7 +428,7 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
         discard;
     }
     let px = in.world_pos;
-    if (inst.clip_radius > 0.0) {
+    if (any(inst.clip_radius > vec4<f32>(0.0))) {
         if (rounded_clip_sd(px, inst.clip_rect.xy, inst.clip_rect.zw, inst.clip_radius) > 0.5) {
             discard;
         }
@@ -502,7 +502,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let px = in.world_pos;
     // Scissor clip — rounded (overflow container with a radius) or square.
     var clip_cov = 1.0;
-    if (inst.clip_radius > 0.0) {
+    if (any(inst.clip_radius > vec4<f32>(0.0))) {
         let sd = rounded_clip_sd(px, inst.clip_rect.xy, inst.clip_rect.zw, inst.clip_radius);
         if (sd > 0.5) {
             discard;
