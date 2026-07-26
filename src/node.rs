@@ -3418,11 +3418,64 @@ impl NodeTree {
             );
         }
         let children_end = events.len();
-        // Emit scrollbar geometry last so visible bars paint over
-        // children. The bar lives at the container's *unscrolled*
-        // position (uses `abs`, not `child_offset`) and inherits the
-        // parent's clip. Hits are populated regardless of `bar_alpha`
-        // so input can detect hover-enter on a faded-out bar's region.
+        // Close the scroll-layer promotion span BEFORE emitting scrollbar
+        // geometry: the promoted thumb (below) pushes its own span whose
+        // event range sits *after* the children, and `LayerTree::rebuild`
+        // walks spans expecting sorted, non-overlapping ranges — with the
+        // thumb span first, the root-segment cursor swallowed the whole
+        // content-local children range and re-drew every row at raw
+        // content coords near the screen origin (glass backdrops then
+        // blurred the splatter in: phantom rows in the sticky header, a
+        // hover-highlight "reflection" while the bar was visible).
+        //
+        // A scroll layer's span is the *children* range (content-local),
+        // with the composite window describing where it lands on screen +
+        // the scroll offset.
+        if is_scroll_layer && children_end > children_start {
+            let s = node.scroll.as_ref().unwrap();
+            // Texture height: a bounded scroller spans the full content
+            // (≥ viewport). A **lazy** list windows to its materialized
+            // rows — the full virtual height would be enormous — so the
+            // texture covers `[tex_origin.y, materialized_bottom)`, i.e.
+            // the row-extent of the visible window (+ buffer rows).
+            let tex_h = match node.lazy_list.as_ref() {
+                Some(ll) => {
+                    let r = ll.range;
+                    let top = ll.row_top_logical(r[0]) * scale;
+                    let bottom = ll.row_top_logical(r[1]) * scale;
+                    (bottom - top).max(size[1])
+                }
+                None => node.content_size[1].max(size[1]),
+            };
+            // Texture width must cover the horizontal content extent for a
+            // horizontally-scrolling layer (a marquee strip), else panning
+            // samples past the texture's right edge and the last column
+            // smears into a line. Vertical scrollers have `content_size.x
+            // == viewport`, so this stays viewport-wide for them.
+            let tex_w = node.content_size[0].max(size[0]);
+            spans.push(LayerSpan {
+                node: id,
+                events: children_start..children_end,
+                scroll: Some(ScrollSpan {
+                    viewport_origin: abs,
+                    viewport: size,
+                    content: [tex_w, tex_h],
+                    tex_origin,
+                    scroll: s.current,
+                    clip,
+                }),
+                external: None,
+                edge_fade: node.edge_fade,
+                edge_fade_falloff: node.edge_fade_falloff,
+            });
+        }
+        // Emit scrollbar geometry after the content span so visible bars
+        // paint over children and the promoted thumb's span stays sorted
+        // after the content span. The bar lives at the container's
+        // *unscrolled* position (uses `abs`, not `child_offset`) and
+        // inherits the parent's clip. Hits are populated regardless of
+        // `bar_alpha` so input can detect hover-enter on a faded-out
+        // bar's region.
         if let Some(s) = node.scroll.as_ref() {
             emit_scrollbars(
                 id,
@@ -3448,50 +3501,10 @@ impl NodeTree {
         if pushed_scroll {
             scroll_stack.pop();
         }
-        // Close the promotion span. A scroll layer's span is the
-        // *children* range (content-local), with the composite window
-        // describing where it lands on screen + the scroll offset. A plain
-        // force-promoted layer spans the whole subtree at absolute coords.
-        if is_scroll_layer {
-            if children_end > children_start {
-                let s = node.scroll.as_ref().unwrap();
-                // Texture height: a bounded scroller spans the full content
-                // (≥ viewport). A **lazy** list windows to its materialized
-                // rows — the full virtual height would be enormous — so the
-                // texture covers `[tex_origin.y, materialized_bottom)`, i.e.
-                // the row-extent of the visible window (+ buffer rows).
-                let tex_h = match node.lazy_list.as_ref() {
-                    Some(ll) => {
-                        let r = ll.range;
-                        let top = ll.row_top_logical(r[0]) * scale;
-                        let bottom = ll.row_top_logical(r[1]) * scale;
-                        (bottom - top).max(size[1])
-                    }
-                    None => node.content_size[1].max(size[1]),
-                };
-                // Texture width must cover the horizontal content extent for a
-                // horizontally-scrolling layer (a marquee strip), else panning
-                // samples past the texture's right edge and the last column
-                // smears into a line. Vertical scrollers have `content_size.x
-                // == viewport`, so this stays viewport-wide for them.
-                let tex_w = node.content_size[0].max(size[0]);
-                spans.push(LayerSpan {
-                    node: id,
-                    events: children_start..children_end,
-                    scroll: Some(ScrollSpan {
-                        viewport_origin: abs,
-                        viewport: size,
-                        content: [tex_w, tex_h],
-                        tex_origin,
-                        scroll: s.current,
-                        clip,
-                    }),
-                    external: None,
-                    edge_fade: node.edge_fade,
-                    edge_fade_falloff: node.edge_fade_falloff,
-                });
-            }
-        } else if promote && events.len() > span_start {
+        // A plain force-promoted layer spans the whole subtree at absolute
+        // coords — including any scrollbar chrome emitted just above, so
+        // this closes *after* `emit_scrollbars`.
+        if !is_scroll_layer && promote && events.len() > span_start {
             spans.push(LayerSpan {
                 node: id,
                 events: span_start..events.len(),

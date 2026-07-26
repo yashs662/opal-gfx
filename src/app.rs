@@ -4283,10 +4283,19 @@ impl<S> ApplicationHandler for App<S> {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(_gpu) = self.gpu.as_mut() else {
             return;
         };
+        // Only the main window drives app state. The splash is a second
+        // winit window on non-Windows platforms — routing its Resized /
+        // ScaleFactorChanged into the shared handler resized the *main*
+        // surface to splash dimensions (giant stretched first frame on
+        // macOS), and its window-local pointer coords corrupted hover /
+        // press hit-testing.
+        if self.window.as_ref().map(|w| w.id()) != Some(id) {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {

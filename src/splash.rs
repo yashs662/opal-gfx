@@ -470,10 +470,12 @@ mod other_impl {
     use winit::window::{Window, WindowLevel};
 
     pub struct SbSplash {
-        // Field order matters: surface borrows the leaked context, window
-        // outlives the surface. Kept alive so the OS holds the presented
-        // pixels through GPU init.
+        // Drop order (declaration order): surface → context → window. All
+        // three hold an Arc<Window>; the OS window closes only when the
+        // last clone drops, so every holder must live in this struct —
+        // leaking any of them keeps the always-on-top splash up forever.
         _surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+        _context: softbuffer::Context<Arc<Window>>,
         _window: Arc<Window>,
     }
 
@@ -497,11 +499,8 @@ mod other_impl {
                 .with_inner_size(logical);
             let window = Arc::new(event_loop.create_window(attrs).ok()?);
 
-            // Leak one Context for the process so the Surface is 'static —
-            // avoids a self-referential struct. Single one-shot splash, so
-            // the leak is bounded + harmless.
-            let context = Box::leak(Box::new(softbuffer::Context::new(window.clone()).ok()?));
-            let mut surface = softbuffer::Surface::new(context, window.clone()).ok()?;
+            let context = softbuffer::Context::new(window.clone()).ok()?;
+            let mut surface = softbuffer::Surface::new(&context, window.clone()).ok()?;
             surface
                 .resize(NonZeroU32::new(bmp.w)?, NonZeroU32::new(bmp.h)?)
                 .ok()?;
@@ -512,6 +511,7 @@ mod other_impl {
 
             Some(Self {
                 _surface: surface,
+                _context: context,
                 _window: window,
             })
         }

@@ -317,6 +317,24 @@ impl LayerTree {
         let mut cursor = 0usize;
         for p in promoted {
             let r = (p.instances.start as usize)..(p.instances.end as usize);
+            // The cursor walk is only correct for sorted, non-overlapping
+            // spans (flatten emits them in paint order). A backward range
+            // would put already-layered instances into a root segment too —
+            // drawing content-local pixels at screen coords (phantom rows
+            // blurred into glass). Scream instead of silently mis-painting.
+            if r.start < cursor {
+                debug_assert!(
+                    false,
+                    "unsorted promoted span {:?} at cursor {cursor} (node {:?})",
+                    p.instances, p.node
+                );
+                log::error!(
+                    "layer rebuild: promoted span {:?} overlaps cursor {cursor} \
+                     (node {:?}) — flatten must emit spans in sorted paint order",
+                    p.instances,
+                    p.node
+                );
+            }
             // Root content painted before this promotion.
             if r.start > cursor {
                 self.layers
@@ -348,13 +366,27 @@ impl LayerTree {
             });
             z += 1;
             // External layers are zero-width — `cursor` stays put so the
-            // surrounding root segments still cover the full stream.
-            cursor = r.end;
+            // surrounding root segments still cover the full stream. Never
+            // move backward (guarded above): a re-covered range would draw
+            // those instances twice.
+            cursor = r.end.max(cursor);
         }
         // Trailing root segment (also the sole layer when no promotions).
         if cursor < total || self.layers.is_empty() {
             self.layers
                 .push(root_segment(cursor..total, viewport, z, self.root_epoch));
+        }
+        // Layer-partition dump for compositor debugging (`opal_gfx::layer=trace`).
+        if log::log_enabled!(log::Level::Trace) {
+            for l in &self.layers {
+                log::trace!(
+                    "layer z={} node={:?} inst={:?} window={:?}",
+                    l.z,
+                    l.root,
+                    l.instances,
+                    l.window
+                );
+            }
         }
     }
 }

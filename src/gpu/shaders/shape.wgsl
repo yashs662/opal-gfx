@@ -619,6 +619,18 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             let r2 = (hash22(in.pos.xy) - vec2<f32>(0.5)) * 2.0;
             center_uv = center_uv + r2 * inst.roughness * inv_screen;
         }
+        // Confine the kernel to the glass's own rect. A glass only frosts
+        // what's behind *its* pixels — but the mip chain pre-mixes
+        // neighbourhoods and the taps reach ±2·hp, so an edge-flush
+        // fragment would otherwise drag in content that never sits under
+        // the glass (a bright hover row touching a glass bar's top edge
+        // read as a "reflection" inside the bar). Inset by the kernel's
+        // reach at this LOD and clamp; edge fragments reuse interior
+        // blurred values (edge-extend), which reads as frost, not leak.
+        let reach = min(vec2<f32>(3.0 * exp2(lod)), outer_half);
+        let lo_uv = (center - outer_half + reach) * inv_screen;
+        let hi_uv = (center + outer_half - reach) * inv_screen;
+        center_uv = clamp(center_uv, lo_uv, hi_uv);
         let s_l  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>(-2.0 * hp.x, 0.0),         lod);
         let s_r  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>( 2.0 * hp.x, 0.0),         lod);
         let s_t  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>(0.0,        -2.0 * hp.y),  lod);
