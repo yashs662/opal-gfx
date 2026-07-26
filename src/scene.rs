@@ -206,6 +206,9 @@ impl SceneCtx {
         let _ = tombstone_matching(&mut self.binds.opacity, &mut self.binds.opacity_free, |s| {
             dropped_set.contains(&s.node_id)
         });
+        let _ = tombstone_matching(&mut self.binds.blur, &mut self.binds.blur_free, |s| {
+            dropped_set.contains(&s.node_id)
+        });
         let _ = tombstone_matching(&mut self.binds.effect, &mut self.binds.effect_free, |s| {
             dropped_set.contains(&s.node_id)
         });
@@ -328,6 +331,12 @@ pub struct BindRegistry {
     pub opacity: Vec<Option<OpacityBindSlot>>,
     /// Tombstoned `opacity` indices available for reuse.
     pub opacity_free: Vec<u32>,
+    /// Glass-blur binds. Each slot drives `style.blur_amount` (logical
+    /// px) from an `f32` source — a user-tunable backdrop blur. Snaps
+    /// (no tween); animate the source signal for smooth motion.
+    pub blur: Vec<Option<BlurBindSlot>>,
+    /// Tombstoned `blur` indices available for reuse.
+    pub blur_free: Vec<u32>,
     /// Effect-data binds. Each slot drives a `ShapeKind::Effect` node's
     /// float params via `set_effect_data` (re-flatten, no relayout). No
     /// tween — the source is expected to already carry animated values
@@ -407,6 +416,12 @@ pub struct WidthPxBindSlot {
 }
 
 pub struct HeightPxBindSlot {
+    pub node_id: NodeId,
+    pub bind: Bind<f32>,
+    pub last_version: u64,
+}
+
+pub struct BlurBindSlot {
     pub node_id: NodeId,
     pub bind: Bind<f32>,
     pub last_version: u64,
@@ -1672,10 +1687,26 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
-    /// Per-glass backdrop blur radius (logical px). 0 = sharp.
-    pub fn blur(&mut self, px: f32) -> &mut Self {
+    /// Per-glass backdrop blur radius (logical px). 0 = sharp. Accepts a
+    /// `Signal`/`Computed` source for a live-tunable radius (settings
+    /// slider); reactive sources snap per tick — animate the source for
+    /// smooth motion.
+    pub fn blur(&mut self, px: impl Into<Bind<f32>>) -> &mut Self {
+        let bind = px.into();
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
-            n.style.blur_amount = px;
+            n.style.blur_amount = bind.read();
+        }
+        if !matches!(bind, Bind::Value(_)) {
+            let initial_version = bind.version();
+            alloc_slot(
+                &mut self.ctx.binds.blur,
+                &mut self.ctx.binds.blur_free,
+                BlurBindSlot {
+                    node_id: self.id,
+                    bind,
+                    last_version: initial_version,
+                },
+            );
         }
         self
     }

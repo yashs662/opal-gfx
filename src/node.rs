@@ -2608,6 +2608,19 @@ impl NodeTree {
         }
     }
 
+    /// Runtime glass-blur setter (logical px). The backdrop mip chain is
+    /// always built to full depth — the radius only selects the sampled
+    /// LOD in the glass fragment shader — so a radius change never needs
+    /// a BACKDROP re-run, just a repaint of the glass instance.
+    pub fn set_blur(&mut self, id: NodeId, px: f32) {
+        if let Some(n) = self.get_mut_raw(id)
+            && n.style.blur_amount != px
+        {
+            n.style.blur_amount = px;
+            self.dirty |= dirty::VISUAL;
+        }
+    }
+
     pub fn set_opacity(&mut self, id: NodeId, opacity: f32) {
         if let Some(n) = self.get_mut_raw(id)
             && n.style.opacity != opacity

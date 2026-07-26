@@ -289,6 +289,11 @@ pub struct App<S = ()> {
     /// flush, session disconnect, etc. `Option` so it can be `take`n
     /// (`FnOnce`-style) on first fire.
     on_exit: Option<Box<dyn FnOnce(&mut S)>>,
+    /// One-shot hook fired in `resumed` right after the window is up and
+    /// visible. Hands the host the raw Win32 HWND (`None` off Windows) —
+    /// for OS integrations that need a window to register against (SMTC
+    /// media controls). Runs before the first `on_frame`.
+    on_window_ready: Option<Box<dyn FnOnce(&mut S, Option<*mut std::ffi::c_void>)>>,
     headless: Option<HeadlessFn>,
     /// Number of still frames to capture and exit after, or `None` for
     /// a normal interactive run. `Some(n)` triggers headless capture
@@ -552,6 +557,7 @@ impl<S> App<S> {
             on_frame: None,
             on_unhandled_press: None,
             on_exit: None,
+            on_window_ready: None,
             headless: None,
             capture_frames: None,
             capture_delay: None,
@@ -728,6 +734,18 @@ impl<S> App<S> {
     /// kill signal that lets winit unwind cleanly.
     pub fn on_exit<F: FnOnce(&mut S) + 'static>(mut self, f: F) -> Self {
         self.on_exit = Some(Box::new(f));
+        self
+    }
+
+    /// Hook fired once when the main window exists and is visible,
+    /// with the raw Win32 HWND (`None` on other platforms). For OS
+    /// integrations that register against a window — e.g. Windows SMTC
+    /// media controls.
+    pub fn on_window_ready<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&mut S, Option<*mut std::ffi::c_void>) + 'static,
+    {
+        self.on_window_ready = Some(Box::new(f));
         self
     }
 
@@ -1554,6 +1572,7 @@ impl<S> App<S> {
             &mut self.timeline,
             now,
         );
+        process_blur_binds(&mut self.ctx.binds.blur, &mut self.ctx.tree);
     }
 
     /// For animated binds, copy the current `displayed` signal value
@@ -3710,6 +3729,23 @@ fn process_opacity_binds(
     }
 }
 
+/// Glass-blur binds snap: on a version bump, write the new radius into
+/// the node (`set_blur` — repaint only, the mip chain is radius-agnostic).
+fn process_blur_binds(
+    slots: &mut [Option<crate::scene::BlurBindSlot>],
+    tree: &mut crate::node::NodeTree,
+) {
+    for opt in slots.iter_mut() {
+        let Some(slot) = opt.as_mut() else { continue };
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        tree.set_blur(slot.node_id, slot.bind.read());
+    }
+}
+
 fn process_position_binds(
     slots: &mut [Option<PositionBindSlot>],
     tree: &mut crate::node::NodeTree,
@@ -4048,6 +4084,7 @@ impl<'a> HeadlessHelper<'a> {
             now,
         );
         process_effect_binds(&mut self.ctx.binds.effect, &mut self.ctx.tree);
+        process_blur_binds(&mut self.ctx.binds.blur, &mut self.ctx.tree);
         for slot in self.ctx.binds.color.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_color(slot.node_id, disp.get());
@@ -4229,6 +4266,18 @@ impl<S> ApplicationHandler for App<S> {
         // Real window is up with its first frame — remove the splash.
         if let Some(splash) = splash {
             splash.close();
+        }
+
+        // Window's up — hand the host its raw handle for OS integrations.
+        if let Some(f) = self.on_window_ready.take() {
+            let hwnd = self.window.as_ref().and_then(|w| {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                match w.window_handle().map(|h| h.as_raw()) {
+                    Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as *mut std::ffi::c_void),
+                    _ => None,
+                }
+            });
+            f(&mut self.state, hwnd);
         }
 
         // Deferred autocapture: arm a deadline + let the loop run
@@ -4639,6 +4688,13 @@ impl<S> ApplicationHandler for App<S> {
                                 );
                             }
                             crate::input::end_drag(d.node_id, d.axis, &mut self.ctx.tree);
+                        }
+                        // Same for a generic node drag (slider/scrubber):
+                        // the release can arrive before `about_to_wait`
+                        // pumps the coalesced cursor, and dropping it
+                        // would commit the value at the *previous* move.
+                        if let Some([px, py]) = self.pending_drag_cursor.take() {
+                            let _ = self.fire_drag(px, py);
                         }
                         self.input.on_left_released(&self.hits, &self.ctx.tree)
                     }
@@ -5455,11 +5511,17 @@ impl<S> App<S> {
         );
         let change = self.input.on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
         self.refresh_cursor(x, y);
+        // Mirror the interactive CursorMoved drag path: a move while a
+        // press is captured on a draggable node fires `on_drag` (the real
+        // path coalesces via `pending_drag_cursor`; scripted input is
+        // synchronous, so fire directly — without this a scripted Drag
+        // only ever applied the press's click-to-set position).
+        let dragged = self.fire_drag(x, y);
         let hovered_moved = self.fire_hover_move(x, y);
         if change.hovered_changed {
             self.refresh_dwell(Instant::now());
         }
-        if change.any() || bar_changed || hovered_moved {
+        if change.any() || bar_changed || hovered_moved || dragged {
             self.react();
         }
     }
