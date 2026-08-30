@@ -342,6 +342,28 @@ fn layout_root<M: Measurer>(
     layout_children(tree, id, measurer, scale);
 }
 
+/// Where a self-sized stack child sits along the cross axis, given the
+/// leftover space. `Stretch` has no meaning for an overlay (the child
+/// asked for its own size) — treat it as `Start`.
+fn align_offset(align: Align, slack: f32) -> f32 {
+    match align {
+        Align::Start | Align::Stretch => 0.0,
+        Align::Center => slack * 0.5,
+        Align::End => slack,
+    }
+}
+
+/// Main-axis twin of [`align_offset`]. The `Space*` variants distribute
+/// between multiple flow children; a stack overlays them, so they mean
+/// nothing here and fall back to `Start`.
+fn justify_offset(justify: Justify, slack: f32) -> f32 {
+    match justify {
+        Justify::Center => slack * 0.5,
+        Justify::End => slack,
+        _ => 0.0,
+    }
+}
+
 fn layout_children<M: Measurer>(tree: &mut NodeTree, parent: NodeId, measurer: &mut M, scale: f32) {
     let Some(p) = tree.get(parent) else { return };
     let parent_rect = p.rect;
@@ -363,7 +385,12 @@ fn layout_children<M: Measurer>(tree: &mut NodeTree, parent: NodeId, measurer: &
         Axis::Col => (content_h, content_w),
     };
 
-    // Split abs and flow children.
+    // Split abs and flow children. A **stack group**
+    // ([`crate::scene::Scene::stack`]) has no flow: every child overlays
+    // the group, which is exactly the absolute path below anchored at
+    // `[0, 0]` — so route them all there rather than duplicating the
+    // sizing rules.
+    let stacked = tree.get(parent).is_some_and(|n| n.stack);
     let mut flow: Vec<NodeId> = Vec::new();
     let mut abs: Vec<NodeId> = Vec::new();
     for c in &children {
@@ -371,7 +398,7 @@ fn layout_children<M: Measurer>(tree: &mut NodeTree, parent: NodeId, measurer: &
             Some(n) if n.visible => n,
             _ => continue,
         };
-        if n.layout.abs.is_some() {
+        if stacked || n.layout.abs.is_some() {
             abs.push(*c);
         } else {
             flow.push(*c);
@@ -599,10 +626,17 @@ fn layout_children<M: Measurer>(tree: &mut NodeTree, parent: NodeId, measurer: &
                 .map(|t| TextProbe::from_node(t, &n.layout.width, scale));
             (n.layout.width, n.layout.height, off, text)
         };
+        // In a stack an `Auto` non-text child means "the whole box", not
+        // "size to content": stacked fills/scrims/covers are the common
+        // case, and an intrinsic default would collapse them to nothing.
+        // Text keeps intrinsic sizing — stretching a label would move
+        // where it wraps.
+        let fill_auto = stacked && text.is_none();
         let w = match width_len {
             Len::Px(p) => p * scale,
             Len::Pct(p) => p * content_w,
             Len::Fr(_) | Len::Fill => content_w,
+            Len::Auto if fill_auto => content_w,
             Len::Auto => intrinsic_main(tree, c, Axis::Row, content_h, &text, measurer, scale),
         };
         // Aspect ratio drives height from the resolved width for abs
@@ -617,11 +651,25 @@ fn layout_children<M: Measurer>(tree: &mut NodeTree, parent: NodeId, measurer: &
                 Len::Px(p) => p * scale,
                 Len::Pct(p) => p * content_h,
                 Len::Fr(_) | Len::Fill => content_h,
+                Len::Auto if fill_auto => content_h,
                 Len::Auto => intrinsic_main(tree, c, Axis::Col, content_w, &text, measurer, scale),
             }
         };
-        let x = content_x + abs_off[0] * scale;
-        let y = content_y + abs_off[1] * scale;
+        // Stack children that size themselves are placed by the group's
+        // own alignment (`.center()` centres them both ways — the axis is
+        // Col, so `justify` is vertical and `align` horizontal, same as
+        // any container). Their own `abs` offset, if any, still nudges
+        // them from there.
+        let (slack_x, slack_y) = if stacked {
+            (
+                align_offset(style.align, content_w - w),
+                justify_offset(style.justify, content_h - h),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let x = content_x + slack_x + abs_off[0] * scale;
+        let y = content_y + slack_y + abs_off[1] * scale;
         if let Some(n) = tree.get_mut_raw(c) {
             n.rect = [x, y, w, h];
         }
@@ -1056,6 +1104,49 @@ mod tests {
             .collect();
         assert_eq!(kids[0], [10.0, 10.0, 180.0, 50.0]);
         assert_eq!(kids[1], [10.0, 68.0, 180.0, 50.0]);
+    }
+
+    #[test]
+    fn stack_children_overlay_and_self_sized_ones_align() {
+        let mut tree = NodeTree::new();
+        let root = tree.add_root(
+            Node::rect()
+                .stack()
+                .layout_align(Align::Center)
+                .layout_justify(Justify::Center)
+                .layout_width(Len::Px(200.0))
+                .layout_height(Len::Px(100.0))
+                .build(),
+        );
+        // Auto (non-text) fills the group...
+        tree.add_child(root, Node::rect().build());
+        // ...an explicit Fill does too...
+        tree.add_child(
+            root,
+            Node::rect()
+                .layout_width(Len::Fill)
+                .layout_height(Len::Fill)
+                .build(),
+        );
+        // ...and a self-sized child centres inside it.
+        tree.add_child(
+            root,
+            Node::rect()
+                .layout_width(Len::Px(20.0))
+                .layout_height(Len::Px(10.0))
+                .build(),
+        );
+        compute_layout(&mut tree, [1000.0, 1000.0], &mut NullMeasurer, 1.0);
+        let kids: Vec<_> = tree
+            .get(root)
+            .unwrap()
+            .children
+            .iter()
+            .map(|c| tree.get(*c).unwrap().rect)
+            .collect();
+        assert_eq!(kids[0], [0.0, 0.0, 200.0, 100.0]);
+        assert_eq!(kids[1], [0.0, 0.0, 200.0, 100.0]);
+        assert_eq!(kids[2], [90.0, 45.0, 20.0, 10.0]);
     }
 
     #[test]

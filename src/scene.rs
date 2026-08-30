@@ -664,6 +664,35 @@ impl<'a> Scene<'a> {
         }
     }
 
+    /// **Overlay stack** — the primitive for "draw these on top of each
+    /// other". Children (added with [`NodeBuilderRef::child`], like any
+    /// container) all sit at the group's origin and fill it, so the
+    /// `abs(0, 0).w(Fill).h(Fill)` boilerplate disappears from call sites.
+    /// A child that sizes itself (px/pct) keeps its size and is placed by
+    /// the group's alignment — `.center()` centres it both ways. Text
+    /// children keep their intrinsic width.
+    ///
+    /// Chain a [`NodeBuilderRef::radius`] on the group to round it. That
+    /// is the important part: **round the group, never the children**. Two
+    /// rounded shapes drawn one on top of the other each anti-alias their
+    /// own corner, and the partially-covered edge pixels blend — the shape
+    /// underneath shows through as a thin arc around the one on top. A
+    /// rounded stack rasterizes its children (drawn square) into one
+    /// compositor layer and rounds the composited result once: a single
+    /// anti-aliased edge, with nothing behind it to reveal. A square stack
+    /// skips the texture entirely and costs no more than a plain row.
+    ///
+    /// Returns the group's builder — size, colour, clip and click it like
+    /// any other node. Its own fill paints *behind* the children (inside
+    /// the same layer), so a stack can be the base surface itself.
+    pub fn stack(&mut self, name: impl IntoNodeName) -> NodeBuilderRef<'_> {
+        let b = self.spawn(name.into_node_name(), SpawnKind::Rect, Axis::Col);
+        if let Some(n) = b.ctx.tree.get_mut_raw(b.id) {
+            n.stack = true;
+        }
+        b
+    }
+
     /// A horizontal auto-panning strip — classic marquee — for one line
     /// of content that mustn't wrap but may overflow (a long title, a
     /// multi-artist credit line). `build` spawns the content, which lays
@@ -2237,6 +2266,33 @@ mod tests {
     use crate::Curve;
     use crate::reactive::{Computed, animated};
     use std::time::Duration;
+
+    #[test]
+    fn stack_overlays_children_and_promotes_only_when_rounded() {
+        let mut ctx = SceneCtx::new();
+        let (square, rounded, kid, sized) = {
+            let mut scene = Scene::root(&mut ctx);
+            let mut kid = None;
+            let mut sized = None;
+            let square = scene
+                .stack(())
+                .child(|s| {
+                    kid = Some(s.rect(()).id());
+                    sized = Some(s.rect(()).w_px(8.0).h_px(8.0).id());
+                })
+                .id();
+            let rounded = scene.stack(()).radius(6.0).id();
+            (square, rounded, kid.unwrap(), sized.unwrap())
+        };
+        // Children stay in flow (no abs anchor) — the layout pass overlays
+        // them because the parent is a stack.
+        let k = ctx.tree.get(kid).unwrap();
+        assert_eq!(k.layout.abs, None);
+        assert!(ctx.tree.get(sized).unwrap().layout.abs.is_none());
+        // Only the rounded group pays for a compositor layer.
+        assert!(!ctx.tree.get(square).unwrap().wants_layer());
+        assert!(ctx.tree.get(rounded).unwrap().wants_layer());
+    }
 
     #[test]
     fn hover_opacity_derives_hover_color_with_alpha_scaled() {

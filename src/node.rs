@@ -766,6 +766,16 @@ pub struct Node {
     /// frames. Default false — most nodes stay merged into the root
     /// layer. See [`crate::layer::LayerTree`].
     pub layer: bool,
+    /// This node is a **stack group** ([`crate::scene::Scene::stack`]):
+    /// its children are overlaid at the group's origin. Recorded because
+    /// the group only needs a compositor layer when it *rounds*: stacked
+    /// children that each round their own corners blend their anti-aliased
+    /// edges against one another, so the one underneath shows as a thin
+    /// arc around the one on top. Rasterizing the group once and rounding
+    /// the composited result (children drawn square) leaves a single clean
+    /// corner. Square stacks skip the texture entirely — see the promotion
+    /// rule in [`Self::wants_layer`].
+    pub stack: bool,
     /// Optional composite-opacity source for a `.layer()`-promoted
     /// subtree. When set, the app pushes this signal's value into the
     /// layer's composite opacity each frame (composite-only — the layer's
@@ -912,6 +922,7 @@ impl std::fmt::Debug for Node {
             .field("scroll", &self.scroll)
             .field("visible", &self.visible)
             .field("layer", &self.layer)
+            .field("stack", &self.stack)
             .field("children", &self.children)
             .field("interact", &self.interact)
             .field("text", &self.text)
@@ -945,6 +956,15 @@ impl std::fmt::Debug for Node {
 }
 
 impl Node {
+    /// Does this node rasterize into its own compositor layer? Either it
+    /// asked outright ([`Self::layer`]), or it's a rounded stack group
+    /// ([`Self::stack`]) — which needs the texture precisely to round the
+    /// composited result once instead of letting stacked children round
+    /// (and anti-alias) against each other. A square stack pays nothing.
+    pub fn wants_layer(&self) -> bool {
+        self.layer || (self.stack && self.style.border_radius.iter().any(|&r| r > 0.0))
+    }
+
     pub fn rect() -> NodeBuilder {
         NodeBuilder {
             node: Node {
@@ -956,6 +976,7 @@ impl Node {
                 visible: true,
                 blur_source: false,
                 layer: false,
+                stack: false,
                 layer_opacity: None,
                 layer_offset_x: None,
                 external: false,
@@ -1292,6 +1313,13 @@ impl NodeBuilder {
     /// changes re-run the blur. See [`Node::blur_source`].
     pub fn blur_source(mut self) -> Self {
         self.node.blur_source = true;
+        self
+    }
+
+    /// Overlay this node's children instead of flowing them. See
+    /// [`Node::stack`] and [`crate::scene::Scene::stack`].
+    pub fn stack(mut self) -> Self {
+        self.node.stack = true;
         self
     }
 
@@ -3029,7 +3057,7 @@ impl NodeTree {
         // promotions collapse into the outermost — P3 supports
         // non-nested promotion only). The span is closed after the
         // children + scrollbar emission below.
-        let promote = node.layer && !in_layer;
+        let promote = node.wants_layer() && !in_layer;
         // A promoted **scroll container** rasters its content into a tall
         // content-sized texture: children emit content-local (scroll NOT
         // baked, self-clip NOT applied — both happen at composite time),
@@ -3038,7 +3066,7 @@ impl NodeTree {
         // sub-range, not the whole subtree.
         let is_scroll_layer = promote && node.scroll.is_some() && node.layout.scrolls();
         let span_start = events.len();
-        let child_in_layer = in_layer || node.layer;
+        let child_in_layer = in_layer || node.wants_layer();
         let rect = node.rect;
         // Visual position (→ instances / layer texture). Inside a scroll
         // layer this is content-local; outside it equals the hit position.
