@@ -626,12 +626,14 @@ fn layout_children<M: Measurer>(tree: &mut NodeTree, parent: NodeId, measurer: &
                 .map(|t| TextProbe::from_node(t, &n.layout.width, scale));
             (n.layout.width, n.layout.height, off, text)
         };
-        // In a stack an `Auto` non-text child means "the whole box", not
-        // "size to content": stacked fills/scrims/covers are the common
-        // case, and an intrinsic default would collapse them to nothing.
-        // Text keeps intrinsic sizing — stretching a label would move
-        // where it wraps.
-        let fill_auto = stacked && text.is_none();
+        // In a stack an `Auto` child that has nothing in it means "the
+        // whole box": a bare fill/scrim/cover is the common stacked case,
+        // and intrinsic sizing would collapse it to nothing. A child that
+        // *has* content (children, or text) keeps intrinsic sizing —
+        // that's the floating pill / badge / label case, which must hug
+        // what it wraps so the group's alignment can place it.
+        let fill_auto =
+            stacked && text.is_none() && tree.get(c).is_some_and(|n| n.children.is_empty());
         let w = match width_len {
             Len::Px(p) => p * scale,
             Len::Pct(p) => p * content_w,
@@ -1118,7 +1120,7 @@ mod tests {
                 .layout_height(Len::Px(100.0))
                 .build(),
         );
-        // Auto (non-text) fills the group...
+        // An empty Auto rect fills the group...
         tree.add_child(root, Node::rect().build());
         // ...an explicit Fill does too...
         tree.add_child(
@@ -1136,6 +1138,15 @@ mod tests {
                 .layout_height(Len::Px(10.0))
                 .build(),
         );
+        // ...and an Auto child that *has* content hugs it, then aligns.
+        let hugging = tree.add_child(root, Node::rect().build());
+        tree.add_child(
+            hugging,
+            Node::rect()
+                .layout_width(Len::Px(40.0))
+                .layout_height(Len::Px(20.0))
+                .build(),
+        );
         compute_layout(&mut tree, [1000.0, 1000.0], &mut NullMeasurer, 1.0);
         let kids: Vec<_> = tree
             .get(root)
@@ -1147,6 +1158,7 @@ mod tests {
         assert_eq!(kids[0], [0.0, 0.0, 200.0, 100.0]);
         assert_eq!(kids[1], [0.0, 0.0, 200.0, 100.0]);
         assert_eq!(kids[2], [90.0, 45.0, 20.0, 10.0]);
+        assert_eq!(kids[3], [80.0, 40.0, 40.0, 20.0]);
     }
 
     #[test]

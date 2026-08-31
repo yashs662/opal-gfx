@@ -189,6 +189,11 @@ impl SceneCtx {
             dropped_set.contains(&s.node_id)
         });
         let _ = tombstone_matching(
+            &mut self.binds.font_size,
+            &mut self.binds.font_size_free,
+            |s| dropped_set.contains(&s.node_id),
+        );
+        let _ = tombstone_matching(
             &mut self.binds.width_pct,
             &mut self.binds.width_pct_free,
             |s| dropped_set.contains(&s.node_id),
@@ -294,6 +299,12 @@ pub struct BindRegistry {
     pub size: Vec<Option<SizeBindSlot>>,
     /// Tombstoned `size` indices available for reuse.
     pub size_free: Vec<u32>,
+    /// Font-size binds. Each slot drives `node.text.font_size` via
+    /// `set_font_size` (which relayouts — the glyphs reshape). Snaps;
+    /// animate the source signal for smooth motion.
+    pub font_size: Vec<Option<FontSizeBindSlot>>,
+    /// Tombstoned `font_size` indices available for reuse.
+    pub font_size_free: Vec<u32>,
     /// Image-handle binds. Each slot drives `node.image`. No tween (a
     /// handle swap is discrete), so unlike the others these carry no
     /// `displayed` signal and no timeline key.
@@ -377,6 +388,15 @@ pub struct SizeBindSlot {
     pub bind: Bind<[f32; 2]>,
     pub last_version: u64,
     pub displayed: Option<Signal<[f32; 2]>>,
+}
+
+/// A reactive **font-size** bind: drives `node.text.font_size` from an
+/// `f32` source. Snaps on change (animate the source for smooth motion) —
+/// a size change reshapes the glyphs, so this relayouts like a text bind.
+pub struct FontSizeBindSlot {
+    pub node_id: NodeId,
+    pub bind: Bind<f32>,
+    pub last_version: u64,
 }
 
 pub struct ImageBindSlot {
@@ -669,8 +689,10 @@ impl<'a> Scene<'a> {
     /// container) all sit at the group's origin and fill it, so the
     /// `abs(0, 0).w(Fill).h(Fill)` boilerplate disappears from call sites.
     /// A child that sizes itself (px/pct) keeps its size and is placed by
-    /// the group's alignment — `.center()` centres it both ways. Text
-    /// children keep their intrinsic width.
+    /// the group's alignment — `.center()` centres it both ways, and so
+    /// does an `Auto` child with content of its own (a floating pill or
+    /// badge hugs it). Only an *empty* `Auto` rect means "the whole box",
+    /// which is what a scrim or cover wants.
     ///
     /// Chain a [`NodeBuilderRef::radius`] on the group to round it. That
     /// is the important part: **round the group, never the children**. Two
@@ -1143,6 +1165,29 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
+    /// Reactive **font size** for a text node. The glyphs reshape (and
+    /// the line re-wraps) as the value moves, so animate the source
+    /// signal — an emphasis that grows and shrinks is a real type-size
+    /// change, not a scaled-up raster that would blur.
+    pub fn font_size_bind(&mut self, size: impl Into<Bind<f32>>) -> &mut Self {
+        let bind = size.into();
+        let initial = bind.read();
+        let initial_version = bind.version();
+        self.ctx.tree.set_font_size(self.id, initial);
+        if !matches!(bind, Bind::Value(_)) {
+            alloc_slot(
+                &mut self.ctx.binds.font_size,
+                &mut self.ctx.binds.font_size_free,
+                FontSizeBindSlot {
+                    node_id: self.id,
+                    bind,
+                    last_version: initial_version,
+                },
+            );
+        }
+        self
+    }
+
     /// Reactive size in pixels. Both axes follow the bind value as
     /// `Len::Px`. Accepts the same shapes as [`Self::pos`].
     pub fn size_bind(&mut self, size: impl Into<Bind<[f32; 2]>>) -> &mut Self {
@@ -1361,6 +1406,15 @@ impl<'a> NodeBuilderRef<'a> {
     /// **X offset** (logical px) from `signal` each frame — composite-only,
     /// no re-flatten and no relayout. Lets an overlay (e.g. the seek-bar
     /// timestamp tooltip) follow the cursor without dirtying the layout tree.
+    /// See [`crate::node::Node::layer_offset_x`].
+    pub fn layer_offset_y(&mut self, signal: crate::signal::Signal<f32>) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.layer = true;
+            n.layer_offset_y = Some(signal);
+        }
+        self
+    }
+
     /// See [`crate::node::Node::layer_offset_x`].
     pub fn layer_offset_x(&mut self, signal: crate::signal::Signal<f32>) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
@@ -2464,6 +2518,28 @@ mod tests {
         let slot = ctx.binds.position[0].as_ref().unwrap();
         assert!(slot.displayed.is_some());
         assert_eq!(slot.displayed.as_ref().unwrap().get(), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn font_size_bind_seeds_the_size_and_tracks_its_source() {
+        let s = Signal::new(30.0_f32);
+        let mut ctx = SceneCtx::new();
+        {
+            let mut scene = Scene::root(&mut ctx);
+            scene.text("t", "hello", 14.0).font_size_bind(s.clone());
+        }
+        assert_eq!(ctx.binds.font_size.len(), 1);
+        let slot = ctx.binds.font_size[0].as_ref().unwrap();
+        // Seeded from the bind, not left at the authored size.
+        let n = ctx.tree.get(slot.node_id).unwrap();
+        assert_eq!(n.text.as_ref().unwrap().font_size, 30.0);
+        // A constant needs no slot — nothing to re-read.
+        let mut ctx2 = SceneCtx::new();
+        {
+            let mut scene = Scene::root(&mut ctx2);
+            scene.text("t", "hello", 14.0).font_size_bind(20.0);
+        }
+        assert!(ctx2.binds.font_size.is_empty());
     }
 
     #[test]

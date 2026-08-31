@@ -340,11 +340,16 @@ pub struct App<S = ()> {
     /// composite opacity, mirroring how reactive binds drive node props.
     layer_opacity_binds: Vec<(crate::node::NodeId, crate::signal::Signal<f32>)>,
     /// Same bridge as [`Self::layer_opacity_binds`] but for a layer's
-    /// composite **X offset** (logical px) — collected from `.layer_offset_x`
+    /// composite offset (logical px) — collected from `.layer_offset_x` /
+    /// `.layer_offset_y`
     /// nodes each flush and pumped each awake frame via
     /// [`Self::set_layer_offset`]. Drives cursor-following overlays without
     /// touching the layout tree.
-    layer_offset_x_binds: Vec<(crate::node::NodeId, crate::signal::Signal<f32>)>,
+    layer_offset_binds: Vec<(
+        crate::node::NodeId,
+        Option<crate::signal::Signal<f32>>,
+        Option<crate::signal::Signal<f32>>,
+    )>,
     /// Reused scratch for [`Self::push_layer_draws`] so composite-only
     /// updates don't allocate a fresh draw-list Vec each frame.
     layer_draw_scratch: Vec<crate::gpu::LayerDraw>,
@@ -566,7 +571,7 @@ impl<S> App<S> {
             last_dirty_mask: 0,
             layer_tree: crate::layer::LayerTree::single_root(),
             layer_opacity_binds: Vec::new(),
-            layer_offset_x_binds: Vec::new(),
+            layer_offset_binds: Vec::new(),
             layer_draw_scratch: Vec::new(),
             last_cpu_ms: 0.0,
             last_render_stats: None,
@@ -1001,14 +1006,15 @@ impl<S> App<S> {
         // tracks the current tree (promotions can come + go); the per-frame
         // pump then drives each layer's composite opacity from its signal.
         self.layer_opacity_binds.clear();
-        self.layer_offset_x_binds.clear();
+        self.layer_offset_binds.clear();
         for p in &promoted {
             if let Some(n) = self.ctx.tree.get(p.node) {
                 if let Some(sig) = n.layer_opacity.clone() {
                     self.layer_opacity_binds.push((p.node, sig));
                 }
-                if let Some(sig) = n.layer_offset_x.clone() {
-                    self.layer_offset_x_binds.push((p.node, sig));
+                let (x, y) = (n.layer_offset_x.clone(), n.layer_offset_y.clone());
+                if x.is_some() || y.is_some() {
+                    self.layer_offset_binds.push((p.node, x, y));
                 }
             }
         }
@@ -1099,11 +1105,15 @@ impl<S> App<S> {
         // `&mut self` calls below don't conflict with borrowing it, then put
         // it back. `set_layer_offset` never touches this field. Keeps a
         // cursor-following overlay's per-move cost alloc-free.
-        let binds = std::mem::take(&mut self.layer_offset_x_binds);
-        for (node, sig) in &binds {
-            self.set_layer_offset(*node, [sig.get(), 0.0]);
+        let binds = std::mem::take(&mut self.layer_offset_binds);
+        for (node, x, y) in &binds {
+            let off = [
+                x.as_ref().map(|s| s.get()).unwrap_or(0.0),
+                y.as_ref().map(|s| s.get()).unwrap_or(0.0),
+            ];
+            self.set_layer_offset(*node, off);
         }
-        self.layer_offset_x_binds = binds;
+        self.layer_offset_binds = binds;
     }
 
     /// Register/replace the **external texture** for an `.external()` node
@@ -1563,6 +1573,7 @@ impl<S> App<S> {
         process_image_binds(&mut self.ctx.binds.image, &mut self.ctx.tree);
         process_effect_binds(&mut self.ctx.binds.effect, &mut self.ctx.tree);
         process_text_binds(&mut self.ctx.binds.text, &mut self.ctx.tree);
+        process_font_size_binds(&mut self.ctx.binds.font_size, &mut self.ctx.tree);
         process_width_pct_binds(&mut self.ctx.binds.width_pct, &mut self.ctx.tree);
         process_width_px_binds(&mut self.ctx.binds.width_px, &mut self.ctx.tree);
         process_height_px_binds(&mut self.ctx.binds.height_px, &mut self.ctx.tree);
@@ -2911,7 +2922,7 @@ impl<S> App<S> {
         // Layer-opacity / layer-offset bindings hold node ids from the old
         // tree — drop them; the rebuilt scene re-collects them on next flush.
         self.layer_opacity_binds.clear();
-        self.layer_offset_x_binds.clear();
+        self.layer_offset_binds.clear();
         // Marquee registry likewise holds old ids — the rebuilt scene
         // re-registers its strips; per-strip pan state re-keys lazily.
         self.ctx.marquees.clear();
@@ -3655,6 +3666,21 @@ fn process_text_binds(slots: &mut [Option<TextBindSlot>], tree: &mut crate::node
 /// Percentage-width binds snap: on a version bump, set the node's width
 /// to `Len::Pct(value)`. Drives responsive fills (progress bar) without
 /// a rebuild.
+fn process_font_size_binds(
+    slots: &mut [Option<crate::scene::FontSizeBindSlot>],
+    tree: &mut crate::node::NodeTree,
+) {
+    for opt in slots.iter_mut() {
+        let Some(slot) = opt.as_mut() else { continue };
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        tree.set_font_size(slot.node_id, slot.bind.read());
+    }
+}
+
 fn process_width_pct_binds(
     slots: &mut [Option<WidthPctBindSlot>],
     tree: &mut crate::node::NodeTree,
@@ -4083,6 +4109,7 @@ impl<'a> HeadlessHelper<'a> {
             self.timeline,
             now,
         );
+        process_font_size_binds(&mut self.ctx.binds.font_size, &mut self.ctx.tree);
         process_effect_binds(&mut self.ctx.binds.effect, &mut self.ctx.tree);
         process_blur_binds(&mut self.ctx.binds.blur, &mut self.ctx.tree);
         for slot in self.ctx.binds.color.iter().flatten() {

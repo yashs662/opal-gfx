@@ -789,6 +789,10 @@ pub struct Node {
     /// no relayout. Lets an overlay (e.g. a seek tooltip) track the cursor
     /// without touching the layout tree. Only meaningful with `layer = true`.
     pub layer_offset_x: Option<crate::signal::Signal<f32>>,
+    /// Vertical twin of [`Self::layer_offset_x`] — composite **Y offset**
+    /// (logical px). Same rules: composite-only, no re-flatten, so a
+    /// slide-in overlay costs nothing but a matrix update.
+    pub layer_offset_y: Option<crate::signal::Signal<f32>>,
     /// **External-texture layer** (P6): this node owns no instances; its
     /// pixels come from a caller-supplied `wgpu::Texture` registered with
     /// [`crate::app::App::set_external_texture`] (keyed by this node's id).
@@ -979,6 +983,7 @@ impl Node {
                 stack: false,
                 layer_opacity: None,
                 layer_offset_x: None,
+                layer_offset_y: None,
                 external: false,
                 image_cover: false,
                 edge_fade: [0.0; 4],
@@ -1335,6 +1340,13 @@ impl NodeBuilder {
     pub fn layer_opacity(mut self, signal: crate::signal::Signal<f32>) -> Self {
         self.node.layer = true;
         self.node.layer_opacity = Some(signal);
+        self
+    }
+    /// Promote to a layer and drive its composite **Y** offset from
+    /// `signal`. See [`Node::layer_offset_y`].
+    pub fn layer_offset_y(mut self, signal: crate::signal::Signal<f32>) -> Self {
+        self.node.layer = true;
+        self.node.layer_offset_y = Some(signal);
         self
     }
     /// Mark this node as an **external-texture layer** (P6) — its pixels
@@ -2352,6 +2364,18 @@ impl NodeTree {
             return applied;
         }
         [0.0; 2]
+    }
+
+    /// Read the scroll **target** (where the spring is easing to), not
+    /// the displayed offset. The pair with [`Self::scroll_offset`]: a
+    /// caller that drove the target itself compares against this to tell
+    /// its own scroll apart from the user's wheel/drag. `[0, 0]` for
+    /// non-scrollable nodes.
+    pub fn scroll_target(&self, id: NodeId) -> [f32; 2] {
+        self.get(id)
+            .and_then(|n| n.scroll.as_ref())
+            .map(|s| s.target)
+            .unwrap_or([0.0; 2])
     }
 
     /// Read the displayed scroll offset (current, not target). Returns
