@@ -2,7 +2,12 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
+/// Floor for the effect-param arena. A storage buffer can't be empty,
+/// and most scenes have no effect nodes at all.
+const EFFECT_PARAM_MIN: u64 = 16;
+
 use super::blur::BlurResources;
+use super::effects::EffectGlobals;
 use super::glyph_atlas::GlyphAtlas;
 use super::image_atlas::{ImageAtlas, ImageHandle};
 use super::instance::{
@@ -162,6 +167,13 @@ pub struct GpuContext {
     /// [`Self::set_window_corner_radius`]; consumed by the next frame
     /// uniform upload.
     window_corner_radius: f32,
+    /// Live clock + audio for the effect shaders (see
+    /// [`super::effects`]). Uploaded with the rest of the frame uniform.
+    effect_globals: EffectGlobals,
+    /// Flat arena of every effect node's params, uploaded alongside the
+    /// instance list and indexed per instance.
+    effect_param_buffer: wgpu::Buffer,
+    effect_param_capacity: u64,
 }
 
 impl GpuContext {
@@ -287,6 +299,15 @@ impl GpuContext {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Effect params live in their own storage buffer so effect nodes
+        // keep their visual fields (border, shadow, radius) and aren't
+        // capped at a fixed param count.
+        let effect_param_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("opal.effect params ssbo"),
+            size: EFFECT_PARAM_MIN * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         // Layer resources need the instance SSBO for the per-layer raster
         // bind groups (scroll-layer content-local path), so build after it.
         let layers = super::layer::LayerResources::new(
@@ -295,10 +316,13 @@ impl GpuContext {
             width,
             height,
             &shape.shape_bgl,
-            &instance_buffer,
+            super::layer::RasterBuffers {
+                instances: &instance_buffer,
+                effect_params: &effect_param_buffer,
+            },
         );
 
-        let shape_bg = make_shape_bg(&device, &shape, &instance_buffer);
+        let shape_bg = make_shape_bg(&device, &shape, &instance_buffer, &effect_param_buffer);
         let glass_bg = make_glass_bg(&device, &shape, &blur);
 
         let overlay_capacity: u64 = 16;
@@ -308,17 +332,18 @@ impl GpuContext {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let overlay_bg = make_shape_bg(&device, &shape, &overlay_buffer);
+        let overlay_bg = make_shape_bg(&device, &shape, &overlay_buffer, &effect_param_buffer);
 
         // Write initial frame uniform.
         queue.write_buffer(
             &shape.frame_buffer,
             0,
-            bytemuck::bytes_of(&FrameUniform {
-                screen_size: [width as f32, height as f32],
-                max_backdrop_lod: blur.mip_count().saturating_sub(1) as f32,
-                window_corner_radius: 0.0,
-            }),
+            bytemuck::bytes_of(&FrameUniform::new(
+                [width as f32, height as f32],
+                blur.mip_count().saturating_sub(1) as f32,
+                0.0,
+                EffectGlobals::default(),
+            )),
         );
 
         Self {
@@ -361,6 +386,9 @@ impl GpuContext {
             last_backdrop_builds: 0,
             last_timing: None,
             window_corner_radius: 0.0,
+            effect_globals: EffectGlobals::default(),
+            effect_param_buffer,
+            effect_param_capacity: EFFECT_PARAM_MIN,
         }
     }
 
@@ -373,18 +401,7 @@ impl GpuContext {
             self.surface_config.width,
             self.surface_config.height,
         );
-        self.queue.write_buffer(
-            &self.shape.frame_buffer,
-            0,
-            bytemuck::bytes_of(&FrameUniform {
-                screen_size: [
-                    self.surface_config.width as f32,
-                    self.surface_config.height as f32,
-                ],
-                max_backdrop_lod: self.blur.mip_count().saturating_sub(1) as f32,
-                window_corner_radius: self.window_corner_radius,
-            }),
-        );
+        self.write_frame_uniform();
         // Blurred view changed — rebuild the glass bind group.
         self.glass_bg = make_glass_bg(&self.device, &self.shape, &self.blur);
         if let Some(od) = self.overdraw.as_mut() {
@@ -736,11 +753,16 @@ impl GpuContext {
     /// raster-skip key: identical bytes ⇒ identical rasterized pixels ⇒
     /// reuse the cached texture. `has_glass` lets the caller force a
     /// re-raster when the backdrop pyramid changed (glass samples it).
-    fn layer_signature(&self, range: &std::ops::Range<u32>) -> (u64, bool) {
+    /// Content hash of a layer's instance range, plus whether it holds
+    /// glass, plus whether it holds an **animated** effect (which has to
+    /// re-raster every frame — its pixels move with the clock, not with
+    /// the tree).
+    fn layer_signature(&self, range: &std::ops::Range<u32>) -> (u64, bool, bool) {
         let start = (range.start as usize).min(self.prev_instances.len());
         let end = (range.end as usize).min(self.prev_instances.len());
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut has_glass = false;
+        let mut has_animated = false;
         for inst in &self.prev_instances[start..end] {
             for &b in bytemuck::bytes_of(inst) {
                 hash ^= b as u64;
@@ -749,8 +771,9 @@ impl GpuContext {
             if inst.shape_kind & SHAPE_KIND_MASK == SHAPE_KIND_GLASS {
                 has_glass = true;
             }
+            has_animated |= inst.shape_kind & super::instance::SHAPE_FLAG_ANIMATED != 0;
         }
-        (hash, has_glass)
+        (hash, has_glass, has_animated)
     }
 
     pub fn overdraw_mode(&self) -> bool {
@@ -776,17 +799,42 @@ impl GpuContext {
     /// loop is idle.
     pub fn set_window_corner_radius(&mut self, r: f32, scale: f32) {
         self.window_corner_radius = r.max(0.0) * scale;
+        self.write_frame_uniform();
+    }
+
+    /// Publish this frame's [`EffectGlobals`] (clock + audio) for every
+    /// effect shader. Cheap — one small uniform write — and the only
+    /// per-frame cost of an animated effect.
+    pub fn set_effect_globals(&mut self, globals: EffectGlobals) {
+        if self.effect_globals == globals {
+            return;
+        }
+        self.effect_globals = globals;
+        self.write_frame_uniform();
+    }
+
+    /// The live effect globals (per-layer raster passes upload the same
+    /// values into their own frame UBOs).
+    pub fn effect_globals(&self) -> EffectGlobals {
+        self.effect_globals
+    }
+
+    /// Re-upload the frame uniform from the current surface size, blur
+    /// pyramid, corner radius and effect globals. One place, so an
+    /// upload can't miss a field.
+    fn write_frame_uniform(&self) {
         self.queue.write_buffer(
             &self.shape.frame_buffer,
             0,
-            bytemuck::bytes_of(&FrameUniform {
-                screen_size: [
+            bytemuck::bytes_of(&FrameUniform::new(
+                [
                     self.surface_config.width as f32,
                     self.surface_config.height as f32,
                 ],
-                max_backdrop_lod: self.blur.mip_count().saturating_sub(1) as f32,
-                window_corner_radius: self.window_corner_radius,
-            }),
+                self.blur.mip_count().saturating_sub(1) as f32,
+                self.window_corner_radius,
+                self.effect_globals,
+            )),
         );
     }
 
@@ -802,9 +850,11 @@ impl GpuContext {
     pub fn set_instances(
         &mut self,
         instances: &[ShapeInstance],
+        effect_params: &[f32],
         glass_count: u32,
         backdrop_hint: bool,
     ) {
+        self.set_effect_params(effect_params);
         let needed = instances.len() as u64;
         let stride = std::mem::size_of::<ShapeInstance>() as u64;
         let grew = needed > self.instance_capacity;
@@ -820,12 +870,22 @@ impl GpuContext {
                 mapped_at_creation: false,
             });
             self.instance_capacity = new_cap;
-            self.shape_bg = make_shape_bg(&self.device, &self.shape, &self.instance_buffer);
+            self.shape_bg = make_shape_bg(
+                &self.device,
+                &self.shape,
+                &self.instance_buffer,
+                &self.effect_param_buffer,
+            );
             // The per-layer raster bind groups (scroll-layer content-local
             // path) reference the instance SSBO too — repoint them at the
             // freshly-grown buffer or they'd sample the dropped one.
-            self.layers
-                .rebuild_raster_bgs(&self.device, &self.instance_buffer);
+            self.layers.rebuild_raster_bgs(
+                &self.device,
+                super::layer::RasterBuffers {
+                    instances: &self.instance_buffer,
+                    effect_params: &self.effect_param_buffer,
+                },
+            );
         }
 
         // Full upload on buffer grow or on any slot-count change (new
@@ -872,6 +932,49 @@ impl GpuContext {
         // index is cached here anymore.
         if backdrop_hint {
             self.backdrop_dirty = true;
+        }
+    }
+
+    /// Upload this frame's effect-param arena. Grows (and repoints every
+    /// bind group at) the buffer when a frame needs more than the last
+    /// one; the arena is small — a handful of floats per effect node.
+    fn set_effect_params(&mut self, params: &[f32]) {
+        let needed = (params.len() as u64).max(EFFECT_PARAM_MIN);
+        if needed > self.effect_param_capacity {
+            let mut cap = self.effect_param_capacity.max(EFFECT_PARAM_MIN);
+            while cap < needed {
+                cap *= 2;
+            }
+            self.effect_param_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("opal.effect params ssbo"),
+                size: cap * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.effect_param_capacity = cap;
+            self.shape_bg = make_shape_bg(
+                &self.device,
+                &self.shape,
+                &self.instance_buffer,
+                &self.effect_param_buffer,
+            );
+            self.overlay_bg = make_shape_bg(
+                &self.device,
+                &self.shape,
+                &self.overlay_buffer,
+                &self.effect_param_buffer,
+            );
+            self.layers.rebuild_raster_bgs(
+                &self.device,
+                super::layer::RasterBuffers {
+                    instances: &self.instance_buffer,
+                    effect_params: &self.effect_param_buffer,
+                },
+            );
+        }
+        if !params.is_empty() {
+            self.queue
+                .write_buffer(&self.effect_param_buffer, 0, bytemuck::cast_slice(params));
         }
     }
 
@@ -940,8 +1043,10 @@ impl GpuContext {
                     opacity: r.opacity,
                     scale: [1.0, 1.0],
                     clip_radius: [0.0; 4],
-                    effect_id: 0.0,
-                    _pad: 0.0,
+                    effect_id: 0,
+                    effect_param_offset: 0,
+                    effect_param_len: 0,
+                    _pad: [0.0; 3],
                 });
             }
         }
@@ -1001,8 +1106,10 @@ impl GpuContext {
                 opacity: r.opacity,
                 scale: [1.0, 1.0],
                 clip_radius: r.clip_radius,
-                effect_id: 0.0,
-                _pad: 0.0,
+                effect_id: 0,
+                effect_param_offset: 0,
+                effect_param_len: 0,
+                _pad: [0.0; 3],
             });
         }
         out
@@ -1025,7 +1132,12 @@ impl GpuContext {
                 mapped_at_creation: false,
             });
             self.overlay_capacity = new_cap;
-            self.overlay_bg = make_shape_bg(&self.device, &self.shape, &self.overlay_buffer);
+            self.overlay_bg = make_shape_bg(
+                &self.device,
+                &self.shape,
+                &self.overlay_buffer,
+                &self.effect_param_buffer,
+            );
         }
         if !instances.is_empty() {
             self.queue
@@ -1074,8 +1186,8 @@ impl GpuContext {
         force: bool,
         ts_pair: Option<(u32, u32)>,
     ) -> bool {
-        let (sig, _) = self.layer_signature(&draw.instances);
-        if draw.instances.is_empty() || !self.layers.needs_raster(i, sig, force) {
+        let (sig, _, animated) = self.layer_signature(&draw.instances);
+        if draw.instances.is_empty() || !self.layers.needs_raster(i, sig, force || animated) {
             return false;
         }
         {
@@ -1196,13 +1308,20 @@ impl GpuContext {
         };
         let surface_px = [self.surface_config.width, self.surface_config.height];
         let sizes: Vec<[u32; 2]> = draws.iter().map(|d| d.texture_size(surface_px)).collect();
-        self.layers
-            .ensure(&self.device, &sizes, &self.instance_buffer);
+        self.layers.ensure(
+            &self.device,
+            &sizes,
+            super::layer::RasterBuffers {
+                instances: &self.instance_buffer,
+                effect_params: &self.effect_param_buffer,
+            },
+        );
         let max_lod = self.blur.mip_count().saturating_sub(1) as f32;
         for (i, d) in draws.iter().enumerate() {
             self.layers.write_uniform(&self.queue, i, d, screen);
             if let Some(w) = d.window.as_ref() {
-                self.layers.write_frame(&self.queue, i, w.tex_size, max_lod);
+                self.layers
+                    .write_frame(&self.queue, i, w.tex_size, max_lod, self.effect_globals);
             }
         }
 
@@ -1301,9 +1420,9 @@ impl GpuContext {
             // the glass re-blur a pyramid containing the layer's own prior
             // output, darkening the backdrop a little more every toggle.
             let glass_content_dirty = {
-                let (sig, _) = self.layer_signature(&draws[glass_layer].instances);
+                let (sig, _, animated) = self.layer_signature(&draws[glass_layer].instances);
                 !draws[glass_layer].instances.is_empty()
-                    && self.layers.needs_raster(glass_layer, sig, false)
+                    && self.layers.needs_raster(glass_layer, sig, animated)
             };
             let need = self.backdrop_dirty || any_below_changed || glass_content_dirty;
             if need {
@@ -1877,6 +1996,7 @@ fn make_shape_bg(
     device: &wgpu::Device,
     shape: &ShapePipeline,
     instance_buffer: &wgpu::Buffer,
+    effect_params: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("opal.shape bg"),
@@ -1889,6 +2009,10 @@ fn make_shape_bg(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: instance_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: effect_params.as_entire_binding(),
             },
         ],
     })

@@ -233,7 +233,7 @@ impl LayerResources {
         width: u32,
         height: u32,
         shape_bgl: &wgpu::BindGroupLayout,
-        instance_buffer: &wgpu::Buffer,
+        bufs: RasterBuffers<'_>,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("opal.composite shader"),
@@ -443,7 +443,7 @@ impl LayerResources {
             textures: Vec::new(),
             sigs: Vec::new(),
         };
-        res.ensure(device, &[res.surface_size], instance_buffer);
+        res.ensure(device, &[res.surface_size], bufs);
         res
     }
 
@@ -451,7 +451,7 @@ impl LayerResources {
         &self,
         device: &wgpu::Device,
         size: [u32; 2],
-        instance_buffer: &wgpu::Buffer,
+        bufs: RasterBuffers<'_>,
     ) -> LayerTexture {
         let size = [size[0].max(1), size[1].max(1)];
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -499,7 +499,7 @@ impl LayerResources {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let raster_bg = make_raster_bg(device, &self.shape_bgl, &frame, instance_buffer);
+        let raster_bg = make_raster_bg(device, &self.shape_bgl, &frame, bufs);
         LayerTexture {
             view,
             uniform,
@@ -514,12 +514,7 @@ impl LayerResources {
     /// of `sizes[i]` (physical px). Slots whose size already matches are
     /// reused (no realloc, signature preserved); resized slots are rebuilt
     /// and their signature invalidated. Always at least one slot.
-    pub fn ensure(
-        &mut self,
-        device: &wgpu::Device,
-        sizes: &[[u32; 2]],
-        instance_buffer: &wgpu::Buffer,
-    ) {
+    pub fn ensure(&mut self, device: &wgpu::Device, sizes: &[[u32; 2]], bufs: RasterBuffers<'_>) {
         let count = sizes.len().max(1);
         if self.textures.len() > count {
             self.textures.truncate(count);
@@ -531,11 +526,11 @@ impl LayerResources {
             match self.textures.get(i) {
                 Some(t) if t.size == want => {}
                 Some(_) => {
-                    self.textures[i] = self.make_texture(device, want, instance_buffer);
+                    self.textures[i] = self.make_texture(device, want, bufs);
                     self.sigs[i] = None;
                 }
                 None => {
-                    let t = self.make_texture(device, want, instance_buffer);
+                    let t = self.make_texture(device, want, bufs);
                     self.textures.push(t);
                     self.sigs.push(None);
                 }
@@ -556,9 +551,9 @@ impl LayerResources {
     /// Repoint every per-layer raster bind group at a freshly-grown
     /// instance buffer. Call from `set_instances` whenever the instance
     /// SSBO is reallocated.
-    pub fn rebuild_raster_bgs(&mut self, device: &wgpu::Device, instance_buffer: &wgpu::Buffer) {
+    pub fn rebuild_raster_bgs(&mut self, device: &wgpu::Device, bufs: RasterBuffers<'_>) {
         for t in &mut self.textures {
-            t.raster_bg = make_raster_bg(device, &self.shape_bgl, &t.frame, instance_buffer);
+            t.raster_bg = make_raster_bg(device, &self.shape_bgl, &t.frame, bufs);
         }
     }
 
@@ -640,12 +635,17 @@ impl LayerResources {
     /// (the window edge isn't the surface edge). `max_lod` is the backdrop
     /// pyramid max LOD (unused — scroll layers are glass-free — but kept
     /// correct for safety).
-    pub fn write_frame(&self, queue: &wgpu::Queue, i: usize, screen_size: [f32; 2], max_lod: f32) {
-        let u = FrameUniform {
-            screen_size,
-            max_backdrop_lod: max_lod,
-            window_corner_radius: 0.0,
-        };
+    pub fn write_frame(
+        &self,
+        queue: &wgpu::Queue,
+        i: usize,
+        screen_size: [f32; 2],
+        max_lod: f32,
+        globals: crate::gpu::effects::EffectGlobals,
+    ) {
+        // Same globals as the main pass — an effect inside a promoted
+        // layer animates on the same clock as one outside it.
+        let u = FrameUniform::new(screen_size, max_lod, 0.0, globals);
         queue.write_buffer(&self.textures[i].frame, 0, bytemuck::bytes_of(&u));
     }
 
@@ -761,11 +761,21 @@ impl LayerResources {
     }
 }
 
+/// The two storage buffers a shape-raster pass binds: the instance list
+/// and the shared effect-param arena. Passed as a pair so every layer
+/// entry point (`new`, `ensure`, `rebuild_raster_bgs`) stays in sync when
+/// either buffer is recreated.
+#[derive(Copy, Clone)]
+pub struct RasterBuffers<'a> {
+    pub instances: &'a wgpu::Buffer,
+    pub effect_params: &'a wgpu::Buffer,
+}
+
 fn make_raster_bg(
     device: &wgpu::Device,
     shape_bgl: &wgpu::BindGroupLayout,
     frame: &wgpu::Buffer,
-    instance_buffer: &wgpu::Buffer,
+    bufs: RasterBuffers<'_>,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("opal.layer raster bg"),
@@ -777,7 +787,11 @@ fn make_raster_bg(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: instance_buffer.as_entire_binding(),
+                resource: bufs.instances.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: bufs.effect_params.as_entire_binding(),
             },
         ],
     })

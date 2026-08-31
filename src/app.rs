@@ -215,6 +215,17 @@ pub struct App<S = ()> {
     /// in painter order (event-index ranges). Mapped to instance ranges
     /// and fed to the `LayerTree` in `flush_tree`.
     flat_spans: Vec<crate::node::LayerSpan>,
+    /// Effect params for the current frame — filled by flatten, uploaded
+    /// with the instance list (see `gpu::effects`).
+    effect_params: Vec<f32>,
+    /// Whether the last flatten emitted an animated effect — a stay-awake
+    /// source for the frame loop (see `node::FlattenOut`).
+    animated_effects: bool,
+    /// Start of the shader clock. `globals.time` is measured from here.
+    effect_epoch: Instant,
+    /// Audio levels the host publishes for the effect shaders (see
+    /// [`Self::set_audio_levels`]). Merged with the clock each frame.
+    audio_levels: (f32, [f32; crate::gpu::effects::BANDS]),
     /// Per-event instance-offset prefix from the last `expand_events_into`
     /// (`event_inst_start`). Reused across frames; maps `flat_spans`
     /// event ranges to instance ranges.
@@ -541,6 +552,10 @@ impl<S> App<S> {
             scroll_hits: Vec::new(),
             scroll_bars: Vec::new(),
             flat_spans: Vec::new(),
+            effect_params: Vec::new(),
+            animated_effects: false,
+            effect_epoch: Instant::now(),
+            audio_levels: (0.0, [0.0; crate::gpu::effects::BANDS]),
             flat_event_inst: Vec::new(),
             bar_drag: None,
             pending_drag_cursor: None,
@@ -956,14 +971,22 @@ impl<S> App<S> {
         }
         let layout_ms = t_layout.elapsed().as_secs_f32() * 1000.0;
         let t_flatten = Instant::now();
-        self.ctx.tree.flatten_into_buffers(
-            self.scale_factor,
-            &mut self.flat_events,
-            &mut self.hits,
-            &mut self.scroll_hits,
-            &mut self.scroll_bars,
-            &mut self.flat_spans,
-        );
+        let mut out = crate::node::FlattenOut {
+            events: &mut self.flat_events,
+            hits: &mut self.hits,
+            scroll_hits: &mut self.scroll_hits,
+            scroll_bars: &mut self.scroll_bars,
+            spans: &mut self.flat_spans,
+            effect_params: &mut self.effect_params,
+            animated_effects: false,
+        };
+        self.ctx
+            .tree
+            .flatten_into_buffers(self.scale_factor, &mut out);
+        let animated = out.animated_effects;
+        // Remembered for the loop's stay-awake check below; the flatten is
+        // the only pass that knows what's actually on screen.
+        self.animated_effects = animated;
         let flatten_ms = t_flatten.elapsed().as_secs_f32() * 1000.0;
         let t_expand = Instant::now();
         let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
@@ -977,7 +1000,12 @@ impl<S> App<S> {
                 self.scale_factor,
                 &mut self.flat_event_inst,
             );
-            gpu.set_instances(&self.instances, self.glass_count, backdrop_hint);
+            gpu.set_instances(
+                &self.instances,
+                &self.effect_params,
+                self.glass_count,
+                backdrop_hint,
+            );
         }
         let expand_ms = t_expand.elapsed().as_secs_f32() * 1000.0;
         if self.stats_log {
@@ -1219,6 +1247,7 @@ impl<S> App<S> {
         if self.hud_enabled {
             self.refresh_hud_overlay();
         }
+        self.publish_effect_globals();
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -1229,6 +1258,31 @@ impl<S> App<S> {
         self.last_render_stats = Some(snapshot);
         if self.stats_log {
             log::info!("frame stats: {snapshot:?}");
+        }
+    }
+
+    /// Publish the audio the effect shaders react to: a broadband level
+    /// and per-band energies, each 0..1, low band first. Call it as often
+    /// as new analysis lands — it only stores; the values reach the GPU
+    /// with the next frame. Leave it unset (or publish zeros) and effects
+    /// simply run on the clock.
+    pub fn set_audio_levels(&mut self, level: f32, bands: [f32; crate::gpu::effects::BANDS]) {
+        self.audio_levels = (level.clamp(0.0, 1.0), bands.map(|b| b.clamp(0.0, 1.0)));
+    }
+
+    /// Push the shader clock + the latest audio into the GPU's frame
+    /// uniform. Wraps the clock every a bit over an hour so `f32` keeps
+    /// its sub-millisecond precision in a long session; effects use it
+    /// through `sin`/`cos`, so the wrap is invisible.
+    fn publish_effect_globals(&mut self) {
+        let time = self.effect_epoch.elapsed().as_secs_f32() % 4096.0;
+        let (audio_level, audio_bands) = self.audio_levels;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_effect_globals(crate::gpu::EffectGlobals {
+                time,
+                audio_level,
+                audio_bands,
+            });
         }
     }
 
@@ -3979,13 +4033,18 @@ impl<'a> HeadlessHelper<'a> {
             );
         }
         let mut spans = Vec::new();
+        let mut effect_params = Vec::new();
         self.ctx.tree.flatten_into_buffers(
             self.scale_factor,
-            self.flat_events,
-            self.hits,
-            self.scroll_hits,
-            self.scroll_bars,
-            &mut spans,
+            &mut crate::node::FlattenOut {
+                events: self.flat_events,
+                hits: self.hits,
+                scroll_hits: self.scroll_hits,
+                scroll_bars: self.scroll_bars,
+                spans: &mut spans,
+                effect_params: &mut effect_params,
+                animated_effects: false,
+            },
         );
         self.instances.clear();
         let mut event_inst = Vec::new();
@@ -3998,8 +4057,12 @@ impl<'a> HeadlessHelper<'a> {
             &mut event_inst,
         );
         let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
-        self.gpu
-            .set_instances(self.instances, *self.glass_count, backdrop_hint);
+        self.gpu.set_instances(
+            self.instances,
+            &effect_params,
+            *self.glass_count,
+            backdrop_hint,
+        );
         // Drive the renderer's layer tree from the promoted spans so
         // headless captures exercise the same raster/composite path as
         // the live app. No promotions → single root layer.
@@ -5220,7 +5283,11 @@ impl<S> ApplicationHandler for App<S> {
         // toggle (if due) and yields the next toggle deadline so the loop
         // wakes for it; a focused field therefore keeps the loop alive.
         let (caret_blinked, caret_deadline) = self.tick_caret_blink(now);
+        // An animated effect moves on the shader clock, so nothing in the
+        // tree asks for the next frame — the flatten's answer does.
+        let effects_animating = self.animated_effects;
         if !timeline_active
+            && !effects_animating
             && !scroll_active
             && !drag_moved
             && !hover_moved
@@ -5335,6 +5402,15 @@ impl<S> ApplicationHandler for App<S> {
                 self.arm_hover_recheck();
             }
         }
+        // An animated effect changes nothing in the tree — only the shader
+        // clock moves — so it never trips the flush above. Repaint it
+        // directly and schedule the next frame.
+        let effect_deadline = if effects_animating {
+            self.request_redraw();
+            Some(now + self.timeline.tick_interval())
+        } else {
+            None
+        };
         let next_scroll_deadline = if self.ctx.tree.has_active_scrolls() || self.bar_drag.is_some()
         {
             Some(now + std::time::Duration::from_millis(16))
@@ -5354,55 +5430,23 @@ impl<S> ApplicationHandler for App<S> {
         } else {
             res.next_deadline
         };
-        let combined = match (timeline_deadline, next_scroll_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        let combined = match (combined, dwell_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        // Wake by the hover-recheck deadline (content changed under a still
-        // cursor) so the debounced re-derive lands even when otherwise idle.
-        let combined = match (combined, self.next_hover_recheck) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        // Make sure the loop wakes by the deferred-capture deadline so
-        // we don't park indefinitely while waiting to snap.
-        let combined = match (combined, self.capture_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        // Merge the scripted-input driver's next wake (REMOVABLE).
-        let combined = match (combined, auto_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        // Wake for the next caret-blink toggle while a field is focused.
-        let combined = match (combined, caret_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        // Wake for the next marquee step (a pan frame or a hold expiry).
-        let combined = match (combined, marquee_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
+        // Next wake = the soonest of every pending deadline. One list, so
+        // a new source (an animated effect, the scripted-input driver, …)
+        // joins by adding an entry rather than another merge arm.
+        let combined = [
+            timeline_deadline,
+            next_scroll_deadline,
+            dwell_deadline,
+            self.next_hover_recheck,
+            self.capture_deadline,
+            auto_deadline,
+            caret_deadline,
+            marquee_deadline,
+            effect_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         match combined {
             Some(deadline) => {
                 let dt = deadline.saturating_duration_since(Instant::now());

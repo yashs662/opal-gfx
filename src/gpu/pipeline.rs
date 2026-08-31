@@ -28,9 +28,14 @@ impl ShapePipeline {
         glyph_bgl: &wgpu::BindGroupLayout,
         image_bgl: &wgpu::BindGroupLayout,
     ) -> Self {
+        // The shape shader is assembled from `shape.wgsl` plus every
+        // registered effect (bodies + generated dispatch) — see
+        // `gpu::effects`.
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("opal.shape shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shape.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                super::effects::compose_shader(include_str!("shaders/shape.wgsl")).into(),
+            ),
         });
 
         let shape_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -57,6 +62,18 @@ impl ShapePipeline {
                         min_binding_size: wgpu::BufferSize::new(
                             std::mem::size_of::<ShapeInstance>() as u64,
                         ),
+                    },
+                    count: None,
+                },
+                // Effect params (see `gpu::effects`): one flat arena
+                // shared by every effect node in the frame.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(4),
                     },
                     count: None,
                 },
@@ -173,11 +190,12 @@ impl ShapePipeline {
 
         let frame_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("opal.frame ubo"),
-            contents: bytemuck::bytes_of(&FrameUniform {
-                screen_size: [1.0, 1.0],
-                max_backdrop_lod: 0.0,
-                window_corner_radius: 0.0,
-            }),
+            contents: bytemuck::bytes_of(&FrameUniform::new(
+                [1.0, 1.0],
+                0.0,
+                0.0,
+                Default::default(),
+            )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 

@@ -9,21 +9,19 @@ use bytemuck::{Pod, Zeroable};
 ///   [`crate::node::BorderSides::ALL`]).
 /// Other bits reserved.
 pub const SHAPE_KIND_MASK: u32 = 0xFF;
+/// `shape_kind` bit 12: this instance is an **animated** effect — it
+/// repaints from `globals.time`/audio, not from anything in the tree.
+/// Layer rasters key on content, so a layer holding one of these must
+/// re-raster every frame or the animation freezes in its cached texture.
+pub const SHAPE_FLAG_ANIMATED: u32 = 1 << 12;
 pub const SHAPE_KIND_RECT: u32 = 0;
 pub const SHAPE_KIND_GLASS: u32 = 1;
-/// Procedural **effect** shape: a single quad whose fragment shader runs a
-/// custom effect selected by [`ShapeInstance::effect_id`], reading generic
-/// float params packed into the otherwise-unused visual fields
-/// (`border_color`/`shadow_color`/`border_radius`/`backdrop_uv_rect` = up to
-/// 16 floats). The scaffold for bespoke shader effects (the first is the EQ
-/// response curve); add an effect by adding a shader case + an id.
+/// Procedural **effect** shape: a single quad painted by one of the
+/// shaders registered in [`crate::gpu::effects`], selected by
+/// [`ShapeInstance::effect_id`] and fed from the shared param arena. The
+/// node's own border, shadow and corner radius stay available — params
+/// live in their own buffer, not in the visual fields.
 pub const SHAPE_KIND_EFFECT: u32 = 4;
-
-/// Effect ids for [`SHAPE_KIND_EFFECT`] (mirror `shape.wgsl`).
-/// Filled, anti-aliased area under a curve through N control points
-/// (y in [0,1] from the bottom); `roughness` carries N, the 16 param
-/// floats carry the points. Used by the equaliser response graph.
-pub const EFFECT_CURVE: f32 = 0.0;
 /// Glyph blit: samples the `R8Unorm` glyph atlas at
 /// `backdrop_uv_rect` (repurposed as atlas `(u0, v0, w, h)`),
 /// multiplied by `color`. Shadows/borders disabled; `position`+`size`
@@ -52,12 +50,11 @@ pub(crate) fn first_glass_index(instances: &[ShapeInstance]) -> u32 {
 }
 
 /// GPU shape instance. Layout must match `ShapeInstance` in `shape.wgsl`.
-/// std430-compatible. **176 bytes, 16-aligned.** WGSL
-/// `array<ShapeInstance>` stride = roundUp(16, last_offset + last_size).
-/// With `effect_id: f32` at offset 168 (size 4), stride rounds to 176.
-/// The Rust struct must equal that stride — the trailing `_pad: f32`
-/// closes the gap. Without it the stride-vs-size mismatch would corrupt
-/// per-instance reads (M2 landmine).
+/// std430-compatible. **192 bytes, 16-aligned.** WGSL
+/// `array<ShapeInstance>` stride = roundUp(16, last_offset + last_size);
+/// the effect fields end at 180, so the stride rounds to 192 and the
+/// trailing pad floats close the gap. Without them the stride-vs-size
+/// mismatch would corrupt per-instance reads (M2 landmine).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct ShapeInstance {
@@ -101,11 +98,15 @@ pub struct ShapeInstance {
     /// shader rescales SDF coords so border + radius scale together.
     /// Layout + hit-test are unaffected (style-level transform only).
     pub scale: [f32; 2],
-    /// [`SHAPE_KIND_EFFECT`]-only: which effect the fragment shader runs
-    /// (e.g. [`EFFECT_CURVE`]). Ignored by other kinds.
-    pub effect_id: f32,
-    /// Closes the struct to the 176-byte WGSL array stride.
-    pub _pad: f32,
+    /// [`SHAPE_KIND_EFFECT`]-only: which registered effect the fragment
+    /// shader runs ([`crate::gpu::effects::EffectId`]). Ignored otherwise.
+    pub effect_id: u32,
+    /// [`SHAPE_KIND_EFFECT`]-only: this instance's slice of the shared
+    /// effect-param arena.
+    pub effect_param_offset: u32,
+    pub effect_param_len: u32,
+    /// Closes the struct to the 192-byte WGSL array stride.
+    pub _pad: [f32; 3],
 }
 
 #[cfg(test)]
@@ -147,7 +148,7 @@ mod tests {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<ShapeInstance>() == 176);
+const _: () = assert!(std::mem::size_of::<ShapeInstance>() == 192);
 
 impl Default for ShapeInstance {
     fn default() -> Self {
@@ -169,8 +170,10 @@ impl Default for ShapeInstance {
             shadow_opacity: 0.0,
             opacity: 1.0,
             scale: [1.0, 1.0],
-            effect_id: 0.0,
-            _pad: 0.0,
+            effect_id: 0,
+            effect_param_offset: 0,
+            effect_param_len: 0,
+            _pad: [0.0; 3],
         }
     }
 }
@@ -202,4 +205,37 @@ pub struct FrameUniform {
     /// this corner radius — gives the whole window rounded corners
     /// without an extra render pass.
     pub window_corner_radius: f32,
+    /// Seconds since the app started (wrapped), the clock every effect
+    /// animates on. Engine-owned; see [`crate::gpu::effects`].
+    pub time: f32,
+    /// Broadband level of the audio the host publishes, 0..1.
+    pub audio_level: f32,
+    pub _pad: [f32; 2],
+    /// Per-band audio energy (low → high), 0..1. Uniform arrays of
+    /// scalars stride to 16 bytes, so the shader reads these as two
+    /// `vec4`s — the byte layout is the same.
+    pub audio_bands: [f32; crate::gpu::effects::BANDS],
+}
+
+impl FrameUniform {
+    /// The frame's fixed geometry plus the live effect globals — the one
+    /// place that maps [`EffectGlobals`] into the uniform, so every
+    /// upload site (surface resize, corner-radius change, per-layer
+    /// raster) carries the same clock and audio.
+    pub fn new(
+        screen_size: [f32; 2],
+        max_backdrop_lod: f32,
+        window_corner_radius: f32,
+        globals: crate::gpu::effects::EffectGlobals,
+    ) -> Self {
+        Self {
+            screen_size,
+            max_backdrop_lod,
+            window_corner_radius,
+            time: globals.time,
+            audio_level: globals.audio_level,
+            _pad: [0.0; 2],
+            audio_bands: globals.audio_bands,
+        }
+    }
 }

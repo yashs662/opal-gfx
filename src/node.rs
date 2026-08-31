@@ -575,8 +575,13 @@ impl NodeInteract {
 /// differently.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NodeEffect {
-    pub id: f32,
+    pub id: crate::gpu::EffectId,
     pub data: Vec<f32>,
+    /// This effect animates on `globals.time` (or the audio), so the
+    /// frame loop must keep rendering while it is on screen. Static
+    /// effects (the EQ curve, which only moves when its params do) leave
+    /// this false and cost nothing when idle.
+    pub animated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1642,6 +1647,38 @@ impl Default for NodeTree {
     }
 }
 
+/// The buffers one flatten fills. Grouped into a single out-parameter so
+/// the recursive walk carries one reference instead of six — and so a new
+/// output (the effect-param arena) doesn't widen every call site.
+pub struct FlattenOut<'a> {
+    pub events: &'a mut Vec<FlatEvent>,
+    pub hits: &'a mut Vec<HitEntry>,
+    pub scroll_hits: &'a mut Vec<ScrollHit>,
+    pub scroll_bars: &'a mut Vec<ScrollbarHit>,
+    pub spans: &'a mut Vec<LayerSpan>,
+    /// Flat arena of every effect node's params; instances index into it.
+    pub effect_params: &'a mut Vec<f32>,
+    /// Set by the walk when it emits an **animated** effect
+    /// ([`crate::scene::NodeBuilderRef::effect_animated`]). The frame loop
+    /// reads it as a stay-awake source: an effect that moves on the shader
+    /// clock needs frames to keep coming, and nothing else in the tree
+    /// changes to ask for them.
+    pub animated_effects: bool,
+}
+
+impl FlattenOut<'_> {
+    /// Empty every buffer, keeping the allocations for the next frame.
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.hits.clear();
+        self.scroll_hits.clear();
+        self.scroll_bars.clear();
+        self.spans.clear();
+        self.effect_params.clear();
+        self.animated_effects = false;
+    }
+}
+
 impl NodeTree {
     pub fn new() -> Self {
         Self::default()
@@ -2650,6 +2687,27 @@ impl NodeTree {
     /// curve's control points) without a scene rebuild — the reactive
     /// `effect_data` bind calls this each frame the source changes.
     /// Flags `VISUAL` (re-flatten, no re-layout).
+    /// Turn a node into an effect quad: which registered effect it runs,
+    /// its params, and whether it animates on the shader clock. The scene
+    /// builders route through this, and so do tests.
+    pub fn set_effect(
+        &mut self,
+        id: NodeId,
+        effect: crate::gpu::EffectId,
+        data: Vec<f32>,
+        animated: bool,
+    ) {
+        if let Some(n) = self.get_mut_raw(id) {
+            n.style.kind = ShapeKind::Effect;
+            n.effect = Some(NodeEffect {
+                id: effect,
+                data,
+                animated,
+            });
+            self.dirty |= dirty::VISUAL;
+        }
+    }
+
     pub fn set_effect_data(&mut self, id: NodeId, data: Vec<f32>) {
         if let Some(n) = self.get_mut_raw(id)
             && let Some(e) = n.effect.as_mut()
@@ -2942,13 +3000,18 @@ impl NodeTree {
         let mut scroll_hits = Vec::new();
         let mut scroll_bars = Vec::new();
         let mut spans = Vec::new();
+        let mut effect_params = Vec::new();
         self.flatten_into_buffers(
             scale,
-            &mut events,
-            &mut hits,
-            &mut scroll_hits,
-            &mut scroll_bars,
-            &mut spans,
+            &mut FlattenOut {
+                events: &mut events,
+                hits: &mut hits,
+                scroll_hits: &mut scroll_hits,
+                scroll_bars: &mut scroll_bars,
+                spans: &mut spans,
+                effect_params: &mut effect_params,
+                animated_effects: false,
+            },
         );
         (events, hits, scroll_hits, scroll_bars)
     }
@@ -2959,20 +3022,8 @@ impl NodeTree {
     /// frames (a steady-state scene reuses the same heap blocks every
     /// flatten — saves ~5–20µs of allocator churn per frame). Hits are
     /// reversed at the end so the cache reads topmost-first as usual.
-    pub fn flatten_into_buffers(
-        &self,
-        scale: f32,
-        events: &mut Vec<FlatEvent>,
-        hits: &mut Vec<HitEntry>,
-        scroll_hits: &mut Vec<ScrollHit>,
-        scroll_bars: &mut Vec<ScrollbarHit>,
-        spans: &mut Vec<LayerSpan>,
-    ) {
-        events.clear();
-        hits.clear();
-        scroll_hits.clear();
-        scroll_bars.clear();
-        spans.clear();
+    pub fn flatten_into_buffers(&self, scale: f32, out: &mut FlattenOut<'_>) {
+        out.clear();
         let mut scroll_stack: Vec<NodeId> = Vec::new();
         // A drag-follow node is skipped in its normal tree slot (leaving
         // a hole) and re-emitted last below so it paints on top.
@@ -2988,11 +3039,7 @@ impl NodeTree {
                 [0.0; 2],
                 skip,
                 &mut scroll_stack,
-                events,
-                hits,
-                scroll_hits,
-                scroll_bars,
-                spans,
+                out,
                 false,
                 scale,
             );
@@ -3018,17 +3065,21 @@ impl NodeTree {
                 [-dx, -dy],
                 None,
                 &mut scroll_stack,
-                events,
-                &mut throwaway_hits,
-                &mut throwaway_scroll,
-                &mut throwaway_bars,
-                &mut throwaway_spans,
+                &mut FlattenOut {
+                    events: out.events,
+                    hits: &mut throwaway_hits,
+                    scroll_hits: &mut throwaway_scroll,
+                    scroll_bars: &mut throwaway_bars,
+                    spans: &mut throwaway_spans,
+                    effect_params: out.effect_params,
+                    animated_effects: false,
+                },
                 // Suppress promotion in the transient drag ghost.
                 true,
                 scale,
             );
         }
-        hits.reverse();
+        out.hits.reverse();
     }
 
     #[cfg(test)]
@@ -3059,11 +3110,7 @@ impl NodeTree {
         hit_offset: [f32; 2],
         skip: Option<NodeId>,
         scroll_stack: &mut Vec<NodeId>,
-        events: &mut Vec<FlatEvent>,
-        hits: &mut Vec<HitEntry>,
-        scroll_hits: &mut Vec<ScrollHit>,
-        scroll_bars: &mut Vec<ScrollbarHit>,
-        spans: &mut Vec<LayerSpan>,
+        out: &mut FlattenOut<'_>,
         in_layer: bool,
         scale: f32,
     ) {
@@ -3089,7 +3136,7 @@ impl NodeTree {
         // layer at screen coords. So the layer span covers the *children*
         // sub-range, not the whole subtree.
         let is_scroll_layer = promote && node.scroll.is_some() && node.layout.scrolls();
-        let span_start = events.len();
+        let span_start = out.events.len();
         let child_in_layer = in_layer || node.wants_layer();
         let rect = node.rect;
         // Visual position (→ instances / layer texture). Inside a scroll
@@ -3144,7 +3191,7 @@ impl NodeTree {
                         (abs[0] + size[0]).round() - x0,
                         (abs[1] + size[1]).round() - y0,
                     ];
-                    events.push(FlatEvent::Shape(ShapeInstance {
+                    out.events.push(FlatEvent::Shape(ShapeInstance {
                         color: node.style.color,
                         border_color: node.style.border_color,
                         shadow_color: node.style.shadow_color,
@@ -3163,8 +3210,10 @@ impl NodeTree {
                         opacity,
                         scale: node.style.scale,
                         clip_radius,
-                        effect_id: 0.0,
-                        _pad: 0.0,
+                        effect_id: 0,
+                        effect_param_offset: 0,
+                        effect_param_len: 0,
+                        _pad: [0.0; 3],
                     }));
                 }
             }
@@ -3184,7 +3233,7 @@ impl NodeTree {
                     } else {
                         t.max_width
                     };
-                    events.push(FlatEvent::Text(TextRef {
+                    out.events.push(FlatEvent::Text(TextRef {
                         position: abs,
                         color: node.style.color,
                         opacity,
@@ -3199,7 +3248,7 @@ impl NodeTree {
             }
             ShapeKind::Image => {
                 if let Some(handle) = node.image {
-                    events.push(FlatEvent::Image(ImageRef {
+                    out.events.push(FlatEvent::Image(ImageRef {
                         position: abs,
                         size,
                         color: node.style.color,
@@ -3215,7 +3264,7 @@ impl NodeTree {
                     // rounded fill *in this same node* (same rect + radius), so
                     // there's no separate layer behind the image to leak through
                     // its corner once the cover loads.
-                    events.push(FlatEvent::Shape(ShapeInstance {
+                    out.events.push(FlatEvent::Shape(ShapeInstance {
                         color: ph,
                         border_color: [0.0; 4],
                         shadow_color: [0.0; 4],
@@ -3234,41 +3283,48 @@ impl NodeTree {
                         opacity,
                         scale: node.style.scale,
                         clip_radius,
-                        effect_id: 0.0,
-                        _pad: 0.0,
+                        effect_id: 0,
+                        effect_param_offset: 0,
+                        effect_param_len: 0,
+                        _pad: [0.0; 3],
                     }));
                 }
             }
             ShapeKind::Effect => {
                 if let Some(e) = node.effect.as_ref() {
-                    // Pack up to 16 param floats into the unused visual
-                    // vec4s; the count rides `roughness`, the effect id
-                    // rides `effect_id`. The shader reads them back per
-                    // `effect_param`.
-                    let mut p = [0.0f32; 16];
-                    for (i, v) in e.data.iter().take(16).enumerate() {
-                        p[i] = *v;
-                    }
-                    events.push(FlatEvent::Shape(ShapeInstance {
+                    // Params go to the shared arena; the instance only
+                    // carries the slice bounds, which is what leaves the
+                    // visual fields (border/shadow/radius) usable here.
+                    let params_offset = out.effect_params.len() as u32;
+                    out.effect_params.extend_from_slice(&e.data);
+                    out.animated_effects |= e.animated;
+                    out.events.push(FlatEvent::Shape(ShapeInstance {
                         color: node.style.color,
-                        border_color: [p[0], p[1], p[2], p[3]],
-                        shadow_color: [p[4], p[5], p[6], p[7]],
-                        border_radius: [p[8], p[9], p[10], p[11]],
-                        backdrop_uv_rect: [p[12], p[13], p[14], p[15]],
+                        border_color: node.style.border_color,
+                        shadow_color: node.style.shadow_color,
+                        border_radius: node.style.border_radius,
+                        backdrop_uv_rect: [0.0; 4],
                         clip_rect: clip,
                         position: abs,
                         size,
                         shadow_offset: [0.0; 2],
-                        shape_kind: ShapeKind::Effect.as_u32(),
-                        roughness: e.data.len().min(16) as f32,
+                        shape_kind: ShapeKind::Effect.as_u32()
+                            | if e.animated {
+                                crate::gpu::instance::SHAPE_FLAG_ANIMATED
+                            } else {
+                                0
+                            },
+                        roughness: 0.0,
                         border_width: 0.0,
                         shadow_blur: 0.0,
                         shadow_opacity: 0.0,
                         opacity,
                         scale: [1.0, 1.0],
                         clip_radius,
-                        effect_id: e.id,
-                        _pad: 0.0,
+                        effect_id: e.id.0,
+                        effect_param_offset: params_offset,
+                        effect_param_len: e.data.len() as u32,
+                        _pad: [0.0; 3],
                     }));
                 }
             }
@@ -3288,7 +3344,7 @@ impl NodeTree {
             || node.drag_follow
             || node.cursor.is_some()
         {
-            hits.push(HitEntry {
+            out.hits.push(HitEntry {
                 node_id: id,
                 bounds: [
                     hit_abs[0],
@@ -3307,7 +3363,7 @@ impl NodeTree {
             let mut chain = Vec::with_capacity(scroll_stack.len() + 1);
             chain.push(id);
             chain.extend(scroll_stack.iter().rev().copied());
-            scroll_hits.push(ScrollHit {
+            out.scroll_hits.push(ScrollHit {
                 node_id: id,
                 bounds: [
                     hit_abs[0],
@@ -3326,7 +3382,7 @@ impl NodeTree {
         // Mark where the children sub-range begins — a scroll layer's
         // span covers exactly the children (content), not the container
         // shape emitted above.
-        let children_start = events.len();
+        let children_start = out.events.len();
         // Children: intersect parent clip with this node's self-clip
         // (axis-aware — only narrow the axes that clip), then add this
         // node's scroll offset to the running offset.
@@ -3473,16 +3529,12 @@ impl NodeTree {
                 child_hit_offset,
                 skip,
                 scroll_stack,
-                events,
-                hits,
-                scroll_hits,
-                scroll_bars,
-                spans,
+                out,
                 child_in_layer,
                 scale,
             );
         }
-        let children_end = events.len();
+        let children_end = out.events.len();
         // Close the scroll-layer promotion span BEFORE emitting scrollbar
         // geometry: the promoted thumb (below) pushes its own span whose
         // event range sits *after* the children, and `LayerTree::rebuild`
@@ -3518,7 +3570,7 @@ impl NodeTree {
             // smears into a line. Vertical scrollers have `content_size.x
             // == viewport`, so this stays viewport-wide for them.
             let tex_w = node.content_size[0].max(size[0]);
-            spans.push(LayerSpan {
+            out.spans.push(LayerSpan {
                 node: id,
                 events: children_start..children_end,
                 scroll: Some(ScrollSpan {
@@ -3551,8 +3603,8 @@ impl NodeTree {
                 opacity,
                 clip,
                 scale,
-                events,
-                scroll_bars,
+                out.events,
+                out.scroll_bars,
                 // When the container is a scroll layer, promote the moving
                 // **thumb** to its own tiny composite layer: its texture is
                 // a static thumb rect (bytes stable across scroll) blitted
@@ -3560,7 +3612,7 @@ impl NodeTree {
                 // raster too — leaving the (static) track + chrome in the
                 // root segment to also skip → pure scroll = raster 0.
                 is_scroll_layer,
-                spans,
+                out.spans,
             );
         }
         if pushed_scroll {
@@ -3569,10 +3621,10 @@ impl NodeTree {
         // A plain force-promoted layer spans the whole subtree at absolute
         // coords — including any scrollbar chrome emitted just above, so
         // this closes *after* `emit_scrollbars`.
-        if !is_scroll_layer && promote && events.len() > span_start {
-            spans.push(LayerSpan {
+        if !is_scroll_layer && promote && out.events.len() > span_start {
+            out.spans.push(LayerSpan {
                 node: id,
-                events: span_start..events.len(),
+                events: span_start..out.events.len(),
                 scroll: None,
                 external: None,
                 edge_fade: node.edge_fade,
@@ -3587,7 +3639,7 @@ impl NodeTree {
         // `.layer()` promote path — an `.external()` node need not be
         // `.layer()`.
         if node.external {
-            spans.push(LayerSpan {
+            out.spans.push(LayerSpan {
                 node: id,
                 events: span_start..span_start,
                 scroll: None,
@@ -3784,8 +3836,10 @@ fn bar_quad(
         opacity: 1.0,
         scale: [1.0, 1.0],
         clip_radius: [0.0; 4],
-        effect_id: 0.0,
-        _pad: 0.0,
+        effect_id: 0,
+        effect_param_offset: 0,
+        effect_param_len: 0,
+        _pad: [0.0; 3],
     }));
 }
 
@@ -3844,8 +3898,10 @@ fn emit_scroll_thumb(
         opacity: 1.0,
         scale: [1.0, 1.0],
         clip_radius: [0.0; 4],
-        effect_id: 0.0,
-        _pad: 0.0,
+        effect_id: 0,
+        effect_param_offset: 0,
+        effect_param_len: 0,
+        _pad: [0.0; 3],
     }));
     spans.push(LayerSpan {
         node: node_id,
@@ -4439,6 +4495,70 @@ mod tests {
             d & dirty::BACKDROP == 0,
             "front-of-glass recolour must not re-run the blur"
         );
+    }
+
+    #[test]
+    fn effect_params_land_in_the_arena_and_animation_is_flagged() {
+        use crate::gpu::instance::SHAPE_FLAG_ANIMATED;
+        let mut tree = NodeTree::new();
+        let a = tree.add_root(
+            Node::rect()
+                .layout_width(Len::Px(10.0))
+                .layout_height(Len::Px(10.0))
+                .build(),
+        );
+        tree.set_effect(a, crate::gpu::EffectId(3), vec![0.25, 0.5, 0.75], true);
+        let b = tree.add_root(
+            Node::rect()
+                .layout_width(Len::Px(10.0))
+                .layout_height(Len::Px(10.0))
+                .build(),
+        );
+        tree.set_effect(b, crate::gpu::EFFECT_CURVE, vec![1.0], false);
+        crate::layout::compute_layout(
+            &mut tree,
+            [100.0, 100.0],
+            &mut crate::layout::NullMeasurer,
+            1.0,
+        );
+
+        let (mut events, mut hits, mut sh, mut sb, mut spans, mut params) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut out = FlattenOut {
+            events: &mut events,
+            hits: &mut hits,
+            scroll_hits: &mut sh,
+            scroll_bars: &mut sb,
+            spans: &mut spans,
+            effect_params: &mut params,
+            animated_effects: false,
+        };
+        tree.flatten_into_buffers(1.0, &mut out);
+        assert!(out.animated_effects, "an animated effect must be reported");
+
+        let insts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                FlatEvent::Shape(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(insts.len(), 2);
+        // Each effect's params are its own slice of one shared arena.
+        assert_eq!(insts[0].effect_param_offset, 0);
+        assert_eq!(insts[0].effect_param_len, 3);
+        assert_eq!(insts[1].effect_param_offset, 3);
+        assert_eq!(insts[1].effect_param_len, 1);
+        assert_eq!(params, vec![0.25, 0.5, 0.75, 1.0]);
+        // Only the animated one carries the re-raster flag.
+        assert_ne!(insts[0].shape_kind & SHAPE_FLAG_ANIMATED, 0);
+        assert_eq!(insts[1].shape_kind & SHAPE_FLAG_ANIMATED, 0);
     }
 
     #[test]

@@ -15,11 +15,10 @@ const SHAPE_KIND_RECT: u32  = 0u;
 const SHAPE_KIND_GLASS: u32 = 1u;
 const SHAPE_KIND_GLYPH: u32 = 2u;
 const SHAPE_KIND_IMAGE: u32 = 3u;
-// Procedural effect: a fragment shader selected by `effect_id`, reading
-// float params from the otherwise-unused visual fields. Scaffold for
-// bespoke shader effects — add one by adding a case in `effect_frag` + an id.
+// Procedural effect: the quad is painted by one of the registered effect
+// shaders (`gpu::effects`), selected by `effect_id` and fed params from
+// the shared arena. Bodies + dispatch are stitched in at pipeline build.
 const SHAPE_KIND_EFFECT: u32 = 4u;
-const EFFECT_CURVE: u32 = 0u;
 const SHAPE_KIND_MASK: u32  = 0xFFu;
 // Border-side bits stored in `shape_kind >> 8`. 0b1111 = all (default).
 const BORDER_SIDE_TOP: u32    = 0x1u;
@@ -58,8 +57,14 @@ struct ShapeInstance {
     /// purely a vertex/fragment-side transform), so hover-grow effects
     /// don't shift click boxes.
     scale: vec2<f32>,
-    effect_id: f32,
-    _pad: f32,
+    effect_id: u32,
+    /// SHAPE_KIND_EFFECT only: where this instance's params live in the
+    /// shared `effect_params` arena, and how many it has.
+    effect_param_offset: u32,
+    effect_param_len: u32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 // Signed distance to a rounded rect with min `lo`, max `hi`, per-corner
@@ -83,10 +88,24 @@ struct Frame {
     /// fragment by a rounded-rect SDF covering the whole surface so
     /// the corner pixels stay transparent.
     window_corner_radius: f32,
+    /// Seconds since the app started, wrapped to keep float precision.
+    /// The only clock effects need — a time-driven effect costs nothing
+    /// per frame on the CPU.
+    time: f32,
+    /// Broadband level of the audio the host is publishing, 0..1.
+    audio_level: f32,
+    _pad0: f32,
+    _pad1: f32,
+    /// Per-band audio energy, 0..1, low to high. Read with `fx_band`;
+    /// packed as vec4s because uniform arrays of scalars stride to 16.
+    audio_bands: array<vec4<f32>, 2>,
 }
 
-@group(0) @binding(0) var<uniform> frame: Frame;
+@group(0) @binding(0) var<uniform> globals: Frame;
 @group(0) @binding(1) var<storage, read> instances: array<ShapeInstance>;
+// Flat arena of every effect node's params, indexed per instance by
+// `effect_param_offset`/`effect_param_len`.
+@group(0) @binding(2) var<storage, read> effect_params: array<f32>;
 
 // Final-pass-only bindings. The opaque-pass pipeline layout omits group 1
 // so only fs_main references these.
@@ -151,8 +170,8 @@ fn vs_main(
 
     // Pixel -> clip-space. Y flipped so (0,0) is top-left.
     let ndc = vec2<f32>(
-        world_pos.x / frame.screen_size.x * 2.0 - 1.0,
-        1.0 - world_pos.y / frame.screen_size.y * 2.0,
+        world_pos.x / globals.screen_size.x * 2.0 - 1.0,
+        1.0 - world_pos.y / globals.screen_size.y * 2.0,
     );
 
     var out: VSOut;
@@ -333,72 +352,39 @@ fn compute_shadow(inst: ShapeInstance, px: vec2<f32>, center: vec2<f32>,
 }
 
 // --- Procedural effects (SHAPE_KIND_EFFECT) -----------------------------
-// Effect params are packed into the unused visual fields: up to 16 floats
-// across border_color/shadow_color/border_radius/backdrop_uv_rect.
+// One fragment shader per effect, each in its own file under
+// `shaders/effects/` and registered in `gpu::effects::EFFECTS`. The bodies
+// and the dispatch below are stitched in at pipeline build; see that
+// module for the authoring contract.
 
-fn effect_param(inst: ShapeInstance, i: u32) -> f32 {
-    if (i < 4u) { return inst.border_color[i]; }
-    if (i < 8u) { return inst.shadow_color[i - 4u]; }
-    if (i < 12u) { return inst.border_radius[i - 8u]; }
-    return inst.backdrop_uv_rect[i - 12u];
+/// Everything an effect is handed. Built once per fragment.
+struct EffectCtx {
+    /// Position within the quad: 0..1, x right, y down.
+    rel: vec2<f32>,
+    /// Position within the quad in physical px, and the quad's size.
+    px: vec2<f32>,
+    size: vec2<f32>,
+    /// The node's authored colour (sRGB; `srgb_to_linear` it to shade).
+    color: vec4<f32>,
+    /// This effect's slice of the shared param arena.
+    params_base: u32,
+    params_len: u32,
 }
 
-fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    return 0.5 * (2.0 * p1
-        + (-p0 + p2) * t
-        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+/// The effect's `i`-th param, or 0 past the end.
+fn fx_param(c: EffectCtx, i: u32) -> f32 {
+    if (i >= c.params_len) { return 0.0; }
+    return effect_params[c.params_base + i];
 }
 
-// Curve height (0..1 from the bottom) at `x` in [0,1]. `n` control points
-// sit at x = (i + 0.5)/n; a Catmull-Rom spline smooths between them and the
-// ends hold flat. Roughness carries `n`; the params carry the point ys.
-fn curve_height(inst: ShapeInstance, n: u32, x: f32) -> f32 {
-    if (n == 0u) { return 0.0; }
-    if (n == 1u) { return effect_param(inst, 0u); }
-    let fx = x * f32(n) - 0.5; // fractional control-point index
-    if (fx <= 0.0) { return effect_param(inst, 0u); }
-    if (fx >= f32(n - 1u)) { return effect_param(inst, n - 1u); }
-    let i = u32(floor(fx));
-    let t = fx - f32(i);
-    let i0 = select(i - 1u, 0u, i == 0u);
-    let i3 = min(i + 2u, n - 1u);
-    return clamp(catmull_rom(
-        effect_param(inst, i0),
-        effect_param(inst, i),
-        effect_param(inst, i + 1u),
-        effect_param(inst, i3),
-        t,
-    ), 0.0, 1.0);
+/// Audio energy in band `i` (0 = lowest), 0..1. Zero when the host
+/// publishes no audio, so effects degrade to time-only motion.
+fn fx_band(i: u32) -> f32 {
+    if (i >= 8u) { return 0.0; }
+    return globals.audio_bands[i / 4u][i % 4u];
 }
 
-// Premultiplied rgba for the EQ response curve: a translucent-`color` fill
-// under the spline, with a crisp full-alpha stroke on the curve itself,
-// both anti-aliased via screen-space derivatives. `rel` = fragment position
-// in the quad, (0,0) top-left .. (1,1) bottom-right.
-fn effect_curve_frag(inst: ShapeInstance, rel: vec2<f32>) -> vec4<f32> {
-    let n = u32(inst.roughness + 0.5);
-    let h = curve_height(inst, n, rel.x);
-    // Work in pixels within the quad so the stroke has a real px width.
-    let edge_y_px = (1.0 - h) * inst.size.y; // curve position from the top
-    let frag_y_px = rel.y * inst.size.y;
-    let d_vert = frag_y_px - edge_y_px; // + below the curve
-    // Perpendicular distance = vertical / sqrt(1 + slope²), so a steep part
-    // of the curve keeps the *same* line width instead of thinning. The
-    // slope is the curve's screen-space y-derivative (px-y per px-x).
-    let slope = dpdx(edge_y_px);
-    let inv_len = inverseSqrt(1.0 + slope * slope);
-    let d_perp = d_vert * inv_len;
-    // Fill below the curve (AA the boundary perpendicular to it).
-    let fill_cov = clamp(d_perp + 0.5, 0.0, 1.0);
-    // Even-width stroke centred on the curve (~1.5 px half-width + 1 px AA).
-    let stroke = 1.0 - smoothstep(1.5, 2.5, abs(d_perp));
-    let rgb_lin = srgb_to_linear(inst.color.rgb);
-    let a = max(inst.color.a * fill_cov, stroke);
-    return vec4<f32>(rgb_lin * a, a);
-}
+//__EFFECT_SNIPPETS__
 
 fn effect_frag(inst: ShapeInstance, px: vec2<f32>) -> vec4<f32> {
     let size = max(inst.size, vec2<f32>(1.0));
@@ -406,10 +392,16 @@ fn effect_frag(inst: ShapeInstance, px: vec2<f32>) -> vec4<f32> {
     if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
         return vec4<f32>(0.0);
     }
-    let eff = u32(inst.effect_id + 0.5);
-    if (eff == EFFECT_CURVE) {
-        return effect_curve_frag(inst, rel);
-    }
+    let c = EffectCtx(
+        rel,
+        px - inst.position,
+        size,
+        inst.color,
+        inst.effect_param_offset,
+        inst.effect_param_len,
+    );
+    let id = inst.effect_id;
+//__EFFECT_DISPATCH__
     return vec4<f32>(0.0);
 }
 
@@ -607,9 +599,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         // chosen mip depth — no visible box-pixel haloing at high blur.
         // hp scales with selected LOD so offsets cover ~one pixel of
         // the source mip at that level.
-        let inv_screen = 1.0 / frame.screen_size;
+        let inv_screen = 1.0 / globals.screen_size;
         var center_uv = sample_px * inv_screen;
-        let lod = clamp(log2(max(blur_px, 1.0)), 0.0, frame.max_backdrop_lod);
+        let lod = clamp(log2(max(blur_px, 1.0)), 0.0, globals.max_backdrop_lod);
         let hp = 0.5 * exp2(lod) * inv_screen;
         // Per-fragment scatter in physical px → frosted-glass texture.
         // Scale stays mip-independent (author asks for "N px of jitter"

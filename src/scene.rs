@@ -530,6 +530,29 @@ impl<'a> Scene<'a> {
         r
     }
 
+    /// The **now-playing** wave field: layered bands drifting on the
+    /// shader clock and swelling with the audio the host publishes,
+    /// tinted from this node's `color`. Sized and rounded like any other
+    /// node — put it behind a row and give it the row's radius.
+    ///
+    /// `seed` decorrelates instances (pass anything stable per row, e.g.
+    /// a hash of its uri) so two of them never move in lockstep;
+    /// `intensity` (0..1) is the master amount, so a caller can fade the
+    /// whole field with a signal-driven
+    /// [`effect_data_bind`](NodeBuilderRef::effect_data_bind).
+    pub fn now_playing_waves(
+        &mut self,
+        name: impl IntoNodeName,
+        seed: f32,
+        intensity: f32,
+    ) -> NodeBuilderRef<'_> {
+        let mut r = self.effect(name);
+        r.effect_id(crate::gpu::EFFECT_NOW_PLAYING);
+        r.effect_data(&[seed, intensity]);
+        r.effect_animated();
+        r
+    }
+
     /// Text child. Default size is `Len::Auto` on both axes — the
     /// layout pass resolves them from the shaped bounding box. Pass
     /// `()` for the name when no lookup is needed.
@@ -1064,13 +1087,28 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
-    /// Select which effect a [`Scene::effect`] node's shader runs. No-op on
+    /// Select which of the registered effects (see
+    /// [`crate::gpu::effects`]) this node's shader runs. No-op on
     /// non-effect nodes.
-    pub fn effect_id(&mut self, id: f32) -> &mut Self {
+    pub fn effect_id(&mut self, id: crate::gpu::EffectId) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
             && let Some(e) = n.effect.as_mut()
         {
             e.id = id;
+        }
+        self
+    }
+
+    /// Mark this effect as animating on the shader clock (or the audio),
+    /// so the frame loop keeps rendering while it is on screen — the one
+    /// thing a time-driven effect needs from the CPU. Leave it off for an
+    /// effect that only moves when its params do (the EQ curve), which
+    /// then costs nothing while idle. No-op on non-effect nodes.
+    pub fn effect_animated(&mut self) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
+            && let Some(e) = n.effect.as_mut()
+        {
+            e.animated = true;
         }
         self
     }
