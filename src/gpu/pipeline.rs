@@ -16,6 +16,8 @@ use super::instance::{FrameUniform, ShapeInstance};
 pub struct ShapePipeline {
     pub opaque_pipeline: wgpu::RenderPipeline,
     pub final_pipeline: wgpu::RenderPipeline,
+    /// Resets the bound scissor rect to transparent (damage rasters).
+    pub clear_pipeline: wgpu::RenderPipeline,
     pub shape_bgl: wgpu::BindGroupLayout,
     pub glass_bgl: wgpu::BindGroupLayout,
     pub frame_buffer: wgpu::Buffer,
@@ -188,6 +190,44 @@ impl ShapePipeline {
         let final_pipeline =
             make_pipeline("opal.shape.final", &final_layout, "fs_main", surface_format);
 
+        // Scissored clear (see `scissor_clear.wgsl`) — used by damage-rect
+        // layer rasters, which keep the rest of the cached texture.
+        let clear_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("opal.scissor-clear shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/scissor_clear.wgsl").into()),
+        });
+        let clear_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("opal.scissor-clear layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let clear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("opal.scissor-clear pipeline"),
+            layout: Some(&clear_layout),
+            vertex: wgpu::VertexState {
+                module: &clear_shader,
+                entry_point: Some("vs_clear"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &clear_shader,
+                entry_point: Some("fs_clear"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    // Layer raster textures carry the surface format.
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let frame_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("opal.frame ubo"),
             contents: bytemuck::bytes_of(&FrameUniform::new(
@@ -200,6 +240,7 @@ impl ShapePipeline {
         });
 
         Self {
+            clear_pipeline,
             opaque_pipeline,
             final_pipeline,
             shape_bgl,

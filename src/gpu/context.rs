@@ -753,6 +753,34 @@ impl GpuContext {
     /// raster-skip key: identical bytes ⇒ identical rasterized pixels ⇒
     /// reuse the cached texture. `has_glass` lets the caller force a
     /// re-raster when the backdrop pyramid changed (glass samples it).
+    /// The rect covering every **animated** instance in `range`, in the
+    /// layer's own raster space, clamped to its texture. `None` when the
+    /// layer holds none (or they're off-texture), which means there is
+    /// nothing to repaint.
+    fn animated_damage(&self, range: &std::ops::Range<u32>, bounds: [u32; 2]) -> Option<[u32; 4]> {
+        let start = (range.start as usize).min(self.prev_instances.len());
+        let end = (range.end as usize).min(self.prev_instances.len());
+        let mut min = [f32::MAX; 2];
+        let mut max = [f32::MIN; 2];
+        for inst in &self.prev_instances[start..end] {
+            if inst.shape_kind & super::instance::SHAPE_FLAG_ANIMATED == 0 {
+                continue;
+            }
+            min[0] = min[0].min(inst.position[0]);
+            min[1] = min[1].min(inst.position[1]);
+            max[0] = max[0].max(inst.position[0] + inst.size[0]);
+            max[1] = max[1].max(inst.position[1] + inst.size[1]);
+        }
+        if min[0] > max[0] {
+            return None;
+        }
+        let x = (min[0].floor().max(0.0) as u32).min(bounds[0]);
+        let y = (min[1].floor().max(0.0) as u32).min(bounds[1]);
+        let w = ((max[0].ceil().max(0.0) as u32).min(bounds[0])).saturating_sub(x);
+        let h = ((max[1].ceil().max(0.0) as u32).min(bounds[1])).saturating_sub(y);
+        (w > 0 && h > 0).then_some([x, y, w, h])
+    }
+
     /// Content hash of a layer's instance range, plus whether it holds
     /// glass, plus whether it holds an **animated** effect (which has to
     /// re-raster every frame — its pixels move with the clock, not with
@@ -1187,7 +1215,25 @@ impl GpuContext {
         ts_pair: Option<(u32, u32)>,
     ) -> bool {
         let (sig, _, animated) = self.layer_signature(&draw.instances);
-        if draw.instances.is_empty() || !self.layers.needs_raster(i, sig, force || animated) {
+        if draw.instances.is_empty() {
+            return false;
+        }
+        // Content changed (or the caller forced it) → a full raster.
+        // Otherwise an animated effect is the only reason to redraw, and
+        // its pixels are confined to its own rect: keep the rest of the
+        // texture and re-render just that band. A row-sized damage rect
+        // instead of a page-sized clear is the difference between a
+        // continuous animation costing a few percent of the GPU and
+        // costing a third of it.
+        let full = self.layers.needs_raster(i, sig, force);
+        let damage = if full {
+            None
+        } else if animated {
+            self.animated_damage(&draw.instances, self.layers.slot_size(i))
+        } else {
+            return false;
+        };
+        if !full && damage.is_none() {
             return false;
         }
         {
@@ -1206,7 +1252,12 @@ impl GpuContext {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        // A damage pass keeps what's already there and
+                        // repaints only the scissored band.
+                        load: match damage {
+                            Some(_) => wgpu::LoadOp::Load,
+                            None => wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1215,6 +1266,14 @@ impl GpuContext {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some([x, y, w, h]) = damage {
+                // Keep the cached texture, but reset the band we're about
+                // to repaint — otherwise each frame's effect blends over
+                // the last one and the colour builds up.
+                rpass.set_scissor_rect(x, y, w, h);
+                rpass.set_pipeline(&self.shape.clear_pipeline);
+                rpass.draw(0..3, 0..1);
+            }
             rpass.set_pipeline(&self.shape.final_pipeline);
             // Identity layers raster in absolute screen coords against the
             // global shape BG (frame = surface); scroll layers raster
@@ -1419,10 +1478,14 @@ impl GpuContext {
             // loop — e.g. a hover-state change in a glass-bearing layer made
             // the glass re-blur a pyramid containing the layer's own prior
             // output, darkening the backdrop a little more every toggle.
+            // NOT forced by an animated effect: one painted *in front of*
+            // the glass changes nothing the glass samples, and re-blurring
+            // the pyramid every frame for it is the most expensive thing
+            // the renderer can do.
             let glass_content_dirty = {
-                let (sig, _, animated) = self.layer_signature(&draws[glass_layer].instances);
+                let (sig, _, _) = self.layer_signature(&draws[glass_layer].instances);
                 !draws[glass_layer].instances.is_empty()
-                    && self.layers.needs_raster(glass_layer, sig, animated)
+                    && self.layers.needs_raster(glass_layer, sig, false)
             };
             let need = self.backdrop_dirty || any_below_changed || glass_content_dirty;
             if need {

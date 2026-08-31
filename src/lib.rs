@@ -98,8 +98,8 @@ pub use overlay::Overlay;
 pub use reactive::{AnimatedBind, Bind, Computed, DepTuple, ImageBind, Source, TextBind, animated};
 pub use scene::{
     BindRegistry, BlurBindSlot, ColorBindSlot, HeightPxBindSlot, ImageBindSlot, IntoNodeName,
-    NodeBuilderRef, PositionBindSlot, Scene, SceneCtx, SizeBindSlot, SubtreeRemoval, TextBindSlot,
-    WidthPctBindSlot, WidthPxBindSlot,
+    NodeBuilderRef, NowPlaying, PositionBindSlot, Scene, SceneCtx, SizeBindSlot, SubtreeRemoval,
+    TextBindSlot, WidthPctBindSlot, WidthPxBindSlot,
 };
 pub use signal::{Signal, TextSignal};
 pub use splash::{Splash, SplashBitmap, SplashConfig};

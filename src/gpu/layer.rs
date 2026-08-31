@@ -649,6 +649,12 @@ impl LayerResources {
         queue.write_buffer(&self.textures[i].frame, 0, bytemuck::bytes_of(&u));
     }
 
+    /// Size of slot `i`'s raster texture — the bound a scissor rect has
+    /// to stay inside.
+    pub fn slot_size(&self, i: usize) -> [u32; 2] {
+        self.textures.get(i).map(|t| t.size).unwrap_or([1, 1])
+    }
+
     /// Render-target view for layer `i` (the raster pass writes here).
     pub fn raster_view(&self, i: usize) -> &wgpu::TextureView {
         &self.textures[i].view

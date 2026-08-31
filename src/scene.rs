@@ -86,6 +86,11 @@ pub struct SceneCtx {
     /// physical reads like [`NodeTree::scroll_offset`] and logical layout
     /// units. Mirrors [`crate::event::EventCtx::scale`] for the frame path.
     pub scale: f32,
+    /// The effect clock (`globals.time`) as of this frame — the same
+    /// value the shaders read. A build stamps it into an effect's params
+    /// to start a time-driven envelope (fade in/out) that then runs
+    /// entirely on the GPU. Kept in sync by the app shell.
+    pub effect_time: f32,
     /// Marquee strips registered this build (see [`Scene::marquee`]) — the
     /// app shell's per-frame tick drives their auto-pan. Rebuilt with the
     /// scene; dead ids are skipped by the tick.
@@ -118,6 +123,7 @@ impl SceneCtx {
             names: HashMap::new(),
             binds: BindRegistry::default(),
             text: TextResources::new(),
+            effect_time: 0.0,
             scale: 1.0,
             marquees: Vec::new(),
             focus_request: None,
@@ -464,6 +470,23 @@ pub struct Scene<'a> {
     parent: Option<NodeId>,
 }
 
+/// How a [`Scene::now_playing_waves`] field is drawn.
+#[derive(Copy, Clone, Debug)]
+pub struct NowPlaying {
+    /// Decorrelates instances — anything stable per row (e.g. a hash of
+    /// its uri) — so two fields never move in lockstep.
+    pub seed: f32,
+    /// Master amount, 0..1.
+    pub intensity: f32,
+    /// Seconds since this field started fading in (or out). The shader
+    /// runs the envelope from there, so a rebuild mid-fade resumes it
+    /// instead of restarting.
+    pub elapsed: f32,
+    /// Fade *out* rather than in — the row that is no longer playing,
+    /// kept in the scene for the length of the handover.
+    pub leaving: bool,
+}
+
 impl<'a> Scene<'a> {
     pub fn root(ctx: &'a mut SceneCtx) -> Self {
         Self { ctx, parent: None }
@@ -535,20 +558,22 @@ impl<'a> Scene<'a> {
     /// tinted from this node's `color`. Sized and rounded like any other
     /// node — put it behind a row and give it the row's radius.
     ///
-    /// `seed` decorrelates instances (pass anything stable per row, e.g.
-    /// a hash of its uri) so two of them never move in lockstep;
-    /// `intensity` (0..1) is the master amount, so a caller can fade the
-    /// whole field with a signal-driven
-    /// [`effect_data_bind`](NodeBuilderRef::effect_data_bind).
+    /// See [`NowPlaying`] for the knobs, including the fade envelope —
+    /// which runs on the shader clock, so a field can fade *out* on a row
+    /// the scene is about to drop without anything pumping it.
     pub fn now_playing_waves(
         &mut self,
         name: impl IntoNodeName,
-        seed: f32,
-        intensity: f32,
+        f: NowPlaying,
     ) -> NodeBuilderRef<'_> {
+        // The envelope is stamped as a *start time* on the shader clock,
+        // not pumped from the CPU: a fade that costs nothing per frame and
+        // survives without a rebuild.
+        let dir = if f.leaving { -1.0 } else { 1.0 };
+        let start = self.ctx.effect_time - f.elapsed.max(0.0);
         let mut r = self.effect(name);
         r.effect_id(crate::gpu::EFFECT_NOW_PLAYING);
-        r.effect_data(&[seed, intensity]);
+        r.effect_data(&[f.seed, f.intensity, start, dir]);
         r.effect_animated();
         r
     }

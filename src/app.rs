@@ -82,6 +82,10 @@ const HOVER_RECHECK: Duration = Duration::from_millis(90);
 /// to bridge hold-still moments mid-drag, short enough to die out right
 /// after the interaction ends.
 const MODAL_PUMP: Duration = Duration::from_millis(200);
+/// Default repaint interval for animated effects — 60 Hz. Hosts can
+/// lower it with [`App::set_effect_frame_rate`].
+const DEFAULT_EFFECT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+
 /// Marquee pacing (see [`Scene::marquee`]): how long an overflowing strip
 /// rests at each end before panning.
 const MARQUEE_HOLD: Duration = Duration::from_millis(1400);
@@ -221,8 +225,21 @@ pub struct App<S = ()> {
     /// Whether the last flatten emitted an animated effect — a stay-awake
     /// source for the frame loop (see `node::FlattenOut`).
     animated_effects: bool,
+    /// The compositor told us the window is fully hidden. Animated
+    /// effects stop asking for frames until it comes back: painting an
+    /// animation nobody can see is pure waste, and it's the one case
+    /// where freezing it is invisible.
+    occluded: bool,
     /// Start of the shader clock. `globals.time` is measured from here.
     effect_epoch: Instant,
+    /// Frame interval for animated effects (see
+    /// [`Self::set_effect_frame_rate`]) and the last frame they got. An
+    /// effect asks for frames every loop iteration otherwise, which is a
+    /// busy loop: winit re-enters `about_to_wait` right after servicing
+    /// the redraw, so the requested frame arrives long before the
+    /// deadline and requests another.
+    effect_frame_interval: Duration,
+    last_effect_frame: Option<Instant>,
     /// Audio levels the host publishes for the effect shaders (see
     /// [`Self::set_audio_levels`]). Merged with the clock each frame.
     audio_levels: (f32, [f32; crate::gpu::effects::BANDS]),
@@ -554,7 +571,10 @@ impl<S> App<S> {
             flat_spans: Vec::new(),
             effect_params: Vec::new(),
             animated_effects: false,
+            occluded: false,
             effect_epoch: Instant::now(),
+            effect_frame_interval: DEFAULT_EFFECT_FRAME_INTERVAL,
+            last_effect_frame: None,
             audio_levels: (0.0, [0.0; crate::gpu::effects::BANDS]),
             flat_event_inst: Vec::new(),
             bar_drag: None,
@@ -861,6 +881,14 @@ impl<S> App<S> {
     /// transparent winit surface. Automatically zeroed out while the
     /// window is maximised / fullscreen — rounding flush against the
     /// work-area boundary clips usable pixels for no visual gain.
+    /// Repaint rate for animated effects (default 60 Hz). Every effect
+    /// frame is a full recomposite of the window, so drifting motion is
+    /// worth pinning lower — see [`App::set_effect_frame_rate`].
+    pub fn effect_frame_rate(mut self, hz: u32) -> Self {
+        self.set_effect_frame_rate(hz);
+        self
+    }
+
     pub fn window_corner_radius(mut self, r: f32) -> Self {
         self.config.window_corner_radius = r.max(0.0);
         self
@@ -1261,6 +1289,14 @@ impl<S> App<S> {
         }
     }
 
+    /// Cap how often animated effects repaint (default 60 Hz). Motion
+    /// that drifts rather than snaps reads the same at 30 and costs half
+    /// as much — every frame is a full recomposite of the window.
+    /// Clamped to 1..=240 Hz.
+    pub fn set_effect_frame_rate(&mut self, hz: u32) {
+        self.effect_frame_interval = Duration::from_secs_f32(1.0 / hz.clamp(1, 240) as f32);
+    }
+
     /// Publish the audio the effect shaders react to: a broadband level
     /// and per-band energies, each 0..1, low band first. Call it as often
     /// as new analysis lands — it only stores; the values reach the GPU
@@ -1276,6 +1312,10 @@ impl<S> App<S> {
     /// through `sin`/`cos`, so the wrap is invisible.
     fn publish_effect_globals(&mut self) {
         let time = self.effect_epoch.elapsed().as_secs_f32() % 4096.0;
+        // Builds read this to stamp time-driven envelopes (see
+        // `Scene::now_playing_waves`), so it must be current before a
+        // rebuild as well as before a render.
+        self.ctx.effect_time = time;
         let (audio_level, audio_bands) = self.audio_levels;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_effect_globals(crate::gpu::EffectGlobals {
@@ -4564,6 +4604,7 @@ impl<S> ApplicationHandler for App<S> {
                 }
             }
             WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
                 if !occluded {
                     self.request_redraw();
                 }
@@ -5285,7 +5326,7 @@ impl<S> ApplicationHandler for App<S> {
         let (caret_blinked, caret_deadline) = self.tick_caret_blink(now);
         // An animated effect moves on the shader clock, so nothing in the
         // tree asks for the next frame — the flatten's answer does.
-        let effects_animating = self.animated_effects;
+        let effects_animating = self.animated_effects && !self.occluded;
         if !timeline_active
             && !effects_animating
             && !scroll_active
@@ -5406,9 +5447,19 @@ impl<S> ApplicationHandler for App<S> {
         // clock moves — so it never trips the flush above. Repaint it
         // directly and schedule the next frame.
         let effect_deadline = if effects_animating {
-            self.request_redraw();
-            Some(now + self.timeline.tick_interval())
+            let last = self
+                .last_effect_frame
+                .unwrap_or(now - self.effect_frame_interval);
+            let next = if now.duration_since(last) >= self.effect_frame_interval {
+                self.last_effect_frame = Some(now);
+                self.request_redraw();
+                now + self.effect_frame_interval
+            } else {
+                last + self.effect_frame_interval
+            };
+            Some(next)
         } else {
+            self.last_effect_frame = None;
             None
         };
         let next_scroll_deadline = if self.ctx.tree.has_active_scrolls() || self.bar_drag.is_some()
