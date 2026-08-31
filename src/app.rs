@@ -390,6 +390,15 @@ pub struct App<S = ()> {
     /// Last cursor icon we set on the window — avoid spamming
     /// `set_cursor` when the cursor stays in the same gutter.
     last_cursor_icon: CursorIcon,
+    /// Maximised state, tracked instead of queried: on macOS winit's
+    /// `is_maximized` (`NSWindow.isZoomed`) temporarily re-adds
+    /// `Titled|Resizable` to a borderless window's styleMask, which re-hosts
+    /// the content view — killing the in-flight click's tracking, so the
+    /// mouse-up (and every `on_click`) is never delivered. Only our own
+    /// [`WindowAction::ToggleMaximize`] can change it on a chrome-less
+    /// window, so the flag stays authoritative.
+    #[cfg(target_os = "macos")]
+    win_maximized: bool,
     /// Display DPI scale factor. Inputs to layout (`Len::Px`,
     /// padding, gap, `abs`, font sizes) and to ShapeInstance
     /// (border_radius, border_width, shadow_*) are in *logical* px
@@ -613,6 +622,8 @@ impl<S> App<S> {
             stats_log: std::env::var_os("OPAL_STATS").is_some(),
             hud_enabled: std::env::var_os("OPAL_HUD").is_some(),
             last_cursor_icon: CursorIcon::Default,
+            #[cfg(target_os = "macos")]
+            win_maximized: false,
             scale_factor: 1.0,
             logical_size: [width, height],
             last_dpi_change: None,
@@ -3131,13 +3142,26 @@ impl<S> App<S> {
         }
     }
 
+    /// Maximised state. macOS reads the tracked flag (see `win_maximized` —
+    /// querying winit there breaks click delivery); elsewhere the live winit
+    /// state, which the OS can change behind our back (e.g. Windows snap).
+    fn window_maximized(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.win_maximized
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.window.as_ref().map(|w| w.is_maximized()).unwrap_or(false)
+        }
+    }
+
     /// Resize gutter hit-test. Returns the direction whose gutter
     /// contains `(x, y)`, or `None` if the cursor is in the interior.
     /// Skipped entirely when the window is maximised — Windows refuses
     /// to start a resize drag in that state anyway.
     fn edge_at(&self, x: f32, y: f32) -> Option<ResizeDirection> {
-        let win = self.window.as_ref()?;
-        if win.is_maximized() {
+        if self.window.is_none() || self.window_maximized() {
             return None;
         }
         let g = self.gpu.as_ref()?;
@@ -3244,7 +3268,12 @@ impl<S> App<S> {
                 true
             }
             WindowAction::ToggleMaximize => {
-                win.set_maximized(!win.is_maximized());
+                let maximize = !self.window_maximized();
+                win.set_maximized(maximize);
+                #[cfg(target_os = "macos")]
+                {
+                    self.win_maximized = maximize;
+                }
                 true
             }
         }
@@ -4352,7 +4381,7 @@ impl<S> ApplicationHandler for App<S> {
         // Apply the configured window-corner radius — suppressed while
         // maximised so the radius doesn't clip against the work-area
         // edge. Toggle is re-evaluated on every resize below.
-        let initial_r = if window_arc.is_maximized() {
+        let initial_r = if self.window_maximized() {
             0.0
         } else {
             self.config.window_corner_radius
@@ -4485,15 +4514,16 @@ impl<S> ApplicationHandler for App<S> {
                 // on maximize/restore transitions on Windows + Linux,
                 // so this is the canonical hook to switch between
                 // "rounded floating window" and "square maximised".
-                if self.config.window_corner_radius > 0.0
-                    && let (Some(w), Some(g)) = (self.window.as_ref(), self.gpu.as_mut())
-                {
-                    let r = if w.is_maximized() {
+                if self.config.window_corner_radius > 0.0 && self.window.is_some() {
+                    let r = if self.window_maximized() {
                         0.0
                     } else {
                         self.config.window_corner_radius
                     };
-                    g.set_window_corner_radius(r, self.scale_factor);
+                    let scale = self.scale_factor;
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.set_window_corner_radius(r, scale);
+                    }
                 }
                 let in_dpi_window = self
                     .last_dpi_change
