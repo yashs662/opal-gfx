@@ -26,24 +26,17 @@ const FX_NP_FADE: f32 = 0.45;
 /// of washing toward the surface underneath.
 const FX_NP_SAT: f32 = 1.75;
 
-/// Cosine palette (Inigo Quilez) around the node's hue: the bands cycle
-/// through neighbours of the album accent rather than a fixed rainbow, so
-/// the effect always belongs to the artwork it sits under.
-fn fx_np_palette(base: vec3<f32>, t: f32) -> vec3<f32> {
-    let tint = 0.5 + 0.5 * cos(6.28318 * (t + vec3<f32>(0.0, 0.33, 0.67)));
-    let col = mix(base, base * 0.4 + tint * 0.9, 0.5);
-    let grey = dot(col, vec3<f32>(0.2126, 0.7152, 0.0722));
-    return max(mix(vec3<f32>(grey), col, FX_NP_SAT), vec3<f32>(0.0));
-}
+/// How far the band colours wander from the node's own hue.
+const FX_NP_SPREAD: f32 = 0.5;
+/// Soft dissolve at every edge, so the field ends in the row rather than
+/// on a rectangle.
+const FX_NP_INSET: f32 = 0.18;
 
 fn fx_now_playing(c: EffectCtx) -> vec4<f32> {
     let seed = fx_param(c, 0u);
     let intensity = select(1.0, fx_param(c, 1u), c.params_len > 1u);
-    // Envelope: 0 → 1 from `fade_start` (or 1 → 0 when fading out). Eased
-    // so it swells rather than ramps.
-    let raw = clamp((globals.time - fx_param(c, 2u)) / FX_NP_FADE, 0.0, 1.0);
-    let linear = select(raw, 1.0 - raw, fx_param(c, 3u) < 0.0);
-    let env = linear * linear * (3.0 - 2.0 * linear);
+    // Envelope: 0 → 1 from `fade_start`, or 1 → 0 when fading out.
+    let env = fx_env(fx_param(c, 2u), fx_param(c, 3u), FX_NP_FADE);
     if (env <= 0.001) {
         return vec4<f32>(0.0);
     }
@@ -53,7 +46,7 @@ fn fx_now_playing(c: EffectCtx) -> vec4<f32> {
     let t = globals.time + seed;
     // Low bands drive the swell, the broadband level the brightness —
     // silence (or no audio source) leaves a slow, steady drift.
-    let bass = fx_band(0u) * 0.6 + fx_band(1u) * 0.4;
+    let bass = fx_bass();
     let energy = globals.audio_level;
     let base = srgb_to_linear(c.color.rgb);
 
@@ -71,14 +64,12 @@ fn fx_now_playing(c: EffectCtx) -> vec4<f32> {
         // a fat gaussian reads as light.
         let thick = 0.19 + 0.10 * energy;
         let d = (y - wave) / thick;
-        acc = acc + fx_np_palette(base, 0.5 * x + layer - 0.08 * t) * exp(-d * d);
+        let tint = fx_palette(base, 0.5 * x + layer - 0.08 * t, FX_NP_SPREAD);
+        acc = acc + fx_vivid(tint, FX_NP_SAT) * exp(-d * d);
     }
     acc = acc / 4.0;
 
-    // Fade at every edge so the field dissolves into the row instead of
-    // ending on a hard rectangle.
-    let fade_x = smoothstep(0.0, 0.18, x) * smoothstep(0.0, 0.18, 1.0 - x);
-    let fade_y = smoothstep(0.0, 0.16, c.rel.y) * smoothstep(0.0, 0.16, 1.0 - c.rel.y);
-    let a = clamp(dot(acc, vec3<f32>(0.5)), 0.0, 1.0) * fade_x * fade_y * intensity * env * c.color.a;
-    return vec4<f32>(acc * a, a);
+    let fade = fx_edge_fade(c.rel, FX_NP_INSET);
+    let a = clamp(dot(acc, vec3<f32>(0.5)), 0.0, 1.0) * fade * intensity * env * c.color.a;
+    return fx_premul(acc, a);
 }

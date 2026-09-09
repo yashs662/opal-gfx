@@ -28,6 +28,12 @@ arboard = "3"
 # Startup splash (see src/splash.rs). Windows uses a layered window for
 # true per-pixel alpha via the Win32 API; other platforms present an
 # opaque panel via softbuffer.
+# Shader validation only (see `gpu::effects` tests): the same WGSL front
+# end wgpu compiles with, so a broken effect fails `cargo test` instead of
+# a user's window.
+[dev-dependencies]
+naga = { version = "29.0.1", features = ["wgsl-in"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
@@ -46,6 +52,10 @@ path = "examples/hello_window.rs"
 [[example]]
 name = "layering"
 path = "examples/layering.rs"
+
+[[example]]
+name = "text_effects"
+path = "examples/text_effects.rs"
 
 [[example]]
 name = "glass_grid"

@@ -12,7 +12,10 @@ pub mod window_round;
 
 pub use blur::{BACKDROP_FORMAT, BlurResources};
 pub use context::{GpuContext, MemoryReport};
-pub use effects::{EFFECT_CURVE, EFFECT_NOW_PLAYING, EffectGlobals, EffectId};
+pub use effects::{
+    EFFECT_CURVE, EFFECT_NOW_PLAYING, EffectGlobals, EffectId, TEXT_EFFECTS, TEXT_FX_KARAOKE,
+    TextFxId,
+};
 pub use glyph_atlas::{AtlasEntry, GlyphAtlas};
 pub use image_atlas::{ImageAtlas, ImageEntry, ImageHandle};
 pub use instance::{

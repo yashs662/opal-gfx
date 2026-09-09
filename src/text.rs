@@ -43,6 +43,11 @@ pub struct ShapedGlyph {
     pub cache_key: CacheKey,
     pub x: i32,
     pub y: i32,
+    /// Advance width in physical px — how far the pen moves past this
+    /// glyph. The glyph's own bitmap can be narrower (or wider); this is
+    /// the *typographic* extent, which is what a per-glyph effect needs
+    /// to place itself along the line.
+    pub advance: f32,
 }
 
 /// Result of rasterizing one glyph to an R8 coverage mask.
@@ -340,6 +345,7 @@ fn shape_uncached_width(
                 cache_key: phys.cache_key,
                 x: phys.x,
                 y: phys.y,
+                advance: g.w,
             });
         }
     }

@@ -62,9 +62,13 @@ struct ShapeInstance {
     /// shared `effect_params` arena, and how many it has.
     effect_param_offset: u32,
     effect_param_len: u32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    /// SHAPE_KIND_GLYPH + a text effect only: where this glyph sits in
+    /// its run — `glyph_along` is its centre as a fraction of the run's
+    /// advance width. Three scalars rather than a `vec3` on purpose: a
+    /// `vec3` aligns to 16 and would pad the struct past its stride.
+    glyph_along: f32,
+    glyph_index: f32,
+    glyph_count: f32,
 }
 
 // Signed distance to a rounded rect with min `lo`, max `hi`, per-corner
@@ -150,9 +154,20 @@ fn vs_main(
     // Per-shape scale is applied around the rect centre. Use max(1.0)
     // as the cover scale so scales < 1.0 still get the original quad
     // area (saves nothing to shrink coverage; the FS clips via SDF).
-    let center_px = inst.position + inst.size * 0.5;
+    var center_px = inst.position + inst.size * 0.5;
+    var quad_size = inst.size;
+    // A glyph running a text effect draws at the rect that effect puts it
+    // at — the fragment stage recomputes the same rect, so the quad and
+    // the atlas mapping cannot drift apart.
+    if (has_text_fx(inst)) {
+        let fx = text_fx_eval(inst.effect_id, text_fx_ctx(inst));
+        let rect = text_fx_rect(inst, fx);
+        // Cover the rotated glyph's bounds, not just its own size.
+        quad_size = 2.0 * text_fx_bounds(rect.zw, fx.rotation);
+        center_px = rect.xy + rect.zw * 0.5;
+    }
     let cover_scale = max(inst.scale, vec2<f32>(1.0));
-    let half_scaled = inst.size * 0.5 * cover_scale + shadow_pad;
+    let half_scaled = quad_size * 0.5 * cover_scale + shadow_pad;
     let min_px = center_px - half_scaled;
     let max_px = center_px + half_scaled;
 
@@ -386,6 +401,137 @@ fn fx_band(i: u32) -> f32 {
 
 //__EFFECT_SNIPPETS__
 
+// --- Per-glyph text effects (SHAPE_KIND_GLYPH) --------------------------
+//
+// One function per effect, evaluated for every glyph in BOTH stages: the
+// vertex stage places the (possibly moved and scaled) quad, the fragment
+// stage maps that same rect back into the atlas and shades it. Same
+// inputs, same result, so the stages agree without passing anything
+// between them — and a whole line can sweep, bounce or shimmer with
+// nothing driven per frame from the CPU.
+
+struct TextFxCtx {
+    /// This glyph's centre along its run, 0..1 — the axis a sweep runs on.
+    along: f32,
+    /// Its index in the run, and how many glyphs the run has: the handle
+    /// for staggering one glyph against the next.
+    index: f32,
+    count: f32,
+    /// The glyph quad's size in physical px.
+    size: vec2<f32>,
+    /// The text node's authored colour (sRGB) — what an effect modulates.
+    color: vec4<f32>,
+    params_base: u32,
+    params_len: u32,
+}
+
+/// What an effect does to one glyph: move it, resize and rotate it about
+/// its own centre, and give it a colour. A zero offset and rotation with
+/// `scale` 1 leaves the glyph exactly where the layout put it.
+struct TextFxOut {
+    offset: vec2<f32>,
+    scale: f32,
+    color: vec4<f32>,
+    /// Radians, clockwise on screen (y grows downward). Small angles read
+    /// as type being *pushed* by something; large ones as tumbling.
+    rotation: f32,
+}
+
+/// The effect's `i`-th param, or 0 past the end.
+fn tfx_param(c: TextFxCtx, i: u32) -> f32 {
+    if (i >= c.params_len) { return 0.0; }
+    return effect_params[c.params_base + i];
+}
+
+/// The untouched glyph — what an effect returns when it has nothing to
+/// say about this one (an inactive line, a finished animation).
+fn tfx_identity(c: TextFxCtx) -> TextFxOut {
+    return TextFxOut(vec2<f32>(0.0), 1.0, c.color, 0.0);
+}
+
+/// An effect's result with no rotation — the common case, and what keeps
+/// an effect that only moves and tints from having to name the field.
+fn tfx_out(offset: vec2<f32>, scale: f32, color: vec4<f32>) -> TextFxOut {
+    return TextFxOut(offset, scale, color, 0.0);
+}
+
+//__TEXTFX_SNIPPETS__
+
+fn text_fx_eval(id: u32, c: TextFxCtx) -> TextFxOut {
+//__TEXTFX_DISPATCH__
+    return tfx_identity(c);
+}
+
+/// Whether this instance is a glyph carrying a text effect.
+fn has_text_fx(inst: ShapeInstance) -> bool {
+    return (inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLYPH
+        && inst.effect_param_len > 0u;
+}
+
+fn text_fx_ctx(inst: ShapeInstance) -> TextFxCtx {
+    return TextFxCtx(
+        inst.glyph_along,
+        inst.glyph_index,
+        inst.glyph_count,
+        inst.size,
+        inst.color,
+        inst.effect_param_offset,
+        inst.effect_param_len,
+    );
+}
+
+/// The glyph's rect after its effect has moved and resized it, as
+/// `(position, size)`. Rotation is *not* folded in here: it happens about
+/// the rect's own centre, so both stages apply it separately — the vertex
+/// stage by growing the quad to the rotated bounds, the fragment stage by
+/// turning the sample point back.
+fn text_fx_rect(inst: ShapeInstance, fx: TextFxOut) -> vec4<f32> {
+    let size = inst.size * max(fx.scale, 0.0);
+    let center = inst.position + inst.size * 0.5 + fx.offset;
+    return vec4<f32>(center - size * 0.5, size);
+}
+
+/// Half-extent of the axis-aligned box a rotated `size` needs. The quad
+/// has to cover it or a tilted glyph would be clipped by its own corners.
+fn text_fx_bounds(size: vec2<f32>, rotation: f32) -> vec2<f32> {
+    let c = abs(cos(rotation));
+    let s = abs(sin(rotation));
+    return 0.5 * vec2<f32>(size.x * c + size.y * s, size.x * s + size.y * c);
+}
+
+/// Turn a point back into the glyph's own (unrotated) frame.
+fn text_fx_unrotate(p: vec2<f32>, rotation: f32) -> vec2<f32> {
+    let c = cos(rotation);
+    let s = sin(rotation);
+    return vec2<f32>(p.x * c + p.y * s, -p.x * s + p.y * c);
+}
+
+/// One glyph, shaded: sample the R8 atlas over the glyph's (possibly
+/// effect-moved) rect and tint it. Shared by both passes so text can
+/// enter the glass backdrop looking exactly as it does in front of it.
+fn glyph_frag(inst: ShapeInstance, px: vec2<f32>) -> vec4<f32> {
+    let fx = text_fx_eval(inst.effect_id, text_fx_ctx(inst));
+    let fxd = has_text_fx(inst);
+    // `backdrop_uv_rect` = (u0, v0, w, h) into the R8 glyph atlas.
+    let rect = select(vec4<f32>(inst.position, inst.size), text_fx_rect(inst, fx), fxd);
+    let color = select(inst.color, fx.color, fxd);
+    let size = max(rect.zw, vec2<f32>(1.0));
+    // Sample in the glyph's own frame: turn the point back about the
+    // rect's centre, then map it to the atlas as usual.
+    let centered = text_fx_unrotate(px - (rect.xy + size * 0.5), select(0.0, fx.rotation, fxd));
+    let rel = (centered + size * 0.5) / size;
+    // Fragments outside [0,1] (from any quad oversize) drop out.
+    if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
+        return vec4<f32>(-1.0);
+    }
+    let uv = inst.backdrop_uv_rect.xy + rel * inst.backdrop_uv_rect.zw;
+    let cov = textureSampleLevel(glyph_tex, glyph_samp, uv, 0.0).r;
+    let rgb_lin = srgb_to_linear(color.rgb);
+    let a = color.a * cov * inst.opacity;
+    return vec4<f32>(rgb_lin * a, a);
+}
+
+
 fn effect_frag(inst: ShapeInstance, px: vec2<f32>) -> vec4<f32> {
     let size = max(inst.size, vec2<f32>(1.0));
     let rel = (px - inst.position) / size;
@@ -430,16 +576,11 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
     }
 
     if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLYPH) {
-        let size = max(inst.size, vec2<f32>(1.0));
-        let rel = (px - inst.position) / size;
-        if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
+        let glyph = glyph_frag(inst, px);
+        if (glyph.a < 0.0) {
             discard;
         }
-        let uv = inst.backdrop_uv_rect.xy + rel * inst.backdrop_uv_rect.zw;
-        let cov = textureSampleLevel(glyph_tex, glyph_samp, uv, 0.0).r;
-        let rgb_lin = srgb_to_linear(inst.color.rgb);
-        let a = inst.color.a * cov * inst.opacity;
-        return vec4<f32>(rgb_lin * a, a);
+        return glyph;
     }
 
     if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_IMAGE) {
@@ -512,18 +653,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let win_cov = clip_cov;
 
     if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLYPH) {
-        // `backdrop_uv_rect` = (u0, v0, w, h) into the R8 glyph atlas.
-        let size = max(inst.size, vec2<f32>(1.0));
-        let rel = (px - inst.position) / size;
-        // Fragments outside [0,1] (from any quad oversize) drop out.
-        if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
+        let glyph = glyph_frag(inst, px);
+        // Negative alpha = outside the glyph's rect (see `glyph_frag`).
+        if (glyph.a < 0.0) {
             discard;
         }
-        let uv = inst.backdrop_uv_rect.xy + rel * inst.backdrop_uv_rect.zw;
-        let cov = textureSampleLevel(glyph_tex, glyph_samp, uv, 0.0).r;
-        let rgb_lin = srgb_to_linear(inst.color.rgb);
-        let a = inst.color.a * cov * inst.opacity;
-        return vec4<f32>(rgb_lin * a, a) * win_cov;
+        return glyph * win_cov;
     }
 
     if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_IMAGE) {

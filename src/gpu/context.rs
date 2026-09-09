@@ -758,6 +758,11 @@ impl GpuContext {
     /// layer holds none (or they're off-texture), which means there is
     /// nothing to repaint.
     fn animated_damage(&self, range: &std::ops::Range<u32>, bounds: [u32; 2]) -> Option<[u32; 4]> {
+        /// How far outside its own box a text effect may carry a glyph,
+        /// as a multiple of the glyph's size. Generous on purpose: the
+        /// cost is a slightly wider repaint band, and the cost of getting
+        /// it wrong is letters clipped mid-flight.
+        const TEXT_FX_TRAVEL: f32 = 1.5;
         let start = (range.start as usize).min(self.prev_instances.len());
         let end = (range.end as usize).min(self.prev_instances.len());
         let mut min = [f32::MAX; 2];
@@ -766,10 +771,20 @@ impl GpuContext {
             if inst.shape_kind & super::instance::SHAPE_FLAG_ANIMATED == 0 {
                 continue;
             }
-            min[0] = min[0].min(inst.position[0]);
-            min[1] = min[1].min(inst.position[1]);
-            max[0] = max[0].max(inst.position[0] + inst.size[0]);
-            max[1] = max[1].max(inst.position[1] + inst.size[1]);
+            // A text effect moves its glyph off the rect the layout gave
+            // it (it drops in, lifts on a beat, tips over), and the damage
+            // band has to cover wherever it can go or the travel would be
+            // scissored away. An effect quad paints inside its own rect,
+            // so it needs no margin.
+            let pad = if inst.shape_kind & SHAPE_KIND_MASK == SHAPE_KIND_GLYPH {
+                [inst.size[0] * TEXT_FX_TRAVEL, inst.size[1] * TEXT_FX_TRAVEL]
+            } else {
+                [0.0, 0.0]
+            };
+            min[0] = min[0].min(inst.position[0] - pad[0]);
+            min[1] = min[1].min(inst.position[1] - pad[1]);
+            max[0] = max[0].max(inst.position[0] + inst.size[0] + pad[0]);
+            max[1] = max[1].max(inst.position[1] + inst.size[1] + pad[1]);
         }
         if min[0] > max[0] {
             return None;
@@ -1035,7 +1050,20 @@ impl GpuContext {
                 }
                 (None, _) => text.shape(&r.content, r.font_size, r.line_height),
             };
-            for g in shaped {
+            // Where each glyph sits in the run, for the text effect:
+            // `along` is its centre as a fraction of the run's advance
+            // width, which is the axis a sweep or a stagger runs on. The
+            // run's width is its last glyph's edge, so a wrapped
+            // paragraph measures across the widest line — one axis for
+            // the whole node, which is what keeps a sweep continuous
+            // across a wrap.
+            let run_w = shaped
+                .iter()
+                .map(|g| g.x as f32 + g.advance)
+                .fold(0.0f32, f32::max)
+                .max(1.0);
+            let count = shaped.len() as f32;
+            for (i, g) in shaped.iter().enumerate() {
                 let Some(entry) = self
                     .glyph_atlas
                     .get_or_insert(&self.queue, text, g.cache_key)
@@ -1063,7 +1091,16 @@ impl GpuContext {
                     position: [px, py],
                     size: [entry.width as f32, entry.height as f32],
                     shadow_offset: [0.0; 2],
-                    shape_kind: SHAPE_KIND_GLYPH,
+                    // An animated text effect redraws on the clock, so its
+                    // glyphs are animated instances too — otherwise the
+                    // layer's cached raster would freeze the animation
+                    // mid-flight.
+                    shape_kind: SHAPE_KIND_GLYPH
+                        | if r.fx.animated {
+                            super::instance::SHAPE_FLAG_ANIMATED
+                        } else {
+                            0
+                        },
                     roughness: 0.0,
                     border_width: 0.0,
                     shadow_blur: 0.0,
@@ -1071,10 +1108,10 @@ impl GpuContext {
                     opacity: r.opacity,
                     scale: [1.0, 1.0],
                     clip_radius: [0.0; 4],
-                    effect_id: 0,
-                    effect_param_offset: 0,
-                    effect_param_len: 0,
-                    _pad: [0.0; 3],
+                    effect_id: r.fx.id.0,
+                    effect_param_offset: r.fx.param_offset,
+                    effect_param_len: r.fx.param_len,
+                    glyph_fx: [(g.x as f32 + g.advance * 0.5) / run_w, i as f32, count],
                 });
             }
         }
@@ -1137,7 +1174,7 @@ impl GpuContext {
                 effect_id: 0,
                 effect_param_offset: 0,
                 effect_param_len: 0,
-                _pad: [0.0; 3],
+                glyph_fx: [0.0; 3],
             });
         }
         out

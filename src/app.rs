@@ -225,6 +225,10 @@ pub struct App<S = ()> {
     /// Whether the last flatten emitted an animated effect — a stay-awake
     /// source for the frame loop (see `node::FlattenOut`).
     animated_effects: bool,
+    /// The rate the on-screen effects asked for this flatten (see
+    /// [`crate::scene::NodeBuilderRef::effect_fps`]); `0` = the app's own
+    /// setting stands.
+    animated_fps: u16,
     /// The compositor told us the window is fully hidden. Animated
     /// effects stop asking for frames until it comes back: painting an
     /// animation nobody can see is pure waste, and it's the one case
@@ -580,6 +584,7 @@ impl<S> App<S> {
             flat_spans: Vec::new(),
             effect_params: Vec::new(),
             animated_effects: false,
+            animated_fps: 0,
             occluded: false,
             effect_epoch: Instant::now(),
             effect_frame_interval: DEFAULT_EFFECT_FRAME_INTERVAL,
@@ -852,10 +857,15 @@ impl<S> App<S> {
     ///
     /// Also honours `OPAL_AUTOCAPTURE_DELAY_MS` (integer ms) — if
     /// set, the autocapture is deferred by that long so async UI state
-    /// has time to populate before the snapshot.
+    /// has time to populate before the snapshot — and
+    /// `OPAL_AUTOCAPTURE_DIR`, which redirects the frames somewhere
+    /// other than `debug_captures/` (two capture runs at once then don't
+    /// overwrite each other's frames).
     pub fn capture_from_env(mut self) -> Self {
         if std::env::var_os("OPAL_AUTOCAPTURE").is_some() {
-            self = self.capture_once();
+            let dir = std::env::var("OPAL_AUTOCAPTURE_DIR")
+                .unwrap_or_else(|_| "debug_captures".to_string());
+            self = self.capture(1, &dir);
         }
         if let Some(raw) = std::env::var_os("OPAL_AUTOCAPTURE_DELAY_MS")
             && let Ok(s) = raw.into_string()
@@ -1018,6 +1028,7 @@ impl<S> App<S> {
             spans: &mut self.flat_spans,
             effect_params: &mut self.effect_params,
             animated_effects: false,
+            animated_fps: 0,
         };
         self.ctx
             .tree
@@ -1026,6 +1037,7 @@ impl<S> App<S> {
         // Remembered for the loop's stay-awake check below; the flatten is
         // the only pass that knows what's actually on screen.
         self.animated_effects = animated;
+        self.animated_fps = out.animated_fps;
         let flatten_ms = t_flatten.elapsed().as_secs_f32() * 1000.0;
         let t_expand = Instant::now();
         let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
@@ -1317,12 +1329,30 @@ impl<S> App<S> {
         self.audio_levels = (level.clamp(0.0, 1.0), bands.map(|b| b.clamp(0.0, 1.0)));
     }
 
+    /// How long between animated-effect frames right now: the app's
+    /// setting, or a faster rate an on-screen effect asked for.
+    fn effect_interval(&self) -> Duration {
+        match self.animated_fps {
+            0 => self.effect_frame_interval,
+            hz => self
+                .effect_frame_interval
+                .min(Duration::from_secs_f32(1.0 / hz.clamp(1, 240) as f32)),
+        }
+    }
+
     /// Push the shader clock + the latest audio into the GPU's frame
     /// uniform. Wraps the clock every a bit over an hour so `f32` keeps
     /// its sub-millisecond precision in a long session; effects use it
     /// through `sin`/`cos`, so the wrap is invisible.
     fn publish_effect_globals(&mut self) {
-        let time = self.effect_epoch.elapsed().as_secs_f32() % 4096.0;
+        // `OPAL_EFFECT_TIME=<secs>` pins the shader clock, which is what
+        // makes a screenshot of a time-driven effect reproducible: the
+        // same value always renders the same instant of the animation.
+        // Debug-only, and absent in every normal run.
+        let time = match effect_time_override() {
+            Some(t) => t,
+            None => self.effect_epoch.elapsed().as_secs_f32() % 4096.0,
+        };
         // Builds read this to stamp time-driven envelopes (see
         // `Scene::now_playing_waves`), so it must be current before a
         // rebuild as well as before a render.
@@ -3590,6 +3620,7 @@ fn build_hud_instances(
             max_width: None,
             wrap: false,
             clip_rect: crate::gpu::NO_CLIP,
+            fx: Default::default(),
         })
         .collect();
     out.extend(gpu.build_glyph_instances(text, &refs));
@@ -3658,6 +3689,7 @@ fn build_hint_instances(
         max_width: None,
         wrap: false,
         clip_rect: crate::gpu::NO_CLIP,
+        fx: Default::default(),
     }];
     out.extend(gpu.build_glyph_instances(text_res, &refs));
     out
@@ -3941,6 +3973,18 @@ fn process_size_binds(
     }
 }
 
+/// The pinned shader clock from `OPAL_EFFECT_TIME`, if the environment
+/// sets one. Read once — an env lookup per frame would be silly, and the
+/// value cannot change during a run.
+fn effect_time_override() -> Option<f32> {
+    static PINNED: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *PINNED.get_or_init(|| {
+        std::env::var("OPAL_EFFECT_TIME")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+    })
+}
+
 /// Resolve a winit `KeyEvent`'s `logical_key` + `text` into an
 /// [`EditOp`]. Returns `None` for keys the editor doesn't handle (so
 /// the caller can fall through to other shell-level handlers).
@@ -4113,6 +4157,7 @@ impl<'a> HeadlessHelper<'a> {
                 spans: &mut spans,
                 effect_params: &mut effect_params,
                 animated_effects: false,
+                animated_fps: 0,
             },
         );
         self.instances.clear();
@@ -5424,6 +5469,12 @@ impl<S> ApplicationHandler for App<S> {
             hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
             self.on_frame = Some(hook);
         }
+        // Audio the hook just published (see `SceneCtx::publish_audio`)
+        // goes into the globals every shader reads, in time for this
+        // frame's uniform — no bind, no rebuild.
+        if let Some((level, bands)) = self.ctx.take_audio() {
+            self.set_audio_levels(level, bands);
+        }
         // Walk the bind registry every tick the loop is awake. This is
         // the bridge from "Signal was set somewhere" to "tree picks up
         // the new value":
@@ -5477,15 +5528,17 @@ impl<S> ApplicationHandler for App<S> {
         // clock moves — so it never trips the flush above. Repaint it
         // directly and schedule the next frame.
         let effect_deadline = if effects_animating {
-            let last = self
-                .last_effect_frame
-                .unwrap_or(now - self.effect_frame_interval);
-            let next = if now.duration_since(last) >= self.effect_frame_interval {
+            // The fastest thing on screen sets the pace: a page of
+            // beat-driven type gets its frames without every drifting
+            // field in the app paying for them.
+            let interval = self.effect_interval();
+            let last = self.last_effect_frame.unwrap_or(now - interval);
+            let next = if now.duration_since(last) >= interval {
                 self.last_effect_frame = Some(now);
                 self.request_redraw();
-                now + self.effect_frame_interval
+                now + interval
             } else {
-                last + self.effect_frame_interval
+                last + interval
             };
             Some(next)
         } else {

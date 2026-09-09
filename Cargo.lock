@@ -1651,6 +1651,7 @@ dependencies = [
  "env_logger",
  "etagere",
  "log",
+ "naga",
  "png 0.18.1",
  "pollster",
  "resvg",

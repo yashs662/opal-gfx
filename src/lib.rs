@@ -82,8 +82,8 @@ pub use event::{
 };
 pub use frame_sink::FrameSink;
 pub use gpu::{
-    FrameStats, FrameTiming, FrameUniform, GpuContext, ImageAtlas, ImageEntry, ImageHandle,
-    MemoryReport, ShapeInstance,
+    EffectId, FrameStats, FrameTiming, FrameUniform, GpuContext, ImageAtlas, ImageEntry,
+    ImageHandle, MemoryReport, ShapeInstance, TEXT_EFFECTS, TEXT_FX_KARAOKE, TextFxId,
 };
 pub use input::{InputChange, InputState};
 pub use layer::{Damage, ExternalRect, Layer, LayerTree};
@@ -91,8 +91,8 @@ pub use layout::{Align, Axis, Justify, LayoutStyle, Len, Measurer, NullMeasurer,
 pub use lazy_list::LazyListState;
 pub use node::{
     BarSide, BorderSides, HitEntry, ImageRef, Node, NodeBuilder, NodeId, NodeTree, ScrollAxis,
-    ScrollHit, ScrollState, ScrollbarHit, ScrollbarStyle, ShapeKind, ShapeStyle, TextRef,
-    WindowAction, dirty,
+    ScrollHit, ScrollState, ScrollbarHit, ScrollbarStyle, ShapeKind, ShapeStyle, TextFxRef,
+    TextRef, WindowAction, dirty,
 };
 pub use overlay::Overlay;
 pub use reactive::{AnimatedBind, Bind, Computed, DepTuple, ImageBind, Source, TextBind, animated};

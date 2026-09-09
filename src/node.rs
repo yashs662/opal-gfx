@@ -57,6 +57,24 @@ pub struct TextRef {
     /// `crate::gpu::NO_CLIP` when none. Stamped onto every glyph
     /// instance built from this ref.
     pub clip_rect: [f32; 4],
+    /// The per-glyph text effect this run runs, and its slice of the
+    /// shared param arena. `len` 0 = no effect (the glyphs paint plainly).
+    pub fx: TextFxRef,
+}
+
+/// A text run's effect: which one, and where its params landed in the
+/// shared arena. Zero length means "none", which is what every text node
+/// without [`crate::scene::NodeBuilderRef::text_fx`] carries.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct TextFxRef {
+    pub id: crate::gpu::TextFxId,
+    pub param_offset: u32,
+    pub param_len: u32,
+    /// The effect moves on the shader clock, so its glyphs must repaint
+    /// every frame even though nothing in the tree changed — the glyph
+    /// instances carry `SHAPE_FLAG_ANIMATED` for it, exactly like an
+    /// animated effect quad.
+    pub animated: bool,
 }
 
 /// One image node discovered during flatten. The atlas lookup happens
@@ -582,6 +600,12 @@ pub struct NodeEffect {
     /// effects (the EQ curve, which only moves when its params do) leave
     /// this false and cost nothing when idle.
     pub animated: bool,
+    /// Frames per second this effect wants while it is on screen. `0` =
+    /// the app's default rate. The loop runs at the highest rate any
+    /// on-screen effect asks for, so a drifting backdrop can stay cheap
+    /// while a snappy one (letters bouncing on a beat) gets the frames it
+    /// needs — without paying for them app-wide.
+    pub fps: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -1664,6 +1688,10 @@ pub struct FlattenOut<'a> {
     /// clock needs frames to keep coming, and nothing else in the tree
     /// changes to ask for them.
     pub animated_effects: bool,
+    /// The highest frame rate any on-screen animated effect asked for
+    /// (see [`NodeEffect::fps`]). `0` = nobody asked, so the app's default
+    /// rate stands.
+    pub animated_fps: u16,
 }
 
 impl FlattenOut<'_> {
@@ -1676,6 +1704,7 @@ impl FlattenOut<'_> {
         self.spans.clear();
         self.effect_params.clear();
         self.animated_effects = false;
+        self.animated_fps = 0;
     }
 }
 
@@ -2703,6 +2732,7 @@ impl NodeTree {
                 id: effect,
                 data,
                 animated,
+                fps: 0,
             });
             self.dirty |= dirty::VISUAL;
         }
@@ -3011,6 +3041,7 @@ impl NodeTree {
                 spans: &mut spans,
                 effect_params: &mut effect_params,
                 animated_effects: false,
+                animated_fps: 0,
             },
         );
         (events, hits, scroll_hits, scroll_bars)
@@ -3073,6 +3104,7 @@ impl NodeTree {
                     spans: &mut throwaway_spans,
                     effect_params: out.effect_params,
                     animated_effects: false,
+                    animated_fps: 0,
                 },
                 // Suppress promotion in the transient drag ghost.
                 true,
@@ -3213,7 +3245,7 @@ impl NodeTree {
                         effect_id: 0,
                         effect_param_offset: 0,
                         effect_param_len: 0,
-                        _pad: [0.0; 3],
+                        glyph_fx: [0.0; 3],
                     }));
                 }
             }
@@ -3233,6 +3265,24 @@ impl NodeTree {
                     } else {
                         t.max_width
                     };
+                    // A text effect's params ride the same arena the
+                    // shape effects use; the glyphs only carry the slice.
+                    let fx = match node.effect.as_ref() {
+                        Some(e) => {
+                            let param_offset = out.effect_params.len() as u32;
+                            out.effect_params.extend_from_slice(&e.data);
+                            out.animated_effects |= e.animated;
+                            out.animated_fps = out.animated_fps.max(e.fps);
+                            out.animated_fps = out.animated_fps.max(e.fps);
+                            TextFxRef {
+                                id: crate::gpu::TextFxId(e.id.0),
+                                param_offset,
+                                param_len: e.data.len() as u32,
+                                animated: e.animated,
+                            }
+                        }
+                        None => TextFxRef::default(),
+                    };
                     out.events.push(FlatEvent::Text(TextRef {
                         position: abs,
                         color: node.style.color,
@@ -3243,6 +3293,7 @@ impl NodeTree {
                         max_width: wrap_width,
                         wrap: t.wrap,
                         clip_rect: clip,
+                        fx,
                     }));
                 }
             }
@@ -3286,7 +3337,7 @@ impl NodeTree {
                         effect_id: 0,
                         effect_param_offset: 0,
                         effect_param_len: 0,
-                        _pad: [0.0; 3],
+                        glyph_fx: [0.0; 3],
                     }));
                 }
             }
@@ -3324,7 +3375,7 @@ impl NodeTree {
                         effect_id: e.id.0,
                         effect_param_offset: params_offset,
                         effect_param_len: e.data.len() as u32,
-                        _pad: [0.0; 3],
+                        glyph_fx: [0.0; 3],
                     }));
                 }
             }
@@ -3839,7 +3890,7 @@ fn bar_quad(
         effect_id: 0,
         effect_param_offset: 0,
         effect_param_len: 0,
-        _pad: [0.0; 3],
+        glyph_fx: [0.0; 3],
     }));
 }
 
@@ -3901,7 +3952,7 @@ fn emit_scroll_thumb(
         effect_id: 0,
         effect_param_offset: 0,
         effect_param_len: 0,
-        _pad: [0.0; 3],
+        glyph_fx: [0.0; 3],
     }));
     spans.push(LayerSpan {
         node: node_id,
@@ -4538,6 +4589,7 @@ mod tests {
             spans: &mut spans,
             effect_params: &mut params,
             animated_effects: false,
+            animated_fps: 0,
         };
         tree.flatten_into_buffers(1.0, &mut out);
         assert!(out.animated_effects, "an animated effect must be reported");

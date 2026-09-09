@@ -91,6 +91,10 @@ pub struct SceneCtx {
     /// to start a time-driven envelope (fade in/out) that then runs
     /// entirely on the GPU. Kept in sync by the app shell.
     pub effect_time: f32,
+    /// Audio published from the per-frame hook, waiting for the shell to
+    /// pick it up (see [`Self::publish_audio`]). `None` = nothing new
+    /// this frame; the shaders keep the last values.
+    pub(crate) audio: Option<(f32, [f32; crate::gpu::effects::BANDS])>,
     /// Marquee strips registered this build (see [`Scene::marquee`]) — the
     /// app shell's per-frame tick drives their auto-pan. Rebuilt with the
     /// scene; dead ids are skipped by the tick.
@@ -124,6 +128,7 @@ impl SceneCtx {
             binds: BindRegistry::default(),
             text: TextResources::new(),
             effect_time: 0.0,
+            audio: None,
             scale: 1.0,
             marquees: Vec::new(),
             focus_request: None,
@@ -409,6 +414,22 @@ pub struct ImageBindSlot {
     pub node_id: NodeId,
     pub bind: ImageBind,
     pub last_version: u64,
+}
+
+impl SceneCtx {
+    /// Publish the audio the effect and text shaders react to: a
+    /// broadband level and per-band energies, each 0..1, low band first.
+    /// Call it from the per-frame hook as new analysis lands; the shell
+    /// forwards it into the frame uniform, so it reaches every shader
+    /// without any of them being rebuilt or re-bound.
+    pub fn publish_audio(&mut self, level: f32, bands: [f32; crate::gpu::effects::BANDS]) {
+        self.audio = Some((level, bands));
+    }
+
+    /// Take whatever the frame hook published, for the shell.
+    pub(crate) fn take_audio(&mut self) -> Option<(f32, [f32; crate::gpu::effects::BANDS])> {
+        self.audio.take()
+    }
 }
 
 /// A reactive effect-data bind: reads a `Vec<f32>` of params from a
@@ -1112,6 +1133,28 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
+    /// Run a registered **text effect** (see
+    /// [`crate::gpu::effects::TEXT_EFFECTS`]) over this text node's
+    /// glyphs: every glyph is placed, sized and coloured by that shader,
+    /// per frame, on the GPU. Feed it with the same
+    /// [`effect_data`](Self::effect_data) /
+    /// [`effect_data_bind`](Self::effect_data_bind) params every effect
+    /// takes, and mark it [`effect_animated`](Self::effect_animated) when
+    /// it moves on the clock rather than only when its params change.
+    ///
+    /// No-op on non-text nodes.
+    pub fn text_fx(&mut self, id: crate::gpu::TextFxId) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
+            && n.text.is_some()
+        {
+            // Text effects ride the same per-node effect slot the shape
+            // effects use — one params path, one bind path, one arena.
+            let e = n.effect.get_or_insert_with(NodeEffect::default);
+            e.id = crate::gpu::EffectId(id.0);
+        }
+        self
+    }
+
     /// Select which of the registered effects (see
     /// [`crate::gpu::effects`]) this node's shader runs. No-op on
     /// non-effect nodes.
@@ -1120,6 +1163,21 @@ impl<'a> NodeBuilderRef<'a> {
             && let Some(e) = n.effect.as_mut()
         {
             e.id = id;
+        }
+        self
+    }
+
+    /// Ask for `hz` frames a second while this effect is on screen. The
+    /// loop runs at the highest rate any visible effect asks for, so a
+    /// slow drifting field stays cheap next to one that has to be crisp
+    /// (letters landing on a beat). `0` — the default — means "whatever
+    /// the app is set to". Only meaningful together with
+    /// [`effect_animated`](Self::effect_animated).
+    pub fn effect_fps(&mut self, hz: u16) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id)
+            && let Some(e) = n.effect.as_mut()
+        {
+            e.fps = hz;
         }
         self
     }

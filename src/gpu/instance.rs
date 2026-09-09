@@ -105,8 +105,12 @@ pub struct ShapeInstance {
     /// effect-param arena.
     pub effect_param_offset: u32,
     pub effect_param_len: u32,
-    /// Closes the struct to the 192-byte WGSL array stride.
-    pub _pad: [f32; 3],
+    /// [`SHAPE_KIND_GLYPH`]-only, and only when a text effect is set:
+    /// where this glyph sits in its run — `[along, index, count]`, with
+    /// `along` the glyph centre as a fraction of the run's advance width.
+    /// A text effect stagger/sweep reads these; every other kind leaves
+    /// them zero (they also close the struct to the 192-byte stride).
+    pub glyph_fx: [f32; 3],
 }
 
 #[cfg(test)]
@@ -173,7 +177,7 @@ impl Default for ShapeInstance {
             effect_id: 0,
             effect_param_offset: 0,
             effect_param_len: 0,
-            _pad: [0.0; 3],
+            glyph_fx: [0.0; 3],
         }
     }
 }

@@ -25,6 +25,16 @@
 //! authored colours), and stay inside the quad — the caller has already
 //! clipped, rounded and applied the node's opacity.
 //!
+//! # Text effects
+//!
+//! [`TEXT_EFFECTS`] is the second registry: one function per effect, run
+//! for **every glyph** of a text node that asks for it (see
+//! [`text_fx`](crate::scene::NodeBuilderRef::text_fx)) — in the vertex
+//! stage (where the glyph goes and how big it is) and in the fragment
+//! stage (what colour it takes). It reads the glyph's place in its run
+//! plus the same params and globals as below, so a whole line can sweep,
+//! bounce or shimmer with nothing pumped per frame.
+//!
 //! # Inputs
 //!
 //! - **Params**: a per-node `&[f32]` of any length ([`crate::scene::Scene`]
@@ -72,6 +82,11 @@ pub struct EffectDef {
     pub wgsl: &'static str,
 }
 
+/// The shared prelude every effect body can call — palettes, envelopes,
+/// edge fades. Stitched in ahead of the bodies so an effect never carries
+/// its own copy of maths another one already needs.
+const PRELUDE: &str = include_str!("../shaders/effects/shared.wgsl");
+
 /// Every effect the shape shader can run, in id order.
 pub const EFFECTS: &[EffectDef] = &[
     EffectDef {
@@ -94,21 +109,63 @@ pub const EFFECT_CURVE: EffectId = EffectId(0);
 /// the audio bands. Params: `[phase_seed, intensity]`.
 pub const EFFECT_NOW_PLAYING: EffectId = EffectId(1);
 
+/// Which **text effect** a node's glyphs run. Like [`EffectId`], ids come
+/// from position in [`TEXT_EFFECTS`], so the constants below and the
+/// generated dispatch cannot disagree.
+///
+/// A text effect is one function evaluated per glyph, in both the vertex
+/// and the fragment stage, returning where that glyph sits, how big it is
+/// and what colour it takes. It reads where the glyph falls in its run
+/// (`along`/`index`/`count`), the node's params, and the frame globals —
+/// so a whole line can sweep, bounce or shimmer with **nothing** driven
+/// per frame from the CPU.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TextFxId(pub u32);
+
+/// Every text effect the shape shader can run, in id order.
+pub const TEXT_EFFECTS: &[EffectDef] = &[EffectDef {
+    name: "karaoke",
+    entry: "tfx_karaoke",
+    wgsl: include_str!("../shaders/text_effects/karaoke.wgsl"),
+}];
+
+/// Sung-line sweep: the words light left to right in time with the line,
+/// with a bloom riding the leading edge.
+/// Params: `[active, start, duration, rate, frozen]` — see the file.
+pub const TEXT_FX_KARAOKE: TextFxId = TextFxId(0);
+
 /// Markers in `shape.wgsl` replaced with the registered effect bodies and
 /// the generated dispatch.
 const SNIPPETS_MARKER: &str = "//__EFFECT_SNIPPETS__";
 const DISPATCH_MARKER: &str = "//__EFFECT_DISPATCH__";
+/// The same pair for the per-glyph text effects.
+const TEXT_SNIPPETS_MARKER: &str = "//__TEXTFX_SNIPPETS__";
+const TEXT_DISPATCH_MARKER: &str = "//__TEXTFX_DISPATCH__";
 
-/// Stitch every registered effect into `shape.wgsl`: the bodies where the
-/// snippet marker sits, and an `if` chain over [`EffectId`] where the
-/// dispatch marker sits.
+/// Stitch the shared [`PRELUDE`] and both registries into `shape.wgsl`:
+/// the prelude + bodies where each snippet marker sits, and an `if` chain
+/// over the id where each dispatch marker sits.
 pub fn compose_shader(shape_wgsl: &str) -> String {
-    let mut snippets = String::new();
+    let (snippets, dispatch) = stitch(EFFECTS, "effect", PRELUDE);
+    let (text_snippets, text_dispatch) = stitch(TEXT_EFFECTS, "text effect", "");
+    shape_wgsl
+        .replace(SNIPPETS_MARKER, &snippets)
+        .replace(DISPATCH_MARKER, &dispatch)
+        .replace(TEXT_SNIPPETS_MARKER, &text_snippets)
+        .replace(TEXT_DISPATCH_MARKER, &text_dispatch)
+}
+
+/// The bodies of one registry, plus the `if` chain that reaches each by
+/// id. Both registries dispatch on a single `c` argument, so one routine
+/// generates both.
+fn stitch(defs: &[EffectDef], label: &str, prelude: &str) -> (String, String) {
+    let mut snippets = String::from(prelude);
+    if !prelude.is_empty() {
+        snippets.push('\n');
+    }
     let mut dispatch = String::new();
-    for (i, e) in EFFECTS.iter().enumerate() {
-        snippets.push_str("// --- effect: ");
-        snippets.push_str(e.name);
-        snippets.push_str(" ---\n");
+    for (i, e) in defs.iter().enumerate() {
+        snippets.push_str(&format!("// --- {label}: {} ---\n", e.name));
         snippets.push_str(e.wgsl);
         snippets.push('\n');
         dispatch.push_str(&format!(
@@ -116,9 +173,7 @@ pub fn compose_shader(shape_wgsl: &str) -> String {
             e.entry
         ));
     }
-    shape_wgsl
-        .replace(SNIPPETS_MARKER, &snippets)
-        .replace(DISPATCH_MARKER, &dispatch)
+    (snippets, dispatch)
 }
 
 #[cfg(test)]
@@ -127,7 +182,7 @@ mod tests {
 
     #[test]
     fn every_effect_defines_the_entry_point_it_registers() {
-        for e in EFFECTS {
+        for e in EFFECTS.iter().chain(TEXT_EFFECTS) {
             assert!(
                 e.wgsl.contains(&format!("fn {}(", e.entry)),
                 "{} does not define {}",
@@ -139,23 +194,57 @@ mod tests {
 
     #[test]
     fn ids_match_table_order() {
-        assert_eq!(EFFECTS[EFFECT_CURVE.0 as usize].entry, "fx_curve");
+        for (id, entry) in [
+            (EFFECT_CURVE, "fx_curve"),
+            (EFFECT_NOW_PLAYING, "fx_now_playing"),
+        ] {
+            assert_eq!(EFFECTS[id.0 as usize].entry, entry);
+        }
         assert_eq!(
-            EFFECTS[EFFECT_NOW_PLAYING.0 as usize].entry,
-            "fx_now_playing"
+            TEXT_EFFECTS[TEXT_FX_KARAOKE.0 as usize].entry,
+            "tfx_karaoke"
         );
     }
 
+    /// The composed shader is only compiled when a GPU device is created,
+    /// so a typo in an effect body would otherwise surface as a black
+    /// window on someone else's machine. Parse + validate it here instead:
+    /// the same front end wgpu runs, at test speed.
     #[test]
-    fn composition_fills_both_markers() {
-        let out = compose_shader("a\n//__EFFECT_SNIPPETS__\nb\n//__EFFECT_DISPATCH__\nc\n");
-        assert!(!out.contains(SNIPPETS_MARKER));
-        assert!(!out.contains(DISPATCH_MARKER));
-        for e in EFFECTS {
+    fn the_composed_shader_is_valid_wgsl() {
+        let src = compose_shader(include_str!("../shaders/shape.wgsl"));
+        let module = match naga::front::wgsl::parse_str(&src) {
+            Ok(m) => m,
+            Err(e) => panic!("{}", e.emit_to_string(&src)),
+        };
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        );
+        if let Err(e) = validator.validate(&module) {
+            panic!("{}", e.emit_to_string(&src));
+        }
+    }
+
+    #[test]
+    fn composition_fills_every_marker() {
+        let out = compose_shader(
+            "a\n//__EFFECT_SNIPPETS__\nb\n//__EFFECT_DISPATCH__\nc\n\
+             //__TEXTFX_SNIPPETS__\nd\n//__TEXTFX_DISPATCH__\n",
+        );
+        for marker in [
+            SNIPPETS_MARKER,
+            DISPATCH_MARKER,
+            TEXT_SNIPPETS_MARKER,
+            TEXT_DISPATCH_MARKER,
+        ] {
+            assert!(!out.contains(marker), "{marker} left unfilled");
+        }
+        for e in EFFECTS.iter().chain(TEXT_EFFECTS) {
             assert!(out.contains(e.entry));
         }
-        // Dispatch reaches every id.
-        for i in 0..EFFECTS.len() {
+        // Dispatch reaches every id in both registries.
+        for i in 0..EFFECTS.len().max(TEXT_EFFECTS.len()) {
             assert!(out.contains(&format!("if (id == {i}u)")));
         }
     }
