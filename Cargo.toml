@@ -45,6 +45,13 @@ windows = { version = "0.61", features = [
 [target.'cfg(not(windows))'.dependencies]
 softbuffer = "0.4"
 
+# Reach the CAMetalLayer wgpu creates to bound `nextDrawable` (see
+# `GpuContext::allow_drawable_timeout`). Same versions wgpu/winit pull.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "objc2-quartz-core"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CAMetalLayer"] }
+
 [[example]]
 name = "hello_window"
 path = "examples/hello_window.rs"

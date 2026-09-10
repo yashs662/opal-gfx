@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId};
 
 use crate::anim::Timeline;
 use crate::debug;
@@ -48,6 +48,7 @@ use crate::scene::{
     ColorBindSlot, HeightPxBindSlot, ImageBindSlot, OpacityBindSlot, PositionBindSlot, Scene,
     SceneCtx, SizeBindSlot, TextBindSlot, WidthPctBindSlot, WidthPxBindSlot,
 };
+use crate::signal::Signal;
 
 /// Pixel band on each window edge that triggers a system resize-drag
 /// instead of a normal click. 6 px matches Windows' frameless feel.
@@ -86,6 +87,22 @@ const MODAL_PUMP: Duration = Duration::from_millis(200);
 /// lower it with [`App::set_effect_frame_rate`].
 const DEFAULT_EFFECT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 
+/// The OS's own fullscreen shortcut: Ctrl+Cmd+F on macOS, F11 elsewhere.
+fn is_fullscreen_hotkey(code: KeyCode, logical: &Key, mods: ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = code;
+        mods.control_key()
+            && mods.super_key()
+            && matches!(logical, Key::Character(s) if s.as_str().eq_ignore_ascii_case("f"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (logical, mods);
+        code == KeyCode::F11
+    }
+}
+
 /// Marquee pacing (see [`Scene::marquee`]): how long an overflowing strip
 /// rests at each end before panning.
 const MARQUEE_HOLD: Duration = Duration::from_millis(1400);
@@ -108,7 +125,6 @@ pub struct AppConfig {
     pub height: u32,
     pub decorations: bool,
     pub transparent: bool,
-    pub blur: bool,
     pub capture_dir: PathBuf,
     /// Window-corner radius in logical px applied by the final shader.
     /// `0.0` (default) = square corners; non-zero rounds the surface
@@ -134,7 +150,6 @@ impl AppConfig {
             height,
             decorations: false,
             transparent: true,
-            blur: true,
             capture_dir: PathBuf::from("debug_captures"),
             window_corner_radius: 0.0,
             window_icon: None,
@@ -198,6 +213,296 @@ pub type FrameFn<S> = Box<dyn FnMut(&mut SceneCtx, &mut crate::anim::Timeline, I
 /// layer's visibility `Signal` (+ rebuild token) and the press never
 /// reaches whatever is behind. After it returns the shell reacts.
 pub type UnhandledPressFn = Box<dyn FnMut(&mut SceneCtx)>;
+
+/// Direction of a completed two-finger horizontal swipe (see
+/// [`App::on_swipe_nav`]). Follows the OS scroll direction the way
+/// browsers do: fingers moving the content toward the right go back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwipeNav {
+    Back,
+    Forward,
+}
+
+/// Swipe-navigation hook. Fires on release when the pull passed
+/// [`SWIPE_NAV_THRESHOLD_LOGICAL`] — never mid-gesture, and not at all
+/// when the fingers came back before letting go.
+pub type SwipeNavFn = Box<dyn FnMut(SwipeNav, &mut SceneCtx)>;
+
+/// Unabsorbed horizontal travel (logical px) that arms a swipe.
+pub const SWIPE_NAV_THRESHOLD_LOGICAL: f32 = 140.0;
+/// How far past the threshold [`App::swipe_progress`] keeps reporting
+/// (in threshold units) — the stretch a pull indicator can show before it
+/// stops growing.
+pub const SWIPE_NAV_MAX_STRETCH: f32 = 1.35;
+/// Gap between wheel ticks that counts as the release where the OS
+/// reports no touch phases (Windows/Linux trackpads).
+const SWIPE_NAV_IDLE: Duration = Duration::from_millis(300);
+/// A gesture that starts this soon after the last one ended is the OS's
+/// inertia tail (macOS reports momentum with the same phases), not a new
+/// swipe — it is ignored to its end.
+const SWIPE_NAV_MOMENTUM_GAP: Duration = Duration::from_millis(150);
+/// Snap-back tween after a release, whether it fired or not.
+const SWIPE_NAV_SNAP: Duration = Duration::from_millis(180);
+/// Gap between wheel ticks that ends an axis-locked scroll gesture where
+/// the OS reports no touch phases.
+const WHEEL_AXIS_IDLE: Duration = Duration::from_millis(300);
+
+/// After a drawable-acquire timeout, wait this long before presenting
+/// again — long enough for the window server to hand drawables back,
+/// short enough that the catch-up frame lands within a blink.
+const PRESENT_BACKOFF: Duration = Duration::from_millis(400);
+/// Presents held after a wake from sleep: the compositor comes back a
+/// beat after the window does, and asking earlier is what stalls.
+const RESUME_RENDER_HOLD: Duration = Duration::from_millis(750);
+/// Wall-clock lead over the monotonic clock between two loop iterations
+/// that counts as a sleep.
+const RESUME_GAP: Duration = Duration::from_secs(5);
+
+/// A UI-thread step slower than this is logged with its name: the OS
+/// shows the busy cursor after a couple of seconds without event
+/// processing, and the log otherwise says nothing about *what* blocked.
+const STALL_WARN: Duration = Duration::from_millis(250);
+
+/// Times one UI-thread step from construction to drop (so every early
+/// return is covered) and logs it when it crossed [`STALL_WARN`].
+struct StallGuard {
+    label: &'static str,
+    started: Instant,
+}
+
+impl StallGuard {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for StallGuard {
+    fn drop(&mut self) {
+        let took = self.started.elapsed();
+        if took > STALL_WARN {
+            log::warn!(
+                "[stall] {} held the ui thread for {} ms",
+                self.label,
+                took.as_millis()
+            );
+        }
+    }
+}
+
+/// Variant name for the stall log — the event itself is moved into the
+/// handler, and formatting every event would cost more than it tells.
+fn event_name(e: &WindowEvent) -> &'static str {
+    match e {
+        WindowEvent::Resized(_) => "window_event Resized",
+        WindowEvent::Moved(_) => "window_event Moved",
+        WindowEvent::Focused(_) => "window_event Focused",
+        WindowEvent::Occluded(_) => "window_event Occluded",
+        WindowEvent::RedrawRequested => "window_event RedrawRequested",
+        WindowEvent::ScaleFactorChanged { .. } => "window_event ScaleFactorChanged",
+        WindowEvent::CursorMoved { .. } => "window_event CursorMoved",
+        WindowEvent::CursorEntered { .. } | WindowEvent::CursorLeft { .. } => {
+            "window_event CursorEntered/Left"
+        }
+        WindowEvent::MouseInput { .. } => "window_event MouseInput",
+        WindowEvent::MouseWheel { .. } => "window_event MouseWheel",
+        WindowEvent::KeyboardInput { .. } => "window_event KeyboardInput",
+        WindowEvent::ModifiersChanged(_) => "window_event ModifiersChanged",
+        WindowEvent::CloseRequested => "window_event CloseRequested",
+        _ => "window_event other",
+    }
+}
+
+/// Locks a trackpad scroll gesture to the axis it starts on, the way
+/// browsers do: a sideways swipe that drifts a little vertically no longer
+/// nudges the page, and a vertical scroll never creeps sideways.
+#[derive(Default)]
+struct WheelAxisLock {
+    /// `0` = x, `1` = y, once the gesture has committed.
+    axis: Option<usize>,
+    last_tick: Option<Instant>,
+}
+
+impl WheelAxisLock {
+    /// Zero the off-axis component of `delta` for the current gesture,
+    /// committing to an axis on the first tick with any travel.
+    fn apply(
+        &mut self,
+        delta: [f32; 2],
+        phase: winit::event::TouchPhase,
+        now: Instant,
+    ) -> [f32; 2] {
+        use winit::event::TouchPhase;
+        let stale = self
+            .last_tick
+            .is_some_and(|t| now.duration_since(t) > WHEEL_AXIS_IDLE);
+        if matches!(
+            phase,
+            TouchPhase::Started | TouchPhase::Ended | TouchPhase::Cancelled
+        ) || stale
+        {
+            self.axis = None;
+        }
+        self.last_tick = Some(now);
+        if self.axis.is_none() && delta != [0.0; 2] {
+            self.axis = Some(usize::from(delta[1].abs() > delta[0].abs()));
+        }
+        match self.axis {
+            Some(0) => [delta[0], 0.0],
+            Some(_) => [0.0, delta[1]],
+            None => delta,
+        }
+    }
+}
+
+/// What one wheel tick did to the swipe gesture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SwipeStep {
+    /// Nothing for the host to see.
+    Idle,
+    /// Fingers still down; signed progress in threshold units
+    /// (positive = back, magnitude clamped to [`SWIPE_NAV_MAX_STRETCH`]).
+    Pulling(f32),
+    /// Fingers lifted. `Some` when the pull was past the threshold.
+    Released(Option<SwipeNav>),
+}
+
+/// Accumulates one horizontal pull gesture off the wheel stream.
+#[derive(Default)]
+struct SwipeTracker {
+    /// Signed unabsorbed horizontal px so far, wheel sign convention,
+    /// clamped to the stretch limit so pulling back responds at once.
+    travel: f32,
+    /// A gesture is in progress (a tick has landed since the last end).
+    active: bool,
+    /// This gesture is scrolling a sideways container — it is not a swipe,
+    /// not even once that container runs out of room.
+    blocked: bool,
+    last_tick: Option<Instant>,
+    last_end: Option<Instant>,
+    /// This gesture is the inertia tail of the previous one — drop it.
+    suppressed: bool,
+}
+
+impl SwipeTracker {
+    fn progress(&self, threshold: f32) -> f32 {
+        (self.travel / threshold).clamp(-SWIPE_NAV_MAX_STRETCH, SWIPE_NAV_MAX_STRETCH)
+    }
+
+    fn release(&mut self, threshold: f32, now: Instant) -> SwipeStep {
+        let fired = (self.travel.abs() >= threshold).then_some(if self.travel > 0.0 {
+            SwipeNav::Back
+        } else {
+            SwipeNav::Forward
+        });
+        let was_active = self.active;
+        *self = Self {
+            last_end: Some(now),
+            ..Self::default()
+        };
+        if was_active {
+            SwipeStep::Released(fired)
+        } else {
+            SwipeStep::Idle
+        }
+    }
+
+    /// Feed one wheel tick. `raw` is the full delta in wheel sign
+    /// convention (positive x = fingers moved right, natural scrolling
+    /// on), `leftover_x` the horizontal part no container took, and
+    /// `in_horizontal` whether the cursor is over a sideways scroller —
+    /// which claims the whole gesture for scrolling.
+    fn feed(
+        &mut self,
+        raw: [f32; 2],
+        leftover_x: f32,
+        in_horizontal: bool,
+        phase: winit::event::TouchPhase,
+        threshold: f32,
+        now: Instant,
+    ) -> SwipeStep {
+        use winit::event::TouchPhase;
+        match phase {
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if self.suppressed {
+                    self.suppressed = false;
+                    return SwipeStep::Idle;
+                }
+                return self.release(threshold, now);
+            }
+            TouchPhase::Started => {
+                let momentum = self
+                    .last_end
+                    .is_some_and(|t| now.duration_since(t) < SWIPE_NAV_MOMENTUM_GAP);
+                *self = Self {
+                    last_end: self.last_end,
+                    suppressed: momentum,
+                    ..Self::default()
+                };
+            }
+            TouchPhase::Moved => {
+                // Phaseless trackpads: a pause was the release, so this
+                // tick opens a new gesture (the timed release in the frame
+                // loop normally gets there first).
+                if self
+                    .last_tick
+                    .is_some_and(|t| now.duration_since(t) > SWIPE_NAV_IDLE)
+                {
+                    self.release(threshold, now);
+                }
+            }
+        }
+        if self.suppressed {
+            return SwipeStep::Idle;
+        }
+        self.last_tick = Some(now);
+        // A vertical scroll is not a swipe: let the indicator go.
+        if raw[1].abs() > raw[0].abs() {
+            if self.travel == 0.0 {
+                return SwipeStep::Idle;
+            }
+            self.travel = 0.0;
+            return SwipeStep::Pulling(0.0);
+        }
+        if in_horizontal {
+            self.blocked = true;
+        }
+        if self.blocked {
+            // Let go of anything pulled before the gesture reached the
+            // container; nothing else to show until it ends.
+            if self.travel == 0.0 {
+                return SwipeStep::Idle;
+            }
+            self.travel = 0.0;
+            return SwipeStep::Pulling(0.0);
+        }
+        if leftover_x == 0.0 && !self.active {
+            return SwipeStep::Idle;
+        }
+        self.active = true;
+        let limit = threshold * SWIPE_NAV_MAX_STRETCH;
+        self.travel = (self.travel + leftover_x).clamp(-limit, limit);
+        SwipeStep::Pulling(self.progress(threshold))
+    }
+
+    /// Deadline for the timed release, while a gesture is live.
+    fn idle_deadline(&self) -> Option<Instant> {
+        if !self.active {
+            return None;
+        }
+        self.last_tick.map(|t| t + SWIPE_NAV_IDLE)
+    }
+
+    /// Frame-loop check: a live gesture that went quiet has been released.
+    fn tick(&mut self, threshold: f32, now: Instant) -> SwipeStep {
+        match self.idle_deadline() {
+            Some(d) if now >= d => self.release(threshold, now),
+            _ => SwipeStep::Idle,
+        }
+    }
+}
 
 pub struct App<S = ()> {
     /// User application state, owned by the app and lent to the scene
@@ -316,6 +621,22 @@ pub struct App<S = ()> {
     on_key: Option<KeyFn>,
     on_frame: Option<FrameFn<S>>,
     on_unhandled_press: Option<UnhandledPressFn>,
+    on_swipe_nav: Option<SwipeNavFn>,
+    swipe: SwipeTracker,
+    /// Live pull of the swipe gesture — see [`Self::swipe_progress`].
+    swipe_progress: Signal<f32>,
+    /// No presents until this instant: set after a drawable-acquire
+    /// timeout (back-off) and on a detected wake from sleep (grace), both
+    /// moments the window server holds every drawable and a present
+    /// would block the UI thread. A frame wanted meanwhile is noted in
+    /// `render_deferred` and drawn when the hold lifts.
+    render_hold_until: Option<Instant>,
+    render_deferred: bool,
+    /// Wall clock at the previous `about_to_wait`, paired with the
+    /// monotonic instant — a wall-clock jump the monotonic clock didn't
+    /// make is a sleep (the monotonic clock stops in sleep on macOS).
+    last_tick_clocks: Option<(Instant, std::time::SystemTime)>,
+    axis_lock: WheelAxisLock,
     /// One-shot hook fired from `exiting()` (winit's last chance before
     /// the event loop tears down). Use for save-on-quit work — prefs
     /// flush, session disconnect, etc. `Option` so it can be `take`n
@@ -610,6 +931,13 @@ impl<S> App<S> {
             on_key: None,
             on_frame: None,
             on_unhandled_press: None,
+            on_swipe_nav: None,
+            swipe: SwipeTracker::default(),
+            swipe_progress: Signal::new(0.0),
+            render_hold_until: None,
+            render_deferred: false,
+            last_tick_clocks: None,
+            axis_lock: WheelAxisLock::default(),
             on_exit: None,
             on_window_ready: None,
             headless: None,
@@ -813,6 +1141,92 @@ impl<S> App<S> {
     pub fn on_unhandled_press<F: FnMut(&mut SceneCtx) + 'static>(mut self, f: F) -> Self {
         self.on_unhandled_press = Some(Box::new(f));
         self
+    }
+
+    /// Register the two-finger swipe hook (browser-style back/forward).
+    /// Built from the wheel stream — winit exposes no swipe event — so it
+    /// works on any trackpad: a horizontal wheel run that the scroll
+    /// containers under the cursor can't absorb (nothing scrolls sideways
+    /// there, or it's already at its edge) is the pull. The hook fires on
+    /// release, only if the pull was past the threshold at that moment.
+    pub fn on_swipe_nav<F: FnMut(SwipeNav, &mut SceneCtx) + 'static>(mut self, f: F) -> Self {
+        self.on_swipe_nav = Some(Box::new(f));
+        self
+    }
+
+    /// The swipe gesture's live pull, for an edge indicator: `0` at rest,
+    /// signed by direction (positive = back), `±1` at the point where a
+    /// release navigates, continuing to `±`[`SWIPE_NAV_MAX_STRETCH`] as the
+    /// fingers keep going. Snaps back to `0` on release (tweened), so a
+    /// node bound to it needs no bookkeeping of its own.
+    pub fn swipe_progress(&self) -> Signal<f32> {
+        self.swipe_progress.clone()
+    }
+
+    fn swipe_threshold(&self) -> f32 {
+        SWIPE_NAV_THRESHOLD_LOGICAL * self.scale_factor
+    }
+
+    /// Per-iteration bookkeeping for the present hold: start one on a
+    /// detected wake, release a deferred frame once a hold has lapsed,
+    /// and return the deadline the loop must wake for while one is live.
+    fn tick_render_hold(&mut self, now: Instant) -> Option<Instant> {
+        let wall = std::time::SystemTime::now();
+        if let Some((prev_mono, prev_wall)) = self.last_tick_clocks {
+            let mono = now.duration_since(prev_mono);
+            let wall_gap = wall.duration_since(prev_wall).unwrap_or_default();
+            if wall_gap.saturating_sub(mono) > RESUME_GAP {
+                log::info!(
+                    "resumed from sleep ({}s) — holding presents for {} ms",
+                    wall_gap.as_secs(),
+                    RESUME_RENDER_HOLD.as_millis()
+                );
+                self.render_hold_until = Some(now + RESUME_RENDER_HOLD);
+                // Whatever is on screen is stale by now.
+                self.render_deferred = true;
+            }
+        }
+        self.last_tick_clocks = Some((now, wall));
+        match self.render_hold_until {
+            Some(until) if now < until => Some(until),
+            Some(_) => {
+                self.render_hold_until = None;
+                if std::mem::take(&mut self.render_deferred) {
+                    self.request_redraw();
+                }
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Push a tracker step out: live pull onto the progress signal, a
+    /// release into the hook (when armed) and a snap-back tween.
+    fn apply_swipe_step(&mut self, step: SwipeStep, now: Instant) {
+        match step {
+            SwipeStep::Idle => {}
+            SwipeStep::Pulling(p) => {
+                self.timeline.stop_for(&self.swipe_progress);
+                self.swipe_progress.set(p);
+                self.react();
+            }
+            SwipeStep::Released(dir) => {
+                if let Some(dir) = dir
+                    && let Some(mut hook) = self.on_swipe_nav.take()
+                {
+                    hook(dir, &mut self.ctx);
+                    self.on_swipe_nav = Some(hook);
+                }
+                self.timeline.animate(
+                    &self.swipe_progress,
+                    0.0,
+                    crate::anim::Curve::EaseInOut,
+                    SWIPE_NAV_SNAP,
+                    now,
+                );
+                self.react();
+            }
+        }
     }
 
     /// Configure the directory used by F2 screenshots and headless
@@ -1273,7 +1687,10 @@ impl<S> App<S> {
         // width from its measured height) — without it here, constraints
         // that follow the viewport only apply after the resize ends.
         if let Some(mut hook) = self.on_frame.take() {
-            hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
+            {
+                let _stall = StallGuard::new("on_frame hook");
+                hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
+            }
             self.on_frame = Some(hook);
             if self.rebuild_request.replace(false) {
                 self.rebuild_scene();
@@ -1295,6 +1712,20 @@ impl<S> App<S> {
     }
 
     fn render_once(&mut self) {
+        // Nothing to show a frame to: on macOS a present into a window the
+        // compositor isn't drawing (other Space, fully covered) blocks in
+        // `nextDrawable` for up to a second per frame, stalling the loop.
+        // `Occluded(false)` requests the catch-up redraw.
+        if self.occluded {
+            return;
+        }
+        let now = Instant::now();
+        if self.render_hold_until.is_some_and(|until| now < until) {
+            self.render_deferred = true;
+            return;
+        }
+        self.render_hold_until = None;
+        self.render_deferred = false;
         if self.hud_enabled {
             self.refresh_hud_overlay();
         }
@@ -1303,7 +1734,18 @@ impl<S> App<S> {
             return;
         };
         let t0 = Instant::now();
-        gpu.render_frame();
+        let outcome = {
+            // Names a present that blocked (macOS `nextDrawable` after a
+            // wake, a swapchain rebuild) apart from app-side work.
+            let _stall = StallGuard::new("render_frame");
+            gpu.render_frame()
+        };
+        if outcome == crate::gpu::FrameOutcome::Timeout {
+            log::info!("drawable acquire timed out — backing off before the next present");
+            self.render_hold_until = Some(Instant::now() + PRESENT_BACKOFF);
+            self.render_deferred = true;
+            return;
+        }
         self.last_cpu_ms = t0.elapsed().as_secs_f32() * 1_000.0;
         let snapshot = self.current_stats();
         self.last_render_stats = Some(snapshot);
@@ -2974,6 +3416,7 @@ impl<S> App<S> {
     ///
     /// No-op if [`App::scene`] was never called.
     pub fn rebuild_scene(&mut self) {
+        let _stall = StallGuard::new("rebuild_scene");
         // 0. Snapshot EVERY scroller's offset (named or anonymous). A
         //    rebuild is often additive UI (a modal opening, a hot-patch)
         //    — teleporting any list back to the top would lose the
@@ -3172,18 +3615,37 @@ impl<S> App<S> {
         }
     }
 
-    /// Maximised state. macOS reads the tracked flag (see `win_maximized` —
-    /// querying winit there breaks click delivery); elsewhere the live winit
-    /// state, which the OS can change behind our back (e.g. Windows snap).
+    /// Maximised or fullscreen state (both mean edge-to-edge: no corner
+    /// rounding, no resize gutters). macOS reads the tracked flag (see
+    /// `win_maximized` — querying winit there breaks click delivery);
+    /// elsewhere the live winit state, which the OS can change behind our
+    /// back (e.g. Windows snap). `fullscreen()` is a plain field read on
+    /// every backend, so it's safe to query.
     fn window_maximized(&self) -> bool {
+        let Some(w) = self.window.as_ref() else {
+            return false;
+        };
+        if w.fullscreen().is_some() {
+            return true;
+        }
         #[cfg(target_os = "macos")]
         {
             self.win_maximized
         }
         #[cfg(not(target_os = "macos"))]
         {
-            self.window.as_ref().map(|w| w.is_maximized()).unwrap_or(false)
+            w.is_maximized()
         }
+    }
+
+    /// Toggle native fullscreen (own Space on macOS, borderless on the
+    /// current monitor elsewhere).
+    fn toggle_fullscreen(&self) {
+        let Some(w) = self.window.as_ref() else {
+            return;
+        };
+        let enter = w.fullscreen().is_none();
+        w.set_fullscreen(enter.then_some(Fullscreen::Borderless(None)));
     }
 
     /// Resize gutter hit-test. Returns the direction whose gutter
@@ -3298,6 +3760,17 @@ impl<S> App<S> {
                 true
             }
             WindowAction::ToggleMaximize => {
+                // macOS convention: the green button enters native
+                // fullscreen; Option-click zooms instead.
+                #[cfg(target_os = "macos")]
+                if !self.modifiers.state().alt_key() {
+                    self.toggle_fullscreen();
+                    return true;
+                }
+                if win.fullscreen().is_some() {
+                    win.set_fullscreen(None);
+                    return true;
+                }
                 let maximize = !self.window_maximized();
                 win.set_maximized(maximize);
                 #[cfg(target_os = "macos")]
@@ -4340,7 +4813,6 @@ impl<S> ApplicationHandler for App<S> {
             .with_transparent(self.config.transparent)
             .with_decorations(self.config.decorations)
             .with_resizable(true)
-            .with_blur(self.config.blur)
             .with_visible(false)
             // Logical size — winit converts to physical based on the
             // monitor's scale factor, so the same `AppConfig::new(w, h)`
@@ -4350,6 +4822,17 @@ impl<S> ApplicationHandler for App<S> {
                 self.config.width as f64,
                 self.config.height as f64,
             ));
+        // Native fullscreen re-adds the titled style mask for the duration;
+        // keep that bar chrome-less so it reveals as a bare traffic-light
+        // strip over our content instead of a titled band above it.
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs
+                .with_titlebar_transparent(true)
+                .with_title_hidden(true)
+                .with_fullsize_content_view(true);
+        }
         // Configured window icon (taskbar / alt-tab). Fail-soft: a
         // mismatched buffer just leaves winit on the exe-icon fallback.
         if let Some((w, h, rgba)) = self.config.window_icon.clone() {
@@ -4537,6 +5020,7 @@ impl<S> ApplicationHandler for App<S> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let _stall = StallGuard::new(event_name(&event));
         let Some(_gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -4781,7 +5265,7 @@ impl<S> ApplicationHandler for App<S> {
                     self.react();
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 let Some([cx, cy]) = self.input.cursor else {
                     return;
                 };
@@ -4810,15 +5294,35 @@ impl<S> ApplicationHandler for App<S> {
                     }
                     winit::event::MouseScrollDelta::PixelDelta(p) => [-p.x as f32, -p.y as f32],
                 };
+                let now = Instant::now();
+                // One axis per gesture: the hand's stray off-axis drift
+                // never reaches the scroll containers or the swipe.
+                let px = self.axis_lock.apply(px, phase, now);
                 let shift = self.modifiers.state().shift_key();
-                if crate::input::on_wheel(
+                let out = crate::input::on_wheel(
                     [cx, cy],
                     px,
                     &self.scroll_hits,
                     &mut self.ctx.tree,
                     shift,
-                ) {
+                );
+                if out.moved {
                     self.react();
+                }
+                // Swipe navigation reads what scrolling left over. `px` is
+                // the sign-flipped scroll delta, so flip back to the raw
+                // wheel convention the tracker documents.
+                if self.on_swipe_nav.is_some() && !shift {
+                    let threshold = self.swipe_threshold();
+                    let step = self.swipe.feed(
+                        [-px[0], -px[1]],
+                        -out.leftover[0],
+                        out.horizontal_container,
+                        phase,
+                        threshold,
+                        now,
+                    );
+                    self.apply_swipe_step(step, now);
                 }
             }
             WindowEvent::MouseInput {
@@ -5002,6 +5506,13 @@ impl<S> ApplicationHandler for App<S> {
                 ..
             } => {
                 if state == ElementState::Pressed {
+                    // OS-standard fullscreen toggle. Ahead of text-field
+                    // routing so it works mid-edit like the OS shortcut
+                    // would.
+                    if !repeat && is_fullscreen_hotkey(code, &logical_key, self.modifiers.state()) {
+                        self.toggle_fullscreen();
+                        return;
+                    }
                     // Text-field routing fires *before* the hotkey path.
                     // While a TextField is focused, typeable keys + nav
                     // keys (Backspace, Arrow*, Home, End, Enter) feed the
@@ -5172,6 +5683,7 @@ impl<S> ApplicationHandler for App<S> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let _stall = StallGuard::new("about_to_wait");
         // Keep the scene ctx's display scale in sync so per-frame hooks
         // (`on_frame`) can convert physical reads (scroll offsets) to
         // logical layout units. Cheap; the value rarely changes.
@@ -5232,7 +5744,10 @@ impl<S> ApplicationHandler for App<S> {
                 "[loop] wake-driven on_frame fired (timeline_tweens={})",
                 self.timeline.len()
             );
-            hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
+            {
+                let _stall = StallGuard::new("on_frame hook");
+                hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
+            }
             self.on_frame = Some(hook);
             log::debug!(
                 "[loop] after on_frame: timeline_tweens={} rebuild_requested={}",
@@ -5399,10 +5914,22 @@ impl<S> ApplicationHandler for App<S> {
         // toggle (if due) and yields the next toggle deadline so the loop
         // wakes for it; a focused field therefore keeps the loop alive.
         let (caret_blinked, caret_deadline) = self.tick_caret_blink(now);
+        // Wake from sleep: hold presents for a beat (see `render_hold_until`),
+        // then draw the frame that was wanted meanwhile once the hold lifts.
+        let render_deadline = self.tick_render_hold(now);
+        // Timed release for trackpads that report no touch phases; the
+        // deadline keeps the loop awake until the gesture is decided.
+        let swipe_step = self.swipe.tick(self.swipe_threshold(), now);
+        let swipe_released = swipe_step != SwipeStep::Idle;
+        self.apply_swipe_step(swipe_step, now);
+        let swipe_deadline = self.swipe.idle_deadline();
         // An animated effect moves on the shader clock, so nothing in the
         // tree asks for the next frame — the flatten's answer does.
         let effects_animating = self.animated_effects && !self.occluded;
         if !timeline_active
+            && !swipe_released
+            && swipe_deadline.is_none()
+            && render_deadline.is_none()
             && !effects_animating
             && !scroll_active
             && !drag_moved
@@ -5466,7 +5993,10 @@ impl<S> ApplicationHandler for App<S> {
         // zero lag.
         let hook_active = self.on_frame.is_some();
         if let Some(mut hook) = self.on_frame.take() {
-            hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
+            {
+                let _stall = StallGuard::new("on_frame hook");
+                hook(&mut self.ctx, &mut self.timeline, now, &mut self.state);
+            }
             self.on_frame = Some(hook);
         }
         // Audio the hook just published (see `SceneCtx::publish_audio`)
@@ -5577,6 +6107,8 @@ impl<S> ApplicationHandler for App<S> {
             caret_deadline,
             marquee_deadline,
             effect_deadline,
+            swipe_deadline,
+            render_deadline,
         ]
         .into_iter()
         .flatten()
@@ -5814,7 +6346,8 @@ impl<S> App<S> {
         let line = 50.0 * self.scale_factor;
         let px = [-dx * line, -dy * line];
         let shift = self.modifiers.state().shift_key();
-        if crate::input::on_wheel([cx, cy], px, &self.scroll_hits, &mut self.ctx.tree, shift) {
+        if crate::input::on_wheel([cx, cy], px, &self.scroll_hits, &mut self.ctx.tree, shift).moved
+        {
             self.react();
         }
     }
@@ -6321,6 +6854,227 @@ mod tests {
         app.input.captured = None;
         // No hook registered — must not panic.
         app.maybe_fire_unhandled_press();
+    }
+
+    /// One wheel tick where nothing absorbed the sideways part.
+    fn swipe_tick(
+        t: &mut SwipeTracker,
+        dx: f32,
+        phase: winit::event::TouchPhase,
+        now: Instant,
+    ) -> SwipeStep {
+        t.feed([dx, 0.0], dx, false, phase, 100.0, now)
+    }
+
+    #[test]
+    fn swipe_stands_down_over_a_horizontal_container_for_the_whole_gesture() {
+        use winit::event::TouchPhase::*;
+        let mut t = SwipeTracker::default();
+        let now = Instant::now();
+        // Pull starts over plain content...
+        assert_eq!(
+            swipe_tick(&mut t, 60.0, Moved, now),
+            SwipeStep::Pulling(0.6)
+        );
+        // ...then the cursor is over a sideways scroller: the pull lets go
+        // and nothing builds again this gesture, edge remainder included.
+        assert_eq!(
+            t.feed([60.0, 0.0], 60.0, true, Moved, 100.0, now),
+            SwipeStep::Pulling(0.0)
+        );
+        assert_eq!(swipe_tick(&mut t, 200.0, Moved, now), SwipeStep::Idle);
+        assert_eq!(
+            swipe_tick(&mut t, 0.0, Ended, now),
+            SwipeStep::Released(None)
+        );
+        // A new gesture over plain content is back to normal.
+        let later = now + Duration::from_secs(1);
+        assert_eq!(swipe_tick(&mut t, 0.0, Started, later), SwipeStep::Idle);
+        assert_eq!(
+            swipe_tick(&mut t, 50.0, Moved, later),
+            SwipeStep::Pulling(0.5)
+        );
+    }
+
+    #[test]
+    fn wheel_axis_lock_commits_to_the_first_axis_per_gesture() {
+        use winit::event::TouchPhase::*;
+        let mut lock = WheelAxisLock::default();
+        let now = Instant::now();
+        // Sideways swipe with a little vertical drift: drift is dropped.
+        assert_eq!(lock.apply([-40.0, 6.0], Started, now), [-40.0, 0.0]);
+        assert_eq!(lock.apply([-30.0, 20.0], Moved, now), [-30.0, 0.0]);
+        // Even a tick that is mostly vertical stays locked mid-gesture.
+        assert_eq!(lock.apply([-5.0, 50.0], Moved, now), [-5.0, 0.0]);
+        assert_eq!(lock.apply([0.0, 0.0], Ended, now), [0.0, 0.0]);
+        // Next gesture is vertical: sideways drift is dropped instead.
+        assert_eq!(lock.apply([4.0, 80.0], Started, now), [0.0, 80.0]);
+        assert_eq!(lock.apply([30.0, 10.0], Moved, now), [0.0, 10.0]);
+    }
+
+    #[test]
+    fn wheel_axis_lock_releases_after_an_idle_gap() {
+        use winit::event::TouchPhase::*;
+        let mut lock = WheelAxisLock::default();
+        let t0 = Instant::now();
+        assert_eq!(lock.apply([-40.0, 0.0], Moved, t0), [-40.0, 0.0]);
+        // Phaseless trackpad: a pause ends the gesture, so the axis can
+        // change on the next tick.
+        let later = t0 + WHEEL_AXIS_IDLE + Duration::from_millis(1);
+        assert_eq!(lock.apply([0.0, 50.0], Moved, later), [0.0, 50.0]);
+    }
+
+    #[test]
+    fn swipe_reports_live_progress_and_fires_on_release_past_threshold() {
+        use winit::event::TouchPhase::*;
+        let mut t = SwipeTracker::default();
+        let now = Instant::now();
+        assert_eq!(swipe_tick(&mut t, 0.0, Started, now), SwipeStep::Idle);
+        assert_eq!(
+            swipe_tick(&mut t, 50.0, Moved, now),
+            SwipeStep::Pulling(0.5)
+        );
+        assert_eq!(
+            swipe_tick(&mut t, 70.0, Moved, now),
+            SwipeStep::Pulling(1.2)
+        );
+        // Stretch stops at the limit, however far the fingers go.
+        assert_eq!(
+            swipe_tick(&mut t, 500.0, Moved, now),
+            SwipeStep::Pulling(SWIPE_NAV_MAX_STRETCH)
+        );
+        assert_eq!(
+            swipe_tick(&mut t, 0.0, Ended, now),
+            SwipeStep::Released(Some(SwipeNav::Back))
+        );
+        // Next gesture the other way (well after the inertia window).
+        let later = now + Duration::from_secs(1);
+        assert_eq!(
+            swipe_tick(&mut t, -120.0, Started, later),
+            SwipeStep::Pulling(-1.2)
+        );
+        assert_eq!(
+            swipe_tick(&mut t, 0.0, Ended, later),
+            SwipeStep::Released(Some(SwipeNav::Forward))
+        );
+    }
+
+    #[test]
+    fn swipe_pulled_back_before_release_does_nothing() {
+        use winit::event::TouchPhase::*;
+        let mut t = SwipeTracker::default();
+        let now = Instant::now();
+        assert_eq!(
+            swipe_tick(&mut t, 120.0, Moved, now),
+            SwipeStep::Pulling(1.2)
+        );
+        // Fingers come back: progress follows, and the release is a no-op.
+        assert_eq!(
+            swipe_tick(&mut t, -70.0, Moved, now),
+            SwipeStep::Pulling(0.5)
+        );
+        assert_eq!(
+            swipe_tick(&mut t, 0.0, Ended, now),
+            SwipeStep::Released(None)
+        );
+    }
+
+    #[test]
+    fn swipe_pull_back_from_the_limit_responds_at_once() {
+        use winit::event::TouchPhase::*;
+        let mut t = SwipeTracker::default();
+        let now = Instant::now();
+        // 1000 px of pull is clamped to the limit, not banked — so 100 px
+        // back is visible immediately, as on a real elastic indicator.
+        assert_eq!(
+            swipe_tick(&mut t, 1000.0, Moved, now),
+            SwipeStep::Pulling(SWIPE_NAV_MAX_STRETCH)
+        );
+        let SwipeStep::Pulling(p) = swipe_tick(&mut t, -100.0, Moved, now) else {
+            panic!("still pulling");
+        };
+        assert!((p - (SWIPE_NAV_MAX_STRETCH - 1.0)).abs() < 1e-5, "{p}");
+    }
+
+    #[test]
+    fn swipe_ignores_absorbed_travel() {
+        use winit::event::TouchPhase::*;
+        let mut t = SwipeTracker::default();
+        let now = Instant::now();
+        // A horizontal scroller ate every tick: raw moves, leftover is 0.
+        for _ in 0..10 {
+            assert_eq!(
+                t.feed([50.0, 0.0], 0.0, false, Moved, 100.0, now),
+                SwipeStep::Idle
+            );
+        }
+        assert_eq!(
+            t.feed([0.0, 0.0], 0.0, false, Ended, 100.0, now),
+            SwipeStep::Idle
+        );
+    }
+
+    #[test]
+    fn swipe_vertical_scroll_lets_the_pull_go() {
+        use winit::event::TouchPhase::*;
+        let mut t = SwipeTracker::default();
+        let now = Instant::now();
+        assert_eq!(
+            swipe_tick(&mut t, 80.0, Moved, now),
+            SwipeStep::Pulling(0.8)
+        );
+        assert_eq!(
+            t.feed([5.0, 60.0], 5.0, false, Moved, 100.0, now),
+            SwipeStep::Pulling(0.0)
+        );
+        // A plain vertical scroll with nothing pulled stays silent.
+        assert_eq!(
+            t.feed([5.0, 60.0], 5.0, false, Moved, 100.0, now),
+            SwipeStep::Idle
+        );
+    }
+
+    #[test]
+    fn swipe_idle_gap_releases_a_phaseless_gesture() {
+        use winit::event::TouchPhase::*;
+        let mut t = SwipeTracker::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            swipe_tick(&mut t, 120.0, Moved, t0),
+            SwipeStep::Pulling(1.2)
+        );
+        let deadline = t.idle_deadline().expect("live gesture has a deadline");
+        assert_eq!(t.tick(100.0, t0), SwipeStep::Idle);
+        // Windows trackpads report no phases: the pause is the release.
+        assert_eq!(
+            t.tick(100.0, deadline),
+            SwipeStep::Released(Some(SwipeNav::Back))
+        );
+        assert_eq!(t.idle_deadline(), None);
+    }
+
+    #[test]
+    fn swipe_momentum_tail_is_ignored_to_its_end() {
+        use winit::event::TouchPhase::*;
+        let mut t = SwipeTracker::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            swipe_tick(&mut t, 120.0, Moved, t0),
+            SwipeStep::Pulling(1.2)
+        );
+        assert_eq!(
+            swipe_tick(&mut t, 0.0, Ended, t0),
+            SwipeStep::Released(Some(SwipeNav::Back))
+        );
+        // macOS reports inertia as a fresh Started right after Ended.
+        let t1 = t0 + Duration::from_millis(20);
+        assert_eq!(swipe_tick(&mut t, 0.0, Started, t1), SwipeStep::Idle);
+        assert_eq!(swipe_tick(&mut t, 300.0, Moved, t1), SwipeStep::Idle);
+        assert_eq!(swipe_tick(&mut t, 0.0, Ended, t1), SwipeStep::Idle);
+        // A real gesture later is back to normal.
+        let t2 = t1 + Duration::from_secs(1);
+        assert_eq!(swipe_tick(&mut t, 0.0, Started, t2), SwipeStep::Idle);
+        assert_eq!(swipe_tick(&mut t, 50.0, Moved, t2), SwipeStep::Pulling(0.5));
     }
 
     #[test]

@@ -176,9 +176,64 @@ pub struct GpuContext {
     effect_param_capacity: u64,
 }
 
+/// What [`GpuContext::render_frame`] did with the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameOutcome {
+    Presented,
+    /// No surface this time (reconfigured, occluded, invalid) — nothing
+    /// to wait for.
+    Skipped,
+    /// The compositor handed out no drawable within the acquire timeout.
+    /// Right after a wake the window server can hold every drawable for
+    /// seconds; the caller should back off rather than ask again at once.
+    Timeout,
+}
+
 impl GpuContext {
     pub fn new(window: Arc<Window>) -> Self {
         pollster::block_on(Self::new_async(window))
+    }
+
+    /// wgpu leaves `CAMetalLayer.allowsNextDrawableTimeout` off, so
+    /// `nextDrawable` blocks the UI thread for as long as the window
+    /// server keeps the drawables — 1–3 s on every wake from sleep (the
+    /// spinner). With the timeout on, the acquire gives up after ~1 s and
+    /// reports [`FrameOutcome::Timeout`], which the loop turns into a
+    /// back-off instead of a second stall. The layer is either the view's
+    /// own layer or the sublayer wgpu attached.
+    #[cfg(target_os = "macos")]
+    fn allow_drawable_timeout(window: &Window) {
+        use objc2_app_kit::NSView;
+        use objc2_quartz_core::CAMetalLayer;
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+            return;
+        };
+        // SAFETY: winit's AppKit handle is the window's live NSView, and
+        // this runs on the main thread inside the winit event loop.
+        let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+        let Some(root) = view.layer() else {
+            return;
+        };
+        let metal = match root.downcast::<CAMetalLayer>() {
+            Ok(m) => Some(m),
+            // SAFETY: `sublayers` is unsafe only because the array's
+            // element type is unchecked; CALayer sublayers are CALayers.
+            Err(root) => unsafe { root.sublayers() }.and_then(|subs| {
+                subs.to_vec()
+                    .into_iter()
+                    .find_map(|l| l.downcast::<CAMetalLayer>().ok())
+            }),
+        };
+        match metal {
+            Some(layer) => layer.setAllowsNextDrawableTimeout(true),
+            None => {
+                log::warn!("no CAMetalLayer on the window view — drawable acquire stays unbounded")
+            }
+        }
     }
 
     async fn new_async(window: Arc<Window>) -> Self {
@@ -241,12 +296,18 @@ impl GpuContext {
                     || *f == wgpu::TextureFormat::Bgra8UnormSrgb
             })
             .unwrap_or(caps.formats[0]);
-        let alpha_mode = caps
-            .alpha_modes
-            .iter()
-            .copied()
-            .find(|m| *m == wgpu::CompositeAlphaMode::PreMultiplied)
-            .unwrap_or(caps.alpha_modes[0]);
+        // Any non-opaque mode keeps the window's corner mask see-through.
+        // DX12 offers PreMultiplied; Metal only Opaque + PostMultiplied (its
+        // layer is premultiplied either way), and Opaque is listed first —
+        // a bare `[0]` fallback paints the rounded corners black on macOS.
+        let alpha_mode = [
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+            wgpu::CompositeAlphaMode::Inherit,
+        ]
+        .into_iter()
+        .find(|m| caps.alpha_modes.contains(m))
+        .unwrap_or(caps.alpha_modes[0]);
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
@@ -259,6 +320,8 @@ impl GpuContext {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &surface_config);
+        #[cfg(target_os = "macos")]
+        Self::allow_drawable_timeout(&window);
 
         log::info!("gpu init: format={format:?} alpha={alpha_mode:?} size={width}x{height}");
 
@@ -1819,18 +1882,19 @@ impl GpuContext {
     }
 
     /// Acquire, render, present.
-    pub fn render_frame(&mut self) {
+    pub fn render_frame(&mut self) -> FrameOutcome {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(tex)
             | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
-                return;
+                return FrameOutcome::Skipped;
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Timeout => return FrameOutcome::Timeout,
+            wgpu::CurrentSurfaceTexture::Occluded => return FrameOutcome::Skipped,
             wgpu::CurrentSurfaceTexture::Validation => {
                 log::error!("surface validation error");
-                return;
+                return FrameOutcome::Skipped;
             }
         };
 
@@ -1849,6 +1913,7 @@ impl GpuContext {
         self.poll_timing_after_submit();
         self.window.pre_present_notify();
         frame.present();
+        FrameOutcome::Presented
     }
 
     /// Kick async map for the slot the most recent `encode_frame` wrote
@@ -2034,7 +2099,7 @@ impl GpuContext {
             self.surface_config.format,
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
         ) {
-            for px in out.chunks_exact_mut(4) {
+            for px in out.as_chunks_mut::<4>().0 {
                 px.swap(0, 2);
             }
         }

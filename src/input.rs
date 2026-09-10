@@ -446,12 +446,16 @@ pub fn on_wheel(
     scroll_hits: &[ScrollHit],
     tree: &mut NodeTree,
     shift: bool,
-) -> bool {
+) -> WheelOutcome {
     if shift {
         delta = [delta[0] + delta[1], 0.0];
     }
     if delta[0].abs() < f32::EPSILON && delta[1].abs() < f32::EPSILON {
-        return false;
+        return WheelOutcome {
+            moved: false,
+            leftover: delta,
+            horizontal_container: false,
+        };
     }
     // Topmost = innermost = last DFS push that contains the cursor.
     let Some(hit) = scroll_hits
@@ -459,8 +463,16 @@ pub fn on_wheel(
         .rev()
         .find(|h| h.contains(cursor[0], cursor[1]))
     else {
-        return false;
+        return WheelOutcome {
+            moved: false,
+            leftover: delta,
+            horizontal_container: false,
+        };
     };
+    let horizontal_container = hit
+        .ancestor_chain
+        .iter()
+        .any(|&id| tree.get(id).is_some_and(|n| n.layout.overflow_x.scrolls()));
     let mut request = delta;
     let mut moved = false;
     for &id in &hit.ancestor_chain {
@@ -473,7 +485,23 @@ pub fn on_wheel(
             break;
         }
     }
-    moved
+    WheelOutcome {
+        moved,
+        leftover: request,
+        horizontal_container,
+    }
+}
+
+/// What a wheel tick did: whether any container scrolled, the part of the
+/// delta (pixels, same sign convention as the input) no container could
+/// absorb — a horizontal remainder is what the swipe-navigation gesture
+/// reads — and whether the cursor sits in something that scrolls sideways
+/// at all (the swipe stands down there, even at its edge).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WheelOutcome {
+    pub moved: bool,
+    pub leftover: [f32; 2],
+    pub horizontal_container: bool,
 }
 
 /// Default arrow-key step size in **logical** px. Caller multiplies by
@@ -746,8 +774,9 @@ mod tests {
                 ancestor_chain: vec![inner, outer],
             },
         ];
-        let moved = on_wheel([100.0, 60.0], [0.0, 100.0], &scroll_hits, &mut t, false);
-        assert!(moved);
+        let out = on_wheel([100.0, 60.0], [0.0, 100.0], &scroll_hits, &mut t, false);
+        assert!(out.moved);
+        assert_eq!(out.leftover, [0.0, 0.0]);
         // Inner stays clamped at its max (50). Outer absorbs the
         // remaining 100 of the requested 100 (since inner had 0 budget
         // left — it was already at edge).
@@ -766,8 +795,8 @@ mod tests {
             ancestor_chain: vec![id],
         }];
         // Vertical wheel + shift → horizontal scroll.
-        let moved = on_wheel([100.0, 50.0], [0.0, 80.0], &scroll_hits, &mut t, true);
-        assert!(moved);
+        let out = on_wheel([100.0, 50.0], [0.0, 80.0], &scroll_hits, &mut t, true);
+        assert!(out.moved);
         let off = t.get(id).unwrap().scroll.unwrap().target;
         assert_eq!(off[1], 0.0, "y must remain 0 after shift swap");
         assert!((off[0] - 80.0).abs() < 0.01, "x should absorb the 80");
@@ -783,8 +812,45 @@ mod tests {
             clip_rect: crate::gpu::NO_CLIP,
             ancestor_chain: vec![id],
         }];
-        let moved = on_wheel([500.0, 500.0], [0.0, 50.0], &scroll_hits, &mut t, false);
-        assert!(!moved);
+        let out = on_wheel([500.0, 500.0], [0.0, 50.0], &scroll_hits, &mut t, false);
+        assert!(!out.moved);
+        assert_eq!(out.leftover, [0.0, 50.0]);
+    }
+
+    #[test]
+    fn wheel_leftover_is_the_unabsorbed_part() {
+        // A vertical-only scroller: a horizontal delta passes straight
+        // through, and the vertical part past the edge is reported too.
+        let mut t = NodeTree::new();
+        let id = scrollable(&mut t, 0.0, 0.0, 100.0, 100.0, [100.0, 150.0], 'y');
+        let scroll_hits = vec![ScrollHit {
+            node_id: id,
+            bounds: [0.0, 0.0, 100.0, 100.0],
+            clip_rect: crate::gpu::NO_CLIP,
+            ancestor_chain: vec![id],
+        }];
+        let out = on_wheel([50.0, 50.0], [-30.0, 80.0], &scroll_hits, &mut t, false);
+        assert!(out.moved);
+        assert!((out.leftover[0] + 30.0).abs() < 0.01, "{:?}", out.leftover);
+        assert!((out.leftover[1] - 30.0).abs() < 0.01, "{:?}", out.leftover);
+        assert!(!out.horizontal_container);
+    }
+
+    #[test]
+    fn wheel_reports_a_horizontal_container_even_at_its_edge() {
+        let mut t = NodeTree::new();
+        let id = scrollable(&mut t, 0.0, 0.0, 200.0, 100.0, [800.0, 100.0], 'x');
+        let scroll_hits = vec![ScrollHit {
+            node_id: id,
+            bounds: [0.0, 0.0, 200.0, 100.0],
+            clip_rect: crate::gpu::NO_CLIP,
+            ancestor_chain: vec![id],
+        }];
+        // Already at the left edge: nothing moves, but the cursor is still
+        // over a sideways scroller — the swipe must not take the remainder.
+        let out = on_wheel([100.0, 50.0], [-40.0, 0.0], &scroll_hits, &mut t, false);
+        assert!(!out.moved);
+        assert!(out.horizontal_container);
     }
 
     fn make_y_bar(node_id: NodeId, current_frac: f32) -> ScrollbarHit {

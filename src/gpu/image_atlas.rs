@@ -192,7 +192,7 @@ impl ImageAtlas {
             (png::ColorType::Rgba, png::BitDepth::Eight) => in_bytes.to_vec(),
             (png::ColorType::Rgb, png::BitDepth::Eight) => {
                 let mut out = Vec::with_capacity((w * h * 4) as usize);
-                for px in in_bytes.chunks_exact(3) {
+                for px in in_bytes.as_chunks::<3>().0 {
                     out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
                 }
                 out
@@ -206,7 +206,7 @@ impl ImageAtlas {
             }
             (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
                 let mut out = Vec::with_capacity((w * h * 4) as usize);
-                for px in in_bytes.chunks_exact(2) {
+                for px in in_bytes.as_chunks::<2>().0 {
                     out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
                 }
                 out

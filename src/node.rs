@@ -531,7 +531,8 @@ pub enum WindowAction {
     Close,
     /// Minimise the window.
     Minimize,
-    /// Toggle the window's maximised state.
+    /// Toggle the window's maximised state. On macOS this is native
+    /// fullscreen (the green-button convention); Option-click zooms.
     ToggleMaximize,
 }
 

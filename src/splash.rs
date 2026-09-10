@@ -139,7 +139,9 @@ impl SplashBitmap {
         let bgc = (bg[1] * 255.0) as u32;
         let bb = (bg[2] * 255.0) as u32;
         self.rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| {
                 let a = p[3] as u32;
                 let r = (p[0] as u32 * a + br * (255 - a)) / 255;

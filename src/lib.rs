@@ -72,7 +72,10 @@ macro_rules! deps {
 }
 
 pub use anim::{Curve, Lerp, TickResult, Timeline, Tween};
-pub use app::{App, AppConfig, HeadlessHelper, WakeHandle};
+pub use app::{
+    App, AppConfig, HeadlessHelper, SWIPE_NAV_MAX_STRETCH, SWIPE_NAV_THRESHOLD_LOGICAL, SwipeNav,
+    WakeHandle,
+};
 #[cfg(feature = "automation")]
 pub use automation::{Script, Step};
 pub use editor::{EditOp, EditOutcome, EditorState};
