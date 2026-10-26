@@ -1115,16 +1115,27 @@ impl GpuContext {
             };
             // Where each glyph sits in the run, for the text effect:
             // `along` is its centre as a fraction of the run's advance
-            // width, which is the axis a sweep or a stagger runs on. The
-            // run's width is its last glyph's edge, so a wrapped
-            // paragraph measures across the widest line — one axis for
-            // the whole node, which is what keeps a sweep continuous
-            // across a wrap.
-            let run_w = shaped
-                .iter()
-                .map(|g| g.x as f32 + g.advance)
-                .fold(0.0f32, f32::max)
-                .max(1.0);
+            // width in *reading order*, which is the axis a sweep or a
+            // stagger runs on. A wrapped paragraph restarts `x` on every
+            // line, so each line is laid end to end after the ones above
+            // it — otherwise a glyph on line two shares the `along` of
+            // the glyph above it and lights in the same instant.
+            let mut line_offset = Vec::new();
+            for g in &shaped {
+                let line = g.line as usize;
+                if line_offset.len() <= line {
+                    line_offset.resize(line + 1, 0.0f32);
+                }
+                line_offset[line] = line_offset[line].max(g.x as f32 + g.advance);
+            }
+            // Widths → running offsets; the total is the whole run.
+            let mut run_w = 0.0f32;
+            for w in &mut line_offset {
+                let width = *w;
+                *w = run_w;
+                run_w += width;
+            }
+            let run_w = run_w.max(1.0);
             let count = shaped.len() as f32;
             for (i, g) in shaped.iter().enumerate() {
                 let Some(entry) = self
@@ -1174,7 +1185,11 @@ impl GpuContext {
                     effect_id: r.fx.id.0,
                     effect_param_offset: r.fx.param_offset,
                     effect_param_len: r.fx.param_len,
-                    glyph_fx: [(g.x as f32 + g.advance * 0.5) / run_w, i as f32, count],
+                    glyph_fx: [
+                        (line_offset[g.line as usize] + g.x as f32 + g.advance * 0.5) / run_w,
+                        i as f32,
+                        count,
+                    ],
                 });
             }
         }

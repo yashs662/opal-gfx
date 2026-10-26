@@ -48,6 +48,9 @@ pub struct ShapedGlyph {
     /// the *typographic* extent, which is what a per-glyph effect needs
     /// to place itself along the line.
     pub advance: f32,
+    /// Visual line this glyph landed on (0 for unwrapped text). A wrapped
+    /// paragraph restarts `x` on every line, so reading order needs this.
+    pub line: u32,
 }
 
 /// Result of rasterizing one glyph to an R8 coverage mask.
@@ -338,7 +341,7 @@ fn shape_uncached_width(
     buf.set_text(text, &attrs, Shaping::Advanced, None);
     buf.shape_until_scroll(fs, false);
     let mut out = Vec::new();
-    for run in buf.layout_runs() {
+    for (line, run) in buf.layout_runs().enumerate() {
         for g in run.glyphs.iter() {
             let phys = g.physical((0.0, run.line_y), 1.0);
             out.push(ShapedGlyph {
@@ -346,6 +349,7 @@ fn shape_uncached_width(
                 x: phys.x,
                 y: phys.y,
                 advance: g.w,
+                line: line as u32,
             });
         }
     }
