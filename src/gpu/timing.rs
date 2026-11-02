@@ -14,30 +14,46 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 
 const SLOTS: usize = 2;
-/// Four logical passes: opaque, final, overdraw count (optional),
-/// overdraw compose (optional). Max queries per frame = 8.
-pub const MAX_PASSES: usize = 4;
-pub const QUERY_COUNT: u32 = (MAX_PASSES * 2) as u32;
+/// Timestamp pairs per frame across the logical passes below (opaque,
+/// final, composite, overdraw count + compose). A logical pass may span several render
+/// passes (one raster per dirty layer); each gets its own pair and the
+/// pass's time is their sum. Past this many, further passes go untimed.
+const MAX_PAIRS: usize = 32;
+pub const QUERY_COUNT: u32 = (MAX_PAIRS * 2) as u32;
 
-/// Per-slot readback buffer size. Must be ≥ `MAX_PASSES * 2 * 8` bytes
+/// Per-slot readback buffer size. Must be ≥ `MAX_PAIRS * 2 * 8` bytes
 /// and aligned to `wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT` (256).
-const RESOLVE_BYTES: wgpu::BufferAddress = 256;
+const RESOLVE_BYTES: wgpu::BufferAddress = 512;
 
 // Pass IDs — stable handles referenced from `FrameTiming`. The runtime
 // index inside the query set is assigned dynamically per frame.
 pub const PASS_OPAQUE: usize = 0;
+/// Every layer raster this frame (named for the old single final pass).
 pub const PASS_FINAL: usize = 1;
 pub const PASS_OD_COUNT: usize = 2;
 pub const PASS_OD_COMPOSE: usize = 3;
+/// Layer composite into the offscreen frame + the window-round blit to the
+/// swapchain — the per-presented-frame cost even when nothing re-rasters.
+pub const PASS_COMPOSITE: usize = 4;
 
 /// Assigns query-pair indices to passes as they run within a single
-/// frame. `pair_of[pass_id] = Some(n)` means pass `pass_id` owns
-/// queries `2n` (begin) and `2n + 1` (end). `None` means the pass did
-/// not run this frame.
-#[derive(Copy, Clone, Debug, Default)]
+/// frame. Pair `n` (queries `2n` begin, `2n + 1` end) belongs to logical
+/// pass `pass_of[n]`; a pass that ran several render passes owns several
+/// pairs. Allocate only for a render pass that is actually encoded —
+/// every pair in the resolved prefix must be written.
+#[derive(Copy, Clone, Debug)]
 pub struct PassAlloc {
-    pair_of: [Option<u8>; MAX_PASSES],
+    pass_of: [u8; MAX_PAIRS],
     next_pair: u8,
+}
+
+impl Default for PassAlloc {
+    fn default() -> Self {
+        Self {
+            pass_of: [0; MAX_PAIRS],
+            next_pair: 0,
+        }
+    }
 }
 
 impl PassAlloc {
@@ -45,19 +61,18 @@ impl PassAlloc {
         Self::default()
     }
 
-    /// Allocate a pair for `pass_id`. Returns `(begin_query_idx,
-    /// end_query_idx)` to hand to the pass's timestamp write descriptor.
-    /// Panics if called twice for the same pass in one frame.
-    pub fn alloc(&mut self, pass_id: usize) -> (u32, u32) {
-        debug_assert!(
-            self.pair_of[pass_id].is_none(),
-            "duplicate alloc for pass {pass_id}"
-        );
-        let pair = self.next_pair;
-        self.pair_of[pass_id] = Some(pair);
+    /// Allocate a pair for one render pass of `pass_id`. Returns
+    /// `(begin_query_idx, end_query_idx)` to hand to the pass's timestamp
+    /// write descriptor, or `None` once the frame's pairs are used up.
+    pub fn alloc(&mut self, pass_id: usize) -> Option<(u32, u32)> {
+        let pair = self.next_pair as usize;
+        if pair >= MAX_PAIRS {
+            return None;
+        }
+        self.pass_of[pair] = pass_id as u8;
         self.next_pair += 1;
         let begin = (pair as u32) * 2;
-        (begin, begin + 1)
+        Some((begin, begin + 1))
     }
 
     /// Total queries written this frame.
@@ -71,6 +86,7 @@ pub struct FrameTiming {
     pub total_ms: f32,
     pub opaque_ms: f32,
     pub final_ms: f32,
+    pub composite_ms: f32,
     pub overdraw_ms: f32,
 }
 
@@ -244,20 +260,24 @@ impl Timing {
 
 fn parse_frame_timing(raw: &[u64], alloc: &PassAlloc, period_ns: f32) -> FrameTiming {
     let ms_for = |pass_id: usize| -> f32 {
-        let Some(pair) = alloc.pair_of[pass_id] else {
-            return 0.0;
-        };
-        let b = raw[(pair as usize) * 2];
-        let e = raw[(pair as usize) * 2 + 1];
-        (e.saturating_sub(b) as f32) * period_ns / 1_000_000.0
+        (0..alloc.next_pair as usize)
+            .filter(|&pair| alloc.pass_of[pair] as usize == pass_id)
+            .map(|pair| {
+                let b = raw[pair * 2];
+                let e = raw[pair * 2 + 1];
+                (e.saturating_sub(b) as f32) * period_ns / 1_000_000.0
+            })
+            // Not `.sum()`: an empty float sum is -0.0, which prints as such.
+            .fold(0.0, |a, ms| a + ms)
     };
     let mut t = FrameTiming {
         opaque_ms: ms_for(PASS_OPAQUE),
         final_ms: ms_for(PASS_FINAL),
+        composite_ms: ms_for(PASS_COMPOSITE),
         overdraw_ms: ms_for(PASS_OD_COUNT) + ms_for(PASS_OD_COMPOSE),
         total_ms: 0.0,
     };
-    t.total_ms = t.opaque_ms + t.final_ms + t.overdraw_ms;
+    t.total_ms = t.opaque_ms + t.final_ms + t.composite_ms + t.overdraw_ms;
     t
 }
 
@@ -268,6 +288,8 @@ pub struct FrameStats {
     pub gpu_ms: f32,
     pub opaque_ms: f32,
     pub final_ms: f32,
+    /// Layer composite + window-round blit (see [`PASS_COMPOSITE`]).
+    pub composite_ms: f32,
     pub overdraw_ms: f32,
     pub instance_count: u32,
     pub opaque_count: u32,

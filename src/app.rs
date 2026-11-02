@@ -254,6 +254,8 @@ const PRESENT_BACKOFF: Duration = Duration::from_millis(400);
 /// Presents held after a wake from sleep: the compositor comes back a
 /// beat after the window does, and asking earlier is what stalls.
 const RESUME_RENDER_HOLD: Duration = Duration::from_millis(750);
+/// Present pacing when the monitor doesn't report a refresh rate.
+const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 /// Wall-clock lead over the monotonic clock between two loop iterations
 /// that counts as a sleep.
 const RESUME_GAP: Duration = Duration::from_secs(5);
@@ -625,13 +627,17 @@ pub struct App<S = ()> {
     swipe: SwipeTracker,
     /// Live pull of the swipe gesture — see [`Self::swipe_progress`].
     swipe_progress: Signal<f32>,
-    /// No presents until this instant: set after a drawable-acquire
-    /// timeout (back-off) and on a detected wake from sleep (grace), both
-    /// moments the window server holds every drawable and a present
-    /// would block the UI thread. A frame wanted meanwhile is noted in
+    /// No presents until this instant. Set after every present to pace
+    /// the next one to the display's refresh (the swapchain doesn't block
+    /// — see the present-mode note in `GpuContext::new`), after a
+    /// drawable-acquire timeout (back-off), and on a detected wake from
+    /// sleep (grace). A frame wanted meanwhile is noted in
     /// `render_deferred` and drawn when the hold lifts.
     render_hold_until: Option<Instant>,
     render_deferred: bool,
+    /// One refresh of the monitor the window is on — the present pacing
+    /// interval. Re-read when the window moves (it may change monitor).
+    frame_interval: Duration,
     /// Wall clock at the previous `about_to_wait`, paired with the
     /// monotonic instant — a wall-clock jump the monotonic clock didn't
     /// make is a sleep (the monotonic clock stops in sleep on macOS).
@@ -936,6 +942,7 @@ impl<S> App<S> {
             swipe_progress: Signal::new(0.0),
             render_hold_until: None,
             render_deferred: false,
+            frame_interval: DEFAULT_FRAME_INTERVAL,
             last_tick_clocks: None,
             axis_lock: WheelAxisLock::default(),
             on_exit: None,
@@ -1667,10 +1674,39 @@ impl<S> App<S> {
         }
     }
 
-    fn request_redraw(&self) {
+    /// Ask for a frame — paced: while a present hold is up the request is
+    /// noted and honoured when it lifts, so a redraw chain (every tick of a
+    /// tween re-requesting) runs at the display's refresh, not as fast as
+    /// the GPU can present.
+    fn request_redraw(&mut self) {
+        if self
+            .render_hold_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            self.render_deferred = true;
+        } else {
+            self.request_redraw_now();
+        }
+    }
+
+    /// Ask the window for a frame, bypassing the pacing — for the OS modal
+    /// loop's paint chain, which paces itself (see `RedrawRequested`).
+    fn request_redraw_now(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// Re-read [`Self::frame_interval`] from the window's current monitor.
+    fn refresh_frame_interval(&mut self) {
+        self.frame_interval = self
+            .window
+            .as_ref()
+            .and_then(|w| w.current_monitor())
+            .and_then(|m| m.refresh_rate_millihertz())
+            .filter(|&mhz| mhz > 0)
+            .map(|mhz| Duration::from_secs_f64(1000.0 / mhz as f64))
+            .unwrap_or(DEFAULT_FRAME_INTERVAL);
     }
 
     /// One animation step for the modal-loop paint chain (see the
@@ -1746,6 +1782,8 @@ impl<S> App<S> {
             self.render_deferred = true;
             return;
         }
+        // Pace the next present to one refresh after this one started.
+        self.render_hold_until = Some(now + self.frame_interval);
         self.last_cpu_ms = t0.elapsed().as_secs_f32() * 1_000.0;
         let snapshot = self.current_stats();
         self.last_render_stats = Some(snapshot);
@@ -4052,11 +4090,12 @@ fn build_hud_instances(
     let panel_w = 160.0 * scale;
     let radius = 6.0 * scale;
 
-    let lines: [String; 9] = [
+    let lines: [String; 10] = [
         format!("cpu  {:>5.2} ms", stats.cpu_ms),
         format!("gpu  {:>5.2} ms", stats.gpu_ms),
         format!("opq  {:>5.2} ms", stats.opaque_ms),
         format!("fnl  {:>5.2} ms", stats.final_ms),
+        format!("cmp  {:>5.2} ms", stats.composite_ms),
         format!("inst {:>5}", stats.instance_count),
         format!("draw {:>5}", stats.drawcalls),
         format!("lyr  {:>5}", stats.layer_count),
@@ -4936,6 +4975,7 @@ impl<S> ApplicationHandler for App<S> {
             gpu.set_window_corner_radius(initial_r, self.scale_factor);
         }
         self.window = Some(window_arc);
+        self.refresh_frame_interval();
         log::info!("display scale: {}", self.scale_factor);
 
         // Drain staged PNGs into the image atlas. The atlas allocates
@@ -5115,14 +5155,16 @@ impl<S> ApplicationHandler for App<S> {
                 self.ctx.tree.mark_all_dirty();
                 self.flush_tree();
                 self.last_move_resize = Some(Instant::now());
-                self.request_redraw();
+                // Unpaced: starts the modal paint chain, which paces itself.
+                self.request_redraw_now();
             }
             WindowEvent::Moved(_) => {
                 // A window drag runs the OS modal move loop — kick the
                 // modal paint chain (see `RedrawRequested`) so animations
                 // and video keep running while the window is dragged.
                 self.last_move_resize = Some(Instant::now());
-                self.request_redraw();
+                self.refresh_frame_interval();
+                self.request_redraw_now();
             }
             WindowEvent::ScaleFactorChanged {
                 scale_factor,
@@ -5173,11 +5215,20 @@ impl<S> ApplicationHandler for App<S> {
                     .map(|t| t.elapsed() < MODAL_PUMP)
                     .unwrap_or(false);
                 if modal {
+                    // No `about_to_wait` (so no timed wake) inside the
+                    // modal loop: WM_PAINT is the only clock, so pace the
+                    // chain by waiting out the rest of this refresh here.
+                    // Bounded by one interval — never a longer hold.
+                    if let Some(until) = self.render_hold_until {
+                        let wait = until.saturating_duration_since(Instant::now());
+                        std::thread::sleep(wait.min(self.frame_interval));
+                        self.render_hold_until = None;
+                    }
                     self.pump_modal_frame();
                 }
                 self.render_once();
                 if modal {
-                    self.request_redraw();
+                    self.request_redraw_now();
                 }
             }
             WindowEvent::Occluded(occluded) => {

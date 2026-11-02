@@ -167,6 +167,108 @@ impl LayerDraw {
             None => surface,
         }
     }
+
+    /// The composite quad + sampling window this layer draws with — the
+    /// one derivation both the GPU uniform and the damage mapping read, so
+    /// they can't disagree about where a layer lands on screen.
+    fn composite_uniform(&self, surface_size: [f32; 2]) -> CompositeUniform {
+        match self.window {
+            // Scroll layer: quad at the container rect, sampling a 1:1-px
+            // window of the tall texture at the scroll offset, clipped to
+            // the container rect.
+            Some(w) => CompositeUniform {
+                dst_origin: w.dst_origin,
+                dst_size: w.dst_size,
+                src_origin: w.src_origin,
+                src_extent: w.dst_size,
+                tex_size: w.tex_size,
+                surface_size,
+                clip_rect: w.clip_rect,
+                corner_radius: self.corner_radius,
+                opacity: self.opacity,
+                edge_fade_falloff: self.edge_fade_falloff,
+                _pad: [0.0; 2],
+                edge_fade: self.edge_fade,
+            },
+            // Full-surface identity (P2/P3 parity): quad = offset +
+            // corner*surface*scale, uv = corner (whole texture). The
+            // layer texture is surface-sized, so tex_size = surface.
+            // `round_rect` rounds the *composited* result at a sub-rect (a
+            // grouped card masked once after its content is drawn).
+            None => CompositeUniform {
+                dst_origin: self.offset,
+                dst_size: [
+                    surface_size[0] * self.scale[0],
+                    surface_size[1] * self.scale[1],
+                ],
+                src_origin: [0.0, 0.0],
+                src_extent: surface_size,
+                tex_size: surface_size,
+                surface_size,
+                clip_rect: self.round_rect.unwrap_or(NO_CLIP),
+                corner_radius: if self.round_rect.is_some() {
+                    self.corner_radius
+                } else {
+                    [0.0; 4]
+                },
+                opacity: self.opacity,
+                edge_fade_falloff: self.edge_fade_falloff,
+                _pad: [0.0; 2],
+                edge_fade: self.edge_fade,
+            },
+        }
+    }
+
+    /// The screen rect (physical `[x0, y0, x1, y1]`) a change to this layer
+    /// repaints: `band` is the changed region in the layer's own texture
+    /// space (`None` = the whole texture), mapped through the composite
+    /// quad and bounded by it and its clip. `None` when nothing of it is
+    /// on screen.
+    pub(crate) fn screen_damage(
+        &self,
+        surface_size: [f32; 2],
+        band: Option<[u32; 4]>,
+    ) -> Option<[f32; 4]> {
+        let u = self.composite_uniform(surface_size);
+        let quad = [
+            u.dst_origin[0],
+            u.dst_origin[1],
+            u.dst_origin[0] + u.dst_size[0],
+            u.dst_origin[1] + u.dst_size[1],
+        ];
+        let mut r = intersect(
+            intersect(quad, u.clip_rect),
+            [0.0, 0.0, surface_size[0], surface_size[1]],
+        );
+        if let Some([x, y, w, h]) = band {
+            // Texture → screen: the inverse of the vertex shader's
+            // `uv = src_origin + corner * src_extent` over the quad.
+            let sx = u.dst_size[0] / u.src_extent[0].max(1.0);
+            let sy = u.dst_size[1] / u.src_extent[1].max(1.0);
+            let map = |tx: f32, ty: f32| {
+                [
+                    u.dst_origin[0] + (tx - u.src_origin[0]) * sx,
+                    u.dst_origin[1] + (ty - u.src_origin[1]) * sy,
+                ]
+            };
+            // One texel of slack each side: bilinear sampling at the
+            // band's edge reads its neighbour.
+            let [x0, y0] = map(x as f32 - 1.0, y as f32 - 1.0);
+            let [x1, y1] = map((x + w) as f32 + 1.0, (y + h) as f32 + 1.0);
+            r = intersect(r, [x0, y0, x1, y1]);
+        }
+        (r[2] > r[0] && r[3] > r[1]).then_some(r)
+    }
+}
+
+/// Overlap of two `[x0, y0, x1, y1]` rects (may come out empty/inverted).
+fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+        a[2].min(b[2]),
+        a[3].min(b[3]),
+    ]
 }
 
 struct LayerTexture {
@@ -565,6 +667,12 @@ impl LayerResources {
         force || self.sigs.get(i).copied().flatten() != Some(sig)
     }
 
+    /// Whether slot `i`'s texture holds a render at all (one a damage band
+    /// can be patched into) — `false` for a fresh or just-reallocated slot.
+    pub fn has_content(&self, i: usize) -> bool {
+        self.sigs.get(i).copied().flatten().is_some()
+    }
+
     /// Record that slot `i`'s texture now holds the render of `sig`.
     pub fn mark_rastered(&mut self, i: usize, sig: u64) {
         if let Some(slot) = self.sigs.get_mut(i) {
@@ -581,51 +689,7 @@ impl LayerResources {
         draw: &LayerDraw,
         surface_size: [f32; 2],
     ) {
-        let u = match draw.window {
-            // Scroll layer: quad at the container rect, sampling a 1:1-px
-            // window of the tall texture at the scroll offset, clipped to
-            // the container rect.
-            Some(w) => CompositeUniform {
-                dst_origin: w.dst_origin,
-                dst_size: w.dst_size,
-                src_origin: w.src_origin,
-                src_extent: w.dst_size,
-                tex_size: w.tex_size,
-                surface_size,
-                clip_rect: w.clip_rect,
-                corner_radius: draw.corner_radius,
-                opacity: draw.opacity,
-                edge_fade_falloff: draw.edge_fade_falloff,
-                _pad: [0.0; 2],
-                edge_fade: draw.edge_fade,
-            },
-            // Full-surface identity (P2/P3 parity): quad = offset +
-            // corner*surface*scale, uv = corner (whole texture). The
-            // layer texture is surface-sized, so tex_size = surface.
-            // `round_rect` rounds the *composited* result at a sub-rect (a
-            // grouped card masked once after its content is drawn).
-            None => CompositeUniform {
-                dst_origin: draw.offset,
-                dst_size: [
-                    surface_size[0] * draw.scale[0],
-                    surface_size[1] * draw.scale[1],
-                ],
-                src_origin: [0.0, 0.0],
-                src_extent: surface_size,
-                tex_size: surface_size,
-                surface_size,
-                clip_rect: draw.round_rect.unwrap_or(NO_CLIP),
-                corner_radius: if draw.round_rect.is_some() {
-                    draw.corner_radius
-                } else {
-                    [0.0; 4]
-                },
-                opacity: draw.opacity,
-                edge_fade_falloff: draw.edge_fade_falloff,
-                _pad: [0.0; 2],
-                edge_fade: draw.edge_fade,
-            },
-        };
+        let u = draw.composite_uniform(surface_size);
         queue.write_buffer(&self.textures[i].uniform, 0, bytemuck::bytes_of(&u));
     }
 
@@ -843,5 +907,49 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(scroll.texture_size(surface), [300, 4000]);
+    }
+
+    #[test]
+    fn screen_damage_maps_scroll_band_through_offset_and_clip() {
+        let surface = [800.0, 600.0];
+        let scroll = LayerDraw {
+            window: Some(ScrollWindow {
+                dst_origin: [100.0, 50.0],
+                dst_size: [300.0, 400.0],
+                src_origin: [0.0, 120.0],
+                tex_size: [300.0, 4000.0],
+                clip_rect: [100.0, 50.0, 400.0, 300.0],
+            }),
+            ..Default::default()
+        };
+        // Whole layer → quad ∩ clip.
+        assert_eq!(
+            scroll.screen_damage(surface, None),
+            Some([100.0, 50.0, 400.0, 300.0])
+        );
+        // Band at texture y=200..210 → screen y = 50 + (200 - 120) = 130, ±1 texel.
+        assert_eq!(
+            scroll.screen_damage(surface, Some([10, 200, 20, 10])),
+            Some([109.0, 129.0, 131.0, 141.0])
+        );
+        // Band scrolled out of the clip → nothing on screen.
+        assert_eq!(scroll.screen_damage(surface, Some([0, 3000, 10, 10])), None);
+    }
+
+    #[test]
+    fn screen_damage_identity_layer_follows_offset() {
+        let surface = [800.0, 600.0];
+        let moved = LayerDraw {
+            offset: [20.0, 0.0],
+            ..Default::default()
+        };
+        assert_eq!(
+            moved.screen_damage(surface, Some([0, 0, 10, 10])),
+            Some([20.0, 0.0, 31.0, 11.0])
+        );
+        assert_eq!(
+            moved.screen_damage(surface, None),
+            Some([20.0, 0.0, 800.0, 600.0])
+        );
     }
 }

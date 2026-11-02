@@ -22,8 +22,74 @@ use crate::text::TextResources;
 // `TextResources` is owned by `SceneCtx`, not the renderer — shape/measure
 // passes need it too, and keeping it scene-side avoids a borrow split.
 use super::timing::{
-    FrameTiming, PASS_FINAL, PASS_OD_COMPOSE, PASS_OD_COUNT, PASS_OPAQUE, PassAlloc, Timing,
+    FrameTiming, PASS_COMPOSITE, PASS_FINAL, PASS_OD_COMPOSE, PASS_OD_COUNT, PASS_OPAQUE,
+    PassAlloc, Timing,
 };
+
+/// What a layer raster repainted: its whole texture, or one damage band
+/// (`[x, y, w, h]`, texture px) of it.
+#[derive(Clone, Copy, Debug)]
+enum Rastered {
+    Whole,
+    Band([u32; 4]),
+}
+
+/// How much of a cached surface — a layer texture, or the composited
+/// frame — has to be repainted. Repainting everything is what a hover tint
+/// or a video tick used to cost: a page-sized layer re-raster, a dozen
+/// surface-sized blends. Tracking the changed rect instead keeps the rest
+/// of the cache and repaints only that.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Repaint {
+    /// Nothing changed; the cache is already current.
+    None,
+    /// Repaint inside this `[x0, y0, x1, y1]` rect only.
+    Rect([f32; 4]),
+    /// Repaint everything.
+    Full,
+}
+
+/// `rect` (`[x0, y0, x1, y1]`) as a texture scissor band `[x, y, w, h]`,
+/// rounded outwards and clamped to `bounds`; `None` when nothing is left.
+fn texture_band(rect: [f32; 4], bounds: [u32; 2]) -> Option<[u32; 4]> {
+    let x = (rect[0].floor().max(0.0) as u32).min(bounds[0]);
+    let y = (rect[1].floor().max(0.0) as u32).min(bounds[1]);
+    let w = ((rect[2].ceil().max(0.0) as u32).min(bounds[0])).saturating_sub(x);
+    let h = ((rect[3].ceil().max(0.0) as u32).min(bounds[1])).saturating_sub(y);
+    (w > 0 && h > 0).then_some([x, y, w, h])
+}
+
+impl Repaint {
+    /// Grow to cover `rect` too.
+    fn add(&mut self, rect: Option<[f32; 4]>) {
+        let Some(r) = rect else { return };
+        *self = match *self {
+            Self::None => Self::Rect(r),
+            Self::Rect(a) => Self::Rect([
+                a[0].min(r[0]),
+                a[1].min(r[1]),
+                a[2].max(r[2]),
+                a[3].max(r[3]),
+            ]),
+            Self::Full => Self::Full,
+        };
+    }
+
+    /// The rect as a scissor (`x, y, w, h`, rounded outwards and clamped to
+    /// `surface`), or `None` when it covers the surface anyway — a scissored
+    /// recomposite of everything is just a full one with extra steps.
+    fn scissor(self, surface: [u32; 2]) -> Option<[u32; 4]> {
+        let Self::Rect([x0, y0, x1, y1]) = self else {
+            return None;
+        };
+        let x0 = (x0.floor().max(0.0) as u32).min(surface[0]);
+        let y0 = (y0.floor().max(0.0) as u32).min(surface[1]);
+        let x1 = (x1.ceil().max(0.0) as u32).min(surface[0]);
+        let y1 = (y1.ceil().max(0.0) as u32).min(surface[1]);
+        let whole = x0 == 0 && y0 == 0 && x1 == surface[0] && y1 == surface[1];
+        (!whole && x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
+    }
+}
 
 /// The view(s) the composite pass samples for one external frame.
 /// `Nv12` carries the two plane views (R8 luma + RG8 chroma) consumed by
@@ -141,6 +207,25 @@ pub struct GpuContext {
     /// glass simply re-frosts when its own backdrop (everything beneath it)
     /// changes, whatever that content is.
     layer_composite_changed: Vec<bool>,
+    /// Some field of the layer draw list changed since the last composite
+    /// (any `set_layers` that wasn't a no-op). Forces a full composite.
+    layers_changed: bool,
+    /// The offscreen frame holds a complete composite of the current draw
+    /// list — the precondition for recompositing only a damage rect over
+    /// it. Dropped by anything that touches pixels outside the layer model
+    /// (resize, the HUD overlay, overdraw mode).
+    frame_valid: bool,
+    /// External nodes whose shown texture changed since the last composite
+    /// (a video advanced a frame). Their layers' rects are the damage.
+    external_damage: Vec<crate::node::NodeId>,
+    /// Instances whose bytes changed since the last frame (index, and the
+    /// pixels the change can touch — old ∪ new [`ShapeInstance::footprint`],
+    /// `None` = unknowable), from `set_instances`' upload diff. What a layer
+    /// re-raster repaints instead of its whole texture.
+    content_damage: Vec<(u32, Option<[f32; 4]>)>,
+    /// Instance slots or layer ranges were reshuffled since the last frame,
+    /// so a cached layer texture can't be patched — it re-rasters whole.
+    instances_reshaped: bool,
 
     /// Timestamp query resources. `Some` when the adapter advertises
     /// `Features::TIMESTAMP_QUERY`, `None` otherwise. Reads happen on
@@ -308,13 +393,25 @@ impl GpuContext {
         .into_iter()
         .find(|m| caps.alpha_modes.contains(m))
         .unwrap_or(caps.alpha_modes[0]);
+        // Tear-free either way; the difference is what waits. Under FIFO a
+        // present into a full queue parks the *GPU queue* on the vblank
+        // (Vulkan on Windows), and that wait is booked — and clocked — as
+        // GPU load: a 25 fps Canvas read ~2× its real cost. Mailbox never
+        // blocks; frame pacing comes from the event loop's own deadlines,
+        // not the swapchain, so nothing renders faster for it. FIFO stays
+        // the fallback (Metal, and any surface without mailbox).
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::AutoVsync
+        };
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
             width,
             height,
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode,
             alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -323,7 +420,9 @@ impl GpuContext {
         #[cfg(target_os = "macos")]
         Self::allow_drawable_timeout(&window);
 
-        log::info!("gpu init: format={format:?} alpha={alpha_mode:?} size={width}x{height}");
+        log::info!(
+            "gpu init: format={format:?} alpha={alpha_mode:?} present={present_mode:?} size={width}x{height}"
+        );
 
         let glyph_atlas = GlyphAtlas::new(&device, 1024);
         // Allocate the image atlas **large up front**. Growing re-uploads
@@ -441,6 +540,11 @@ impl GpuContext {
             layer_composite_changed: Vec::new(),
             prev_instances: Vec::new(),
             backdrop_dirty: true,
+            layers_changed: true,
+            frame_valid: false,
+            external_damage: Vec::new(),
+            content_damage: Vec::new(),
+            instances_reshaped: true,
             timing,
             last_drawcalls: 0,
             last_layer_count: 1,
@@ -486,12 +590,26 @@ impl GpuContext {
         self.layers
             .resize(self.surface_config.width, self.surface_config.height);
         self.backdrop_dirty = true;
+        self.frame_valid = false;
     }
 
-    /// Set the per-frame layer draw list (from the CPU `LayerTree`).
-    /// `encode_frame` rasters each layer's instance sub-range into its
-    /// texture, then composites them to the surface in z-order. An empty
-    /// list falls back to a single root layer spanning every instance.
+    /// Show `view` for external `node`, queueing its layer's rect as
+    /// composite damage — every change to what an external layer samples
+    /// goes through here or [`hide_external`](Self::hide_external), so a
+    /// video tick can never be missed by the damage-rect composite.
+    fn show_external(&mut self, node: crate::node::NodeId, view: ExternalShown) {
+        self.external_textures.insert(node, view);
+        self.external_damage.push(node);
+    }
+
+    /// Stop showing anything for external `node` (its layer composites
+    /// transparent), queueing the damage like [`show_external`](Self::show_external).
+    fn hide_external(&mut self, node: crate::node::NodeId) {
+        if self.external_textures.remove(&node).is_some() {
+            self.external_damage.push(node);
+        }
+    }
+
     /// Register (or replace) the external texture for an `.external()`
     /// node (P6). The composite pass samples it for that node's layer
     /// instead of a rastered slot texture. Pass a `TextureView` over the
@@ -499,14 +617,13 @@ impl GpuContext {
     /// (and request a redraw to recomposite). Unregistered external nodes
     /// composite empty until set.
     pub fn set_external_texture(&mut self, node: crate::node::NodeId, view: wgpu::TextureView) {
-        self.external_textures
-            .insert(node, ExternalShown::Rgba(view));
+        self.show_external(node, ExternalShown::Rgba(view));
     }
 
     /// Drop a node's external texture + any resident frame set (e.g. video
     /// stopped / node gone), freeing the VRAM.
     pub fn clear_external_texture(&mut self, node: crate::node::NodeId) {
-        self.external_textures.remove(&node);
+        self.hide_external(node);
         self.external_owned.remove(&node);
         self.external_frame_sets.remove(&node);
     }
@@ -661,7 +778,7 @@ impl GpuContext {
         match self.external_frame_sets.get(&node) {
             Some(set) if set.epoch != epoch => {
                 self.external_frame_sets.remove(&node);
-                self.external_textures.remove(&node);
+                self.hide_external(node);
             }
             _ => {}
         }
@@ -671,7 +788,7 @@ impl GpuContext {
         set.bytes += bytes;
         set.frames.push(frame);
         // Show the just-uploaded frame.
-        self.external_textures.insert(node, shown);
+        self.show_external(node, shown);
     }
 
     /// Bind `node`'s shown texture to frame `index` of its resident set.
@@ -683,7 +800,7 @@ impl GpuContext {
             && set.epoch == epoch
             && let Some(frame) = set.frames.get(index)
         {
-            self.external_textures.insert(node, frame.shown.clone());
+            self.show_external(node, frame.shown.clone());
         }
     }
 
@@ -699,6 +816,7 @@ impl GpuContext {
             return;
         }
         if let Some(mut set) = self.external_frame_sets.remove(&old) {
+            self.external_damage.push(old);
             let shown = self
                 .external_textures
                 .remove(&old)
@@ -716,7 +834,7 @@ impl GpuContext {
                 set.frames.extend(existing.frames);
             }
             if let Some(view) = shown {
-                self.external_textures.insert(new, view);
+                self.show_external(new, view);
             }
             self.external_frame_sets.insert(new, set);
         }
@@ -777,10 +895,13 @@ impl GpuContext {
             size,
         );
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        self.external_textures
-            .insert(node, ExternalShown::Rgba(view));
+        self.show_external(node, ExternalShown::Rgba(view));
     }
 
+    /// Set the per-frame layer draw list (from the CPU `LayerTree`).
+    /// `encode_frame` rasters each layer's instance sub-range into its
+    /// texture, then composites them to the surface in z-order. An empty
+    /// list falls back to a single root layer spanning every instance.
     pub fn set_layers(&mut self, draws: &[super::layer::LayerDraw]) {
         // Generic glass (P4) sources its backdrop from the composite of the
         // layers *below* it. Those layers can change composite-only (a scroll
@@ -791,6 +912,12 @@ impl GpuContext {
         // (`encode_frame`) rebuilds a glass iff any layer below it is flagged
         // (or re-rastered). No glass is special — this is purely "did the
         // stuff beneath you move?", so glasses can be added/removed freely.
+        self.layers_changed |= draws != self.layer_draws.as_slice();
+        self.instances_reshaped |= draws.len() != self.layer_draws.len()
+            || draws
+                .iter()
+                .zip(&self.layer_draws)
+                .any(|(a, b)| a.instances != b.instances);
         self.layer_composite_changed.clear();
         self.layer_composite_changed.reserve(draws.len());
         for (i, d) in draws.iter().enumerate() {
@@ -817,10 +944,9 @@ impl GpuContext {
     /// reuse the cached texture. `has_glass` lets the caller force a
     /// re-raster when the backdrop pyramid changed (glass samples it).
     /// The rect covering every **animated** instance in `range`, in the
-    /// layer's own raster space, clamped to its texture. `None` when the
-    /// layer holds none (or they're off-texture), which means there is
-    /// nothing to repaint.
-    fn animated_damage(&self, range: &std::ops::Range<u32>, bounds: [u32; 2]) -> Option<[u32; 4]> {
+    /// layer's own raster space. `None` when the layer holds none, which
+    /// means there is nothing to repaint.
+    fn animated_damage(&self, range: &std::ops::Range<u32>) -> Option<[f32; 4]> {
         /// How far outside its own box a text effect may carry a glyph,
         /// as a multiple of the glyph's size. Generous on purpose: the
         /// cost is a slightly wider repaint band, and the cost of getting
@@ -828,8 +954,7 @@ impl GpuContext {
         const TEXT_FX_TRAVEL: f32 = 1.5;
         let start = (range.start as usize).min(self.prev_instances.len());
         let end = (range.end as usize).min(self.prev_instances.len());
-        let mut min = [f32::MAX; 2];
-        let mut max = [f32::MIN; 2];
+        let mut out = Repaint::None;
         for inst in &self.prev_instances[start..end] {
             if inst.shape_kind & super::instance::SHAPE_FLAG_ANIMATED == 0 {
                 continue;
@@ -844,19 +969,33 @@ impl GpuContext {
             } else {
                 [0.0, 0.0]
             };
-            min[0] = min[0].min(inst.position[0] - pad[0]);
-            min[1] = min[1].min(inst.position[1] - pad[1]);
-            max[0] = max[0].max(inst.position[0] + inst.size[0] + pad[0]);
-            max[1] = max[1].max(inst.position[1] + inst.size[1] + pad[1]);
+            out.add(Some([
+                inst.position[0] - pad[0],
+                inst.position[1] - pad[1],
+                inst.position[0] + inst.size[0] + pad[0],
+                inst.position[1] + inst.size[1] + pad[1],
+            ]));
         }
-        if min[0] > max[0] {
-            return None;
+        match out {
+            Repaint::Rect(r) => Some(r),
+            _ => None,
         }
-        let x = (min[0].floor().max(0.0) as u32).min(bounds[0]);
-        let y = (min[1].floor().max(0.0) as u32).min(bounds[1]);
-        let w = ((max[0].ceil().max(0.0) as u32).min(bounds[0])).saturating_sub(x);
-        let h = ((max[1].ceil().max(0.0) as u32).min(bounds[1])).saturating_sub(y);
-        (w > 0 && h > 0).then_some([x, y, w, h])
+    }
+
+    /// What this frame's instance changes in `range` repaint, in the layer's
+    /// raster space: the union of the changed instances' footprints, or
+    /// [`Repaint::Full`] when any of them can't be bounded.
+    fn content_repaint(&self, range: &std::ops::Range<u32>) -> Repaint {
+        let mut out = Repaint::None;
+        for &(i, rect) in &self.content_damage {
+            if range.contains(&i) {
+                match rect {
+                    Some(r) => out.add(Some(r)),
+                    None => return Repaint::Full,
+                }
+            }
+        }
+        out
     }
 
     /// Content hash of a layer's instance range, plus whether it holds
@@ -888,6 +1027,7 @@ impl GpuContext {
 
     pub fn set_overdraw(&mut self, on: bool) {
         self.overdraw_mode = on;
+        self.frame_valid = false;
         if on && self.overdraw.is_none() {
             self.overdraw = Some(OverdrawResources::new(
                 &self.device,
@@ -1006,6 +1146,7 @@ impl GpuContext {
             }
             self.prev_instances.clear();
             self.prev_instances.extend_from_slice(instances);
+            self.instances_reshaped = true;
         } else {
             let mut i = 0;
             while i < instances.len() {
@@ -1027,6 +1168,24 @@ impl GpuContext {
                     (start as u64) * stride,
                     bytemuck::cast_slice(&instances[start..end]),
                 );
+                let changed = self.prev_instances[start..end]
+                    .iter()
+                    .zip(&instances[start..end])
+                    .zip(start as u32..);
+                for ((old, new), j) in changed {
+                    // Old and new footprint: a moved/resized instance must
+                    // clear where it was as well as paint where it is.
+                    let rect = match (old.footprint(), new.footprint()) {
+                        (Some(a), Some(b)) => Some([
+                            a[0].min(b[0]),
+                            a[1].min(b[1]),
+                            a[2].max(b[2]),
+                            a[3].max(b[3]),
+                        ]),
+                        _ => None,
+                    };
+                    self.content_damage.push((j, rect));
+                }
                 self.prev_instances[start..end].copy_from_slice(&instances[start..end]);
             }
         }
@@ -1286,6 +1445,11 @@ impl GpuContext {
             self.queue
                 .write_buffer(&self.overlay_buffer, 0, bytemuck::cast_slice(instances));
         }
+        // The overlay draws into the offscreen frame on top of the layers,
+        // outside any layer's damage — repaint it all whenever it changes.
+        if self.overlay_count > 0 || !instances.is_empty() {
+            self.frame_valid = false;
+        }
         self.overlay_count = instances.len() as u32;
     }
 
@@ -1310,13 +1474,12 @@ impl GpuContext {
     }
 
     /// Rasterize one layer's instance sub-range into its offscreen texture
-    /// (`fs_main`, cleared transparent). Honors raster-skip: returns
-    /// `false` (no pass encoded) when the slot's content signature is
-    /// unchanged and `force` is false. `ts_pair` is the optional
-    /// timestamp write-index pair (used only by the root layer's
-    /// PASS_FINAL slot); the query set is read from `self.timing` here so
-    /// the caller doesn't hold a `&self.timing` borrow across this
-    /// `&mut self` call.
+    /// (`fs_main`, cleared transparent), returning what it repainted.
+    /// Honors raster-skip: returns `None` (no pass encoded) when the slot's content signature is
+    /// unchanged and `force` is false. A raster that does encode takes a
+    /// `PASS_FINAL` timestamp pair from `alloc` (when timing is on); the
+    /// query set is read from `self.timing` here so the caller doesn't hold
+    /// a `&self.timing` borrow across this `&mut self` call.
     ///
     /// Split out of the old single raster loop so P4 can raster the
     /// below-glass layers **before** the backdrop build (which composites
@@ -1327,11 +1490,11 @@ impl GpuContext {
         i: usize,
         draw: &super::layer::LayerDraw,
         force: bool,
-        ts_pair: Option<(u32, u32)>,
-    ) -> bool {
+        alloc: &mut PassAlloc,
+    ) -> Option<Rastered> {
         let (sig, _, animated) = self.layer_signature(&draw.instances);
         if draw.instances.is_empty() {
-            return false;
+            return None;
         }
         // Content changed (or the caller forced it) → a full raster.
         // Otherwise an animated effect is the only reason to redraw, and
@@ -1340,18 +1503,44 @@ impl GpuContext {
         // instead of a page-sized clear is the difference between a
         // continuous animation costing a few percent of the GPU and
         // costing a third of it.
-        let full = self.layers.needs_raster(i, sig, force);
-        let damage = if full {
-            None
-        } else if animated {
-            self.animated_damage(&draw.instances, self.layers.slot_size(i))
+        //
+        // The same holds for an ordinary content change (a hover tint, a
+        // label update): the texture still holds last frame's render, so
+        // only the changed instances' footprints need repainting — unless
+        // there's no usable render to patch (fresh, reshuffled, or forced).
+        let changed = self.layers.needs_raster(i, sig, false);
+        let patchable = !force && !self.instances_reshaped && self.layers.has_content(i);
+        let mut repaint = if force || (changed && !patchable) {
+            Repaint::Full
+        } else if changed {
+            self.content_repaint(&draw.instances)
         } else {
-            return false;
+            Repaint::None
         };
-        if !full && damage.is_none() {
-            return false;
+        if animated {
+            repaint.add(self.animated_damage(&draw.instances));
         }
+        let damage = match repaint {
+            Repaint::None => return None,
+            Repaint::Full => None,
+            Repaint::Rect(r) => match texture_band(r, self.layers.slot_size(i)) {
+                Some(band) => Some(band),
+                None => {
+                    // The change landed off this texture: nothing to paint,
+                    // but the texture is current for the new content.
+                    self.layers.mark_rastered(i, sig);
+                    return None;
+                }
+            },
+        };
         {
+            // Allocated only now that this pass is certain to be encoded:
+            // an unwritten pair in the resolved range would read garbage.
+            let ts_pair = self
+                .timing
+                .is_some()
+                .then(|| alloc.alloc(PASS_FINAL))
+                .flatten();
             let ts = match (self.timing.as_ref(), ts_pair) {
                 (Some(t), Some((b, e))) => Some(wgpu::RenderPassTimestampWrites {
                     query_set: &t.query_set,
@@ -1405,7 +1594,10 @@ impl GpuContext {
             rpass.draw(0..6, draw.instances.clone());
         }
         self.layers.mark_rastered(i, sig);
-        true
+        Some(match damage {
+            Some(band) => Rastered::Band(band),
+            None => Rastered::Whole,
+        })
     }
 
     /// Encode the opaque pass, downsample dispatches (if needed), and
@@ -1426,37 +1618,22 @@ impl GpuContext {
         // is never sampled; if backdrop content hasn't changed since the
         // last submit the existing pyramid is still valid.
         let has_glass = self.glass_count() > 0;
-        // Whether any backdrop build will *likely* run this frame (a
-        // blur_source changed, or some layer's composite moved). Per-glass
-        // `need` below decides which glasses actually rebuild; this only
-        // gates the shared timing-query allocation. (A build triggered purely
-        // by a below-layer re-raster may go untimed — timing is debug-only.)
-        let run_backdrop =
-            has_glass && (self.backdrop_dirty || self.layer_composite_changed.iter().any(|&c| c));
-        // Pre-allocate query pairs for every pass that will run this
-        // frame. The pair indices are dense so `resolve_query_set` can
-        // cover a contiguous prefix.
-        let (opaque_begin, opaque_end) = if has_timing && run_backdrop {
-            let (b, e) = alloc.alloc(PASS_OPAQUE);
-            (Some(b), Some(e))
-        } else {
-            (None, None)
-        };
-        let (final_begin, final_end) = if has_timing {
-            let (b, e) = alloc.alloc(PASS_FINAL);
-            (Some(b), Some(e))
+        // Pre-allocate query pairs for the passes certain to run this frame
+        // (backdrop builds and rasters allocate their own as they encode).
+        // The pair indices are dense so `resolve_query_set` can cover a
+        // contiguous prefix.
+        let (composite_begin, composite_end) = if has_timing {
+            alloc.alloc(PASS_COMPOSITE).unzip()
         } else {
             (None, None)
         };
         let (od_count_begin, od_count_end) = if has_timing && self.overdraw_mode {
-            let (b, e) = alloc.alloc(PASS_OD_COUNT);
-            (Some(b), Some(e))
+            alloc.alloc(PASS_OD_COUNT).unzip()
         } else {
             (None, None)
         };
         let (od_compose_begin, od_compose_end) = if has_timing && self.overdraw_mode {
-            let (b, e) = alloc.alloc(PASS_OD_COMPOSE);
-            (Some(b), Some(e))
+            alloc.alloc(PASS_OD_COMPOSE).unzip()
         } else {
             (None, None)
         };
@@ -1527,6 +1704,23 @@ impl GpuContext {
         // the list scrolling beneath it, not just the ambient backdrop.
         let mut raster_count = 0u32;
         let mut rastered = vec![false; draws.len()];
+        // What the composite has to repaint. A frame that can't trust its
+        // previous composite starts (and stays) full; otherwise each change
+        // below adds its layer's on-screen rect.
+        let mut damage = if !self.frame_valid
+            || self.layers_changed
+            || self.overlay_count > 0
+            || self.overdraw_mode
+        {
+            Repaint::Full
+        } else {
+            Repaint::None
+        };
+        for node in std::mem::take(&mut self.external_damage) {
+            for d in draws.iter().filter(|d| d.external == Some(node)) {
+                damage.add(d.screen_damage(screen, None));
+            }
+        }
         let glass_pps: Vec<usize> = order_paint
             .iter()
             .enumerate()
@@ -1540,23 +1734,22 @@ impl GpuContext {
                 if rastered[li] {
                     false
                 } else {
-                    let ts = if li == 0 {
-                        final_begin.zip(final_end)
-                    } else {
-                        None
-                    };
                     let d = draws[li].clone();
-                    let did = self.raster_layer(encoder, li, &d, $force, ts);
-                    if did {
+                    let did = self.raster_layer(encoder, li, &d, $force, &mut alloc);
+                    if let Some(r) = did {
                         drawcalls += 1;
                         raster_count += 1;
+                        let band = match r {
+                            Rastered::Whole => None,
+                            Rastered::Band(b) => Some(b),
+                        };
+                        damage.add(d.screen_damage(screen, band));
                     }
                     rastered[li] = true;
-                    did
+                    did.is_some()
                 }
             }};
         }
-        let mut built_backdrop = false;
         let mut backdrop_builds = 0u32;
         // Did any layer processed so far (in ascending z) change since last
         // frame — re-rastered (content) or moved (composite)? Accumulated as
@@ -1618,15 +1811,14 @@ impl GpuContext {
                     let rel = crate::gpu::instance::first_glass_index(&self.prev_instances[s..e]);
                     gstart as u32 + rel
                 };
-                // GPU timing attaches to the first build of the frame only.
-                let backdrop_ts = match (self.timing.as_ref(), opaque_begin.zip(opaque_end)) {
-                    (Some(t), Some((b, e))) if !built_backdrop => {
-                        Some(wgpu::RenderPassTimestampWrites {
-                            query_set: &t.query_set,
-                            beginning_of_pass_write_index: Some(b),
-                            end_of_pass_write_index: Some(e),
-                        })
-                    }
+                // Every build is timed (they sum into `opaque_ms`).
+                let backdrop_pair = has_timing.then(|| alloc.alloc(PASS_OPAQUE)).flatten();
+                let backdrop_ts = match (self.timing.as_ref(), backdrop_pair) {
+                    (Some(t), Some((b, e))) => Some(wgpu::RenderPassTimestampWrites {
+                        query_set: &t.query_set,
+                        beginning_of_pass_write_index: Some(b),
+                        end_of_pass_write_index: Some(e),
+                    }),
                     _ => None,
                 };
                 {
@@ -1668,7 +1860,6 @@ impl GpuContext {
                 }
                 // Downsample mip0 → pyramid for this glass layer to sample.
                 self.blur.run_downsample(encoder);
-                built_backdrop = true;
                 backdrop_builds += 1;
             }
             // Raster the glass layer (samples the freshly-built pyramid;
@@ -1727,11 +1918,26 @@ impl GpuContext {
                 None => CompositeBg::Slot(i),
             })
             .collect();
-        // Composite the whole frame into the offscreen target; the final
-        // window-round pass below blits it to the swapchain with rounded
-        // corners (one corner boundary over the composited result, so stacked
-        // translucent layers can't leak the back one at the arc).
-        {
+        // Composite into the offscreen target; the final window-round pass
+        // below blits it to the swapchain with rounded corners (one corner
+        // boundary over the composited result, so stacked translucent layers
+        // can't leak the back one at the arc). The offscreen frame persists
+        // between frames, so only the damage needs recompositing: nothing
+        // at all when no pixel moved, one scissored rect when a single
+        // layer changed (a video tick), the whole surface otherwise.
+        let scissor = damage.scissor(surface_px);
+        let composite_ts = composite_begin.zip(composite_end);
+        if damage != Repaint::None {
+            let ts = match (self.timing.as_ref(), composite_ts) {
+                // Composite + window-round are timed as one span: the
+                // round pass closes it (or this one does, when it's skipped).
+                (Some(t), Some((b, e))) => Some(wgpu::RenderPassTimestampWrites {
+                    query_set: &t.query_set,
+                    beginning_of_pass_write_index: Some(b),
+                    end_of_pass_write_index: self.overdraw_mode.then_some(e),
+                }),
+                _ => None,
+            };
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("opal.composite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1739,15 +1945,26 @@ impl GpuContext {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: match scissor {
+                            Some(_) => wgpu::LoadOp::Load,
+                            None => wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: ts,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some([x, y, w, h]) = scissor {
+                // Keep the frame outside the rect; reset inside it so the
+                // layers blend over transparent, exactly as a full pass does.
+                rpass.set_scissor_rect(x, y, w, h);
+                rpass.set_pipeline(&self.shape.clear_pipeline);
+                rpass.draw(0..3, 0..1);
+                drawcalls += 1;
+            }
             rpass.set_pipeline(self.layers.pipeline());
             // Track which composite pipeline is bound — NV12 external
             // layers swap to the yuv pipeline and back; a scene with no
@@ -1791,6 +2008,15 @@ impl GpuContext {
         if !self.overdraw_mode {
             self.window_round
                 .set_uniform(&self.queue, self.window_corner_radius);
+            let ts = match (self.timing.as_ref(), composite_ts) {
+                (Some(t), Some((b, e))) => Some(wgpu::RenderPassTimestampWrites {
+                    query_set: &t.query_set,
+                    // Opens the span itself when the composite was skipped.
+                    beginning_of_pass_write_index: (damage == Repaint::None).then_some(b),
+                    end_of_pass_write_index: Some(e),
+                }),
+                _ => None,
+            };
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("opal.window_round pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1803,7 +2029,7 @@ impl GpuContext {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: ts,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1812,9 +2038,16 @@ impl GpuContext {
             rpass.draw(0..3, 0..1);
             drawcalls += 1;
         }
+        self.frame_valid = true;
+        self.layers_changed = false;
+        self.content_damage.clear();
+        self.instances_reshaped = false;
         self.last_layer_count = draws.len() as u32;
         self.last_raster_count = raster_count;
-        self.last_composite_count = order.len() as u32;
+        self.last_composite_count = match damage {
+            Repaint::None => 0,
+            _ => order.len() as u32,
+        };
 
         // ---- Pass D (optional): overdraw count + compose --------------
         // When toggled on, count shape coverage into an Rgba16Float
@@ -1954,6 +2187,7 @@ impl GpuContext {
             gpu_ms: t.total_ms,
             opaque_ms: t.opaque_ms,
             final_ms: t.final_ms,
+            composite_ms: t.composite_ms,
             overdraw_ms: t.overdraw_ms,
             instance_count: self.instance_count,
             // Non-glass count = everything that enters the backdrop

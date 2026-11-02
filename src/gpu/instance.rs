@@ -113,9 +113,60 @@ pub struct ShapeInstance {
     pub glyph_fx: [f32; 3],
 }
 
+impl ShapeInstance {
+    /// The pixels this instance can paint, `[x0, y0, x1, y1]` in its raster
+    /// space: the quad `vs_main` emits (rect scaled about its centre, padded
+    /// for the drop shadow) cut to its clip rect. `None` when that can't be
+    /// known up front — a glyph running a text effect is placed by the
+    /// shader's clock. Mirrors `vs_main`; keep the two in sync.
+    pub(crate) fn footprint(&self) -> Option<[f32; 4]> {
+        if self.shape_kind & SHAPE_KIND_MASK == SHAPE_KIND_GLYPH && self.effect_param_len > 0 {
+            return None;
+        }
+        let blur = self.shadow_blur.max(0.0) * 2.0;
+        let pad = [
+            self.shadow_offset[0].abs() + blur,
+            self.shadow_offset[1].abs() + blur,
+        ];
+        let half = [
+            self.size[0] * 0.5 * self.scale[0].max(1.0) + pad[0],
+            self.size[1] * 0.5 * self.scale[1].max(1.0) + pad[1],
+        ];
+        let c = [
+            self.position[0] + self.size[0] * 0.5,
+            self.position[1] + self.size[1] * 0.5,
+        ];
+        let k = self.clip_rect;
+        Some([
+            (c[0] - half[0]).max(k[0]),
+            (c[1] - half[1]).max(k[1]),
+            (c[0] + half[0]).min(k[2]),
+            (c[1] + half[1]).min(k[3]),
+        ])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footprint_covers_scale_shadow_and_clip() {
+        let mut s = ShapeInstance::zeroed();
+        s.position = [100.0, 100.0];
+        s.size = [40.0, 20.0];
+        s.scale = [1.5, 1.0];
+        s.shadow_offset = [0.0, 4.0];
+        s.shadow_blur = 2.0;
+        s.clip_rect = NO_CLIP;
+        // centre (120, 110); half = (30 + 4, 10 + 8).
+        assert_eq!(s.footprint(), Some([86.0, 92.0, 154.0, 128.0]));
+        s.clip_rect = [0.0, 0.0, 120.0, 1000.0];
+        assert_eq!(s.footprint(), Some([86.0, 92.0, 120.0, 128.0]));
+        s.shape_kind = SHAPE_KIND_GLYPH;
+        s.effect_param_len = 1;
+        assert_eq!(s.footprint(), None);
+    }
 
     fn inst(kind: u32) -> ShapeInstance {
         let mut s = ShapeInstance::zeroed();
