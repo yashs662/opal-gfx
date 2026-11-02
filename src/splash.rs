@@ -121,12 +121,20 @@ impl SplashBitmap {
     #[cfg(windows)]
     fn bgra_premultiplied(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.rgba.len()];
-        for (s, d) in self.rgba.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
-            let (r, g, b, a) = (s[0] as u32, s[1] as u32, s[2] as u32, s[3] as u32);
-            d[0] = (b * a / 255) as u8;
-            d[1] = (g * a / 255) as u8;
-            d[2] = (r * a / 255) as u8;
-            d[3] = a as u8;
+        for (&[r, g, b, a], d) in self
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<4>().0)
+        {
+            let (r, g, b, a) = (r as u32, g as u32, b as u32, a as u32);
+            *d = [
+                (b * a / 255) as u8,
+                (g * a / 255) as u8,
+                (r * a / 255) as u8,
+                a as u8,
+            ];
         }
         out
     }
