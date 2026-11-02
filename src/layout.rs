@@ -115,6 +115,12 @@ pub struct LayoutStyle {
     /// flow layout. Root nodes treat `Some` as viewport-relative and
     /// `None` as origin `(0, 0)`.
     pub abs: Option<[f32; 2]>,
+    /// On an absolute child: keep it inside the parent's content box. An
+    /// axis that would overflow the far edge flips to the other side of
+    /// the `abs` anchor (a context menu at the bottom-right opens up/left
+    /// of the cursor), then clamps if it still doesn't fit. No effect on
+    /// flow children.
+    pub flip_to_fit: bool,
     /// Per-axis overflow behavior. Default Visible on both axes.
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
@@ -148,6 +154,7 @@ impl Default for LayoutStyle {
             align: Align::Start,
             aspect_ratio: None,
             abs: None,
+            flip_to_fit: false,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             push_end: false,
@@ -162,6 +169,22 @@ impl LayoutStyle {
     }
     pub fn scrolls(&self) -> bool {
         self.overflow_x.scrolls() || self.overflow_y.scrolls()
+    }
+}
+
+/// One axis of [`LayoutStyle::flip_to_fit`]: a span of `size` anchored at
+/// `pos` inside `[start, start + extent)`. Overflowing the far edge mirrors
+/// it across the anchor (it ends at `pos` instead of starting there) when
+/// the mirrored span fits; otherwise it shifts back just enough to fit,
+/// pinned to `start` if it's bigger than the box.
+fn flip_to_fit(pos: f32, size: f32, start: f32, extent: f32) -> f32 {
+    let end = start + extent;
+    if pos + size <= end {
+        pos
+    } else if pos - size >= start {
+        pos - size
+    } else {
+        (end - size).max(start)
     }
 }
 
@@ -670,8 +693,12 @@ fn layout_children<M: Measurer>(tree: &mut NodeTree, parent: NodeId, measurer: &
         } else {
             (0.0, 0.0)
         };
-        let x = content_x + slack_x + abs_off[0] * scale;
-        let y = content_y + slack_y + abs_off[1] * scale;
+        let mut x = content_x + slack_x + abs_off[0] * scale;
+        let mut y = content_y + slack_y + abs_off[1] * scale;
+        if tree.get(c).is_some_and(|n| n.layout.flip_to_fit) {
+            x = flip_to_fit(x, w, content_x, content_w);
+            y = flip_to_fit(y, h, content_y, content_h);
+        }
         if let Some(n) = tree.get_mut_raw(c) {
             n.rect = [x, y, w, h];
         }
@@ -950,6 +977,18 @@ fn _suppress() {
 mod tests {
     use super::*;
     use crate::node::Node;
+
+    #[test]
+    fn flip_to_fit_mirrors_then_clamps() {
+        // Fits: untouched.
+        assert_eq!(flip_to_fit(10.0, 50.0, 0.0, 100.0), 10.0);
+        // Overflows the far edge: mirrored to end at the anchor.
+        assert_eq!(flip_to_fit(90.0, 50.0, 0.0, 100.0), 40.0);
+        // Mirroring would cross the near edge: shifted to fit instead.
+        assert_eq!(flip_to_fit(30.0, 80.0, 0.0, 100.0), 20.0);
+        // Bigger than the box: pinned to the start.
+        assert_eq!(flip_to_fit(30.0, 150.0, 0.0, 100.0), 0.0);
+    }
 
     /// Deterministic wrapping measurer: every char is `size*0.5` wide, a
     /// paragraph breaks into `ceil(natural / max_width)` lines.

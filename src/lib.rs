@@ -102,7 +102,7 @@ pub use reactive::{AnimatedBind, Bind, Computed, DepTuple, ImageBind, Source, Te
 pub use scene::{
     BindRegistry, BlurBindSlot, ColorBindSlot, HeightPxBindSlot, ImageBindSlot, IntoNodeName,
     NodeBuilderRef, NowPlaying, PositionBindSlot, Scene, SceneCtx, SizeBindSlot, SubtreeRemoval,
-    TextBindSlot, WidthPctBindSlot, WidthPxBindSlot,
+    TextBindSlot, WidthPctBindSlot, WidthPxBindSlot, ZBindSlot,
 };
 pub use signal::{Signal, TextSignal};
 pub use splash::{Splash, SplashBitmap, SplashConfig};

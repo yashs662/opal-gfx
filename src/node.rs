@@ -848,6 +848,17 @@ pub struct Node {
     /// hover/containment walk upward (e.g. ancestor-hover, so a container's
     /// `on_hover` signal lights when any descendant is hovered).
     pub parent: Option<NodeId>,
+    /// Paint-order key among siblings (CSS `z-index` within the parent):
+    /// higher paints — and hit-tests — on top. Equal keys keep build
+    /// order. Affects only flatten (paint + hit order), never layout, so
+    /// flow siblings keep their positions. Set via [`NodeTree::set_z`].
+    pub z: i32,
+    /// `children` stably sorted by their `z` — the order flatten walks.
+    /// `None` while every child sits at `z == 0` (the overwhelmingly
+    /// common case), so an unordered tree pays nothing. Maintained by
+    /// [`NodeTree::set_z`] / `add_child` / `remove_subtree`; never set
+    /// directly.
+    paint_order: Option<Vec<NodeId>>,
     pub interact: NodeInteract,
     pub text: Option<NodeText>,
     pub image: Option<ImageHandle>,
@@ -1020,6 +1031,8 @@ impl Node {
                 edge_fade_falloff: 1.0,
                 children: Vec::new(),
                 parent: None,
+                z: 0,
+                paint_order: None,
                 interact: NodeInteract::default(),
                 text: None,
                 image: None,
@@ -1653,6 +1666,12 @@ pub struct NodeTree {
     /// failed submit). Drained by the app shell, which routes it through the
     /// same focus machinery as a click so the caret + blink reset correctly.
     pending_focus: Option<NodeId>,
+    /// Pending window action requested by an event handler (via
+    /// [`NodeTree::request_window_action`]) — for handlers that must do
+    /// their own work *before* the window acts (e.g. a menu item that
+    /// records a choice, then closes the app), which a node's
+    /// press-time `window_action` can't express. Drained by the app shell.
+    pending_window_action: Option<WindowAction>,
 }
 
 impl Default for NodeTree {
@@ -1668,6 +1687,7 @@ impl Default for NodeTree {
             drag_follow: None,
             pending_clipboard: None,
             pending_focus: None,
+            pending_window_action: None,
         }
     }
 }
@@ -1814,14 +1834,70 @@ impl NodeTree {
 
     pub fn add_child(&mut self, parent: NodeId, node: Node) -> NodeId {
         let id = self.insert(node);
-        if let Some(p) = self.get_mut_raw(parent) {
-            p.children.push(id);
-        }
-        if let Some(c) = self.get_mut_raw(id) {
-            c.parent = Some(parent);
+        let z_ordered = match self.get_mut_raw(parent) {
+            Some(p) => {
+                p.children.push(id);
+                p.paint_order.is_some()
+            }
+            None => false,
+        };
+        let z = match self.get_mut_raw(id) {
+            Some(c) => {
+                c.parent = Some(parent);
+                c.z
+            }
+            None => 0,
+        };
+        // A newcomer can't just append to an existing paint order — it
+        // must slot in below any raised sibling — so re-sort.
+        if z_ordered || z != 0 {
+            self.resort_paint_order(parent);
         }
         self.dirty |= dirty::TREE;
         id
+    }
+
+    /// Set `id`'s paint-order key among its siblings (see [`Node::z`]).
+    /// Re-sorts the parent's paint order only on an actual change, and
+    /// dirties just the flatten (paint + hit order) — no relayout.
+    pub fn set_z(&mut self, id: NodeId, z: i32) {
+        let Some(n) = self.get_mut_raw(id) else {
+            return;
+        };
+        if n.z == z {
+            return;
+        }
+        n.z = z;
+        if let Some(parent) = n.parent {
+            self.resort_paint_order(parent);
+        }
+        self.dirty |= dirty::TREE;
+    }
+
+    /// Rebuild `parent`'s cached paint order: its children stably sorted
+    /// by `z`, or `None` once they're all back at 0. Reuses the old
+    /// allocation.
+    fn resort_paint_order(&mut self, parent: NodeId) {
+        let Some(p) = self.get_mut_raw(parent) else {
+            return;
+        };
+        let mut order = p.paint_order.take().unwrap_or_default();
+        order.clear();
+        order.extend_from_slice(&p.children);
+        let z_of = |c: &NodeId| self.get(*c).map_or(0, |n| n.z);
+        if order.iter().all(|c| z_of(c) == 0) {
+            return;
+        }
+        order.sort_by_key(z_of);
+        if let Some(p) = self.get_mut_raw(parent) {
+            p.paint_order = Some(order);
+        }
+    }
+
+    /// The order flatten walks `node`'s children in — z-sorted when any
+    /// child is raised, plain build order otherwise.
+    fn paint_children(node: &Node) -> &[NodeId] {
+        node.paint_order.as_deref().unwrap_or(&node.children)
     }
 
     /// Parent of `id`, or `None` for a root / missing node.
@@ -1880,6 +1956,10 @@ impl NodeTree {
         for slot in self.slots.iter_mut() {
             if let Some(node) = slot.payload.as_mut() {
                 node.children.retain(|c| *c != id);
+                // Removal keeps the rest sorted — just drop it.
+                if let Some(order) = node.paint_order.as_mut() {
+                    order.retain(|c| *c != id);
+                }
             }
         }
         // Collect ids in pre-order (parents before children) so the
@@ -2861,6 +2941,18 @@ impl NodeTree {
         self.pending_clipboard.take()
     }
 
+    /// Request a window action (close / minimise / maximise) from an event
+    /// handler. Performed by the app shell on the next loop iteration —
+    /// the same dispatch a `window_action` node gets on press.
+    pub fn request_window_action(&mut self, action: WindowAction) {
+        self.pending_window_action = Some(action);
+    }
+
+    /// Drain a pending window action (app shell only).
+    pub fn take_window_action(&mut self) -> Option<WindowAction> {
+        self.pending_window_action.take()
+    }
+
     /// Request that `id` be focused (e.g. re-focus a text field after a
     /// failed submit). The app shell drains it next iteration and routes it
     /// through the focus machinery so the caret shows + the blink resets.
@@ -3570,7 +3662,9 @@ impl NodeTree {
         } else {
             clip_radius
         };
-        for &child in &node.children {
+        // Paint order, not build order: a raised sibling (`z`) paints —
+        // and so hit-tests — above the rest without touching layout.
+        for &child in Self::paint_children(node) {
             self.flatten_into(
                 child,
                 opacity,
@@ -4204,6 +4298,59 @@ mod tests {
         let positions = shape_positions(&t.flatten(1.0).0);
         // A is skipped in place (hole) and re-emitted LAST, shifted.
         assert_eq!(positions, vec![[0.0, 20.0], [5.0, 7.0]]);
+    }
+
+    // --- sibling z (paint order) ---
+
+    /// Root with three opaque full-overlap children at y = 0/1/2 (so the
+    /// emitted positions name which child painted), each hit-testable.
+    fn z_fixture() -> (NodeTree, [NodeId; 3]) {
+        let mut t = NodeTree::new();
+        let root = t.add_root(Node::rect().build());
+        let kids = [0.0, 1.0, 2.0].map(|y| {
+            let c = t.add_child(root, Node::rect().build());
+            let n = t.get_mut_raw(c).unwrap();
+            n.style.color = [1.0; 4];
+            n.rect = [0.0, y, 10.0, 10.0];
+            n.cursor = Some(winit::window::CursorIcon::Default);
+            c
+        });
+        (t, kids)
+    }
+
+    #[test]
+    fn z_raises_sibling_paint_and_hit_order() {
+        let (mut t, [a, b, c]) = z_fixture();
+        // Raising the first child paints it last and makes it the topmost
+        // hit (hits are topmost-first); the rest keep build order.
+        t.set_z(a, 1);
+        let (events, hits, ..) = t.flatten(1.0);
+        assert_eq!(
+            shape_positions(&events),
+            vec![[0.0, 1.0], [0.0, 2.0], [0.0, 0.0]]
+        );
+        assert_eq!(hits[0].node_id, a);
+        // A newer, higher raise wins over the older one — open order.
+        t.set_z(b, 2);
+        assert_eq!(t.flatten(1.0).1[0].node_id, b);
+        // A child added after a raise still lands below the raised ones.
+        let d = t.add_child(t.parent(a).unwrap(), Node::rect().build());
+        t.get_mut_raw(d).unwrap().cursor = Some(winit::window::CursorIcon::Default);
+        let order: Vec<_> = t.flatten(1.0).1.iter().map(|h| h.node_id).collect();
+        assert_eq!(order, vec![b, a, d, c]);
+        // Dropping every raise falls back to plain build order.
+        t.set_z(a, 0);
+        t.set_z(b, 0);
+        assert!(t.get(t.parent(a).unwrap()).unwrap().paint_order.is_none());
+    }
+
+    #[test]
+    fn z_survives_sibling_removal() {
+        let (mut t, [a, b, c]) = z_fixture();
+        t.set_z(a, 1);
+        t.remove_subtree(b);
+        let order: Vec<_> = t.flatten(1.0).1.iter().map(|h| h.node_id).collect();
+        assert_eq!(order, vec![a, c]);
     }
 
     #[test]

@@ -225,6 +225,9 @@ impl SceneCtx {
         let _ = tombstone_matching(&mut self.binds.blur, &mut self.binds.blur_free, |s| {
             dropped_set.contains(&s.node_id)
         });
+        let _ = tombstone_matching(&mut self.binds.z, &mut self.binds.z_free, |s| {
+            dropped_set.contains(&s.node_id)
+        });
         let _ = tombstone_matching(&mut self.binds.effect, &mut self.binds.effect_free, |s| {
             dropped_set.contains(&s.node_id)
         });
@@ -366,6 +369,11 @@ pub struct BindRegistry {
     pub effect: Vec<Option<EffectBindSlot>>,
     /// Tombstoned `effect` indices available for reuse.
     pub effect_free: Vec<u32>,
+    /// Paint-order binds. Each slot drives a node's sibling `z` (see
+    /// [`crate::node::Node::z`]) — re-flatten only, no relayout. Snaps.
+    pub z: Vec<Option<ZBindSlot>>,
+    /// Tombstoned `z` indices available for reuse.
+    pub z_free: Vec<u32>,
 }
 
 /// Store `slot`, reusing a tombstoned index from `free` if one exists
@@ -465,6 +473,12 @@ pub struct WidthPxBindSlot {
 pub struct HeightPxBindSlot {
     pub node_id: NodeId,
     pub bind: Bind<f32>,
+    pub last_version: u64,
+}
+
+pub struct ZBindSlot {
+    pub node_id: NodeId,
+    pub signal: Signal<i32>,
     pub last_version: u64,
 }
 
@@ -1062,6 +1076,16 @@ impl<'a> NodeBuilderRef<'a> {
     pub fn abs(&mut self, x: f32, y: f32) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
             n.layout.abs = Some([x, y]);
+        }
+        self
+    }
+
+    /// Keep this absolute node inside its parent: an axis that would
+    /// overflow flips to the other side of its `abs` anchor, then clamps.
+    /// See [`crate::layout::LayoutStyle::flip_to_fit`].
+    pub fn flip_to_fit(&mut self) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.layout.flip_to_fit = true;
         }
         self
     }
@@ -1912,6 +1936,32 @@ impl<'a> NodeBuilderRef<'a> {
                 },
             );
         }
+        self
+    }
+
+    /// Paint order among siblings (CSS `z-index` within the parent):
+    /// higher paints and hit-tests on top; equal values keep build order.
+    /// Layout is untouched. See [`crate::node::Node::z`].
+    pub fn z_index(&mut self, z: i32) -> &mut Self {
+        self.ctx.tree.set_z(self.id, z);
+        self
+    }
+
+    /// Reactive [`Self::z_index`]: re-orders the siblings whenever
+    /// `signal` changes, with no scene rebuild — how popups raise
+    /// themselves on open ([`crate::Overlay`]).
+    pub fn z_index_bind(&mut self, signal: Signal<i32>) -> &mut Self {
+        self.ctx.tree.set_z(self.id, signal.get());
+        let last_version = signal.version();
+        alloc_slot(
+            &mut self.ctx.binds.z,
+            &mut self.ctx.binds.z_free,
+            ZBindSlot {
+                node_id: self.id,
+                signal,
+                last_version,
+            },
+        );
         self
     }
 

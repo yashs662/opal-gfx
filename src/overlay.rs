@@ -17,13 +17,23 @@
 //!
 //! ## Multiple overlays / stacking
 //! Each `Overlay` is independent (its own opacity signal + auto-allocated
-//! tween key), so any number can be open at once. They **stack by render
-//! order**: render them in the order you want them layered (last = on
-//! top). Each one's full-window scrim blocks input to everything rendered
-//! before it, so the topmost overlay owns input until dismissed, then the
-//! one below takes over — standard modal-stack behaviour, no extra
-//! bookkeeping. (Relies on topmost-wins hit-testing; see `input::hit_test`.)
+//! tween key), so any number can be open at once. Stacking is **by open
+//! order, not render order**: every [`Overlay::open`] stamps the overlay
+//! with a process-wide, ever-rising stack key bound to its scrim's
+//! [`crate::scene::NodeBuilderRef::z_index_bind`], so the most recently
+//! opened overlay paints — and hit-tests — above every other one, with no
+//! scene rebuild. A popup opened from inside another popup (a picker
+//! launched from a search result's context menu) therefore always lands
+//! on top, wherever its `render` call happens to sit. Each one's
+//! full-window scrim blocks input to everything beneath it, so the
+//! topmost overlay owns input until dismissed, then the one below takes
+//! over — standard modal-stack behaviour, no extra bookkeeping.
 //!
+//! The z key orders **siblings**, so render every overlay under the same
+//! parent (conventionally: the view root, after the normal content). Plain
+//! content sits at `z = 0`; stack keys start at 1, so any opened overlay is
+//! above it.
+
 //! ## Cost
 //! Closed (opacity 0) → the scrim's [`crate::scene::NodeBuilderRef::opacity_bind`]
 //! marks the subtree invisible, so flatten skips it entirely: no draw, no
@@ -31,7 +41,7 @@
 //! quad + the panel; the loop parks (0% CPU) until the next input. Only
 //! the ~160 ms fade animates.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use winit::window::CursorIcon;
@@ -47,6 +57,10 @@ use crate::signal::Signal;
 /// can never collide.
 const WIDGET_TWEEN_BASE: u32 = 0xF000_0000;
 static NEXT_WIDGET_KEY: AtomicU32 = AtomicU32::new(WIDGET_TWEEN_BASE);
+
+/// Source of overlay stack keys: each open takes the next one, so the
+/// newest open is the topmost. Starts at 1 — above plain content (`z = 0`).
+static NEXT_STACK_Z: AtomicI32 = AtomicI32::new(1);
 
 /// Default morph spring — a quick, decisive move into the new height with a
 /// damping ratio just under critical (ζ≈0.77) for a barely-there bounce at
@@ -96,6 +110,9 @@ pub struct Overlay {
     /// springs this on open/close/dismiss so the panel grows/shrinks; `None`
     /// = a plain fade modal.
     morph: Option<Morph>,
+    /// Stack key, bound to the scrim's sibling z. Re-stamped from
+    /// [`NEXT_STACK_Z`] on every open so the newest overlay is on top.
+    z: Signal<i32>,
 }
 
 impl Default for Overlay {
@@ -114,6 +131,7 @@ impl Overlay {
             curve: Curve::EaseInOut,
             anchor: Justify::Center,
             morph: None,
+            z: Signal::new(0),
         }
     }
 
@@ -198,9 +216,18 @@ impl Overlay {
         self.opacity.get() > 0.5
     }
 
-    /// Fade in. Idempotent + interruptible: re-targets the same tween, so
-    /// opening mid-close smoothly reverses from wherever it is.
+    /// Bring this overlay above every other one (see the module docs on
+    /// stacking). [`Self::open`] does this itself; call it directly only to
+    /// re-front an overlay that's already open.
+    pub fn raise(&self) {
+        self.z.set(NEXT_STACK_Z.fetch_add(1, Ordering::Relaxed));
+    }
+
+    /// Raise to the top and fade in. Idempotent + interruptible:
+    /// re-targets the same tween, so opening mid-close smoothly reverses
+    /// from wherever it is.
     pub fn open(&self, timeline: &mut Timeline, now: Instant) {
+        self.raise();
         timeline.start(
             self.tween_key,
             self.opacity.clone(),
@@ -243,29 +270,52 @@ impl Overlay {
     /// was open when the app last closed, where a fade-in would look like
     /// a glitch on launch.
     pub fn open_instant(&self) {
+        self.raise();
         self.opacity.set(1.0);
     }
 
     /// Render the modal. Builds a full-window scrim (dimmed by
-    /// `scrim_color`, click-to-dismiss, input-blocking) with the panel
-    /// `content` centred on top; the whole thing fades via the owned
-    /// opacity. `content` builds the panel interior — style it however you
-    /// like; the overlay handles the scrim, dismissal, centring and the
-    /// click-absorbing host so panel clicks never leak to the dismiss
-    /// handler.
+    /// `scrim_color`, input-blocking, dismissed by any click or right-click
+    /// outside the panel) with the panel `content` placed per
+    /// [`Self::with_anchor`]; the whole thing fades via the owned opacity
+    /// and stacks by open order. `content` builds the panel interior —
+    /// style it however you like; the overlay handles the scrim, dismissal,
+    /// placement and the click-absorbing host so panel clicks never leak
+    /// to the dismiss handler.
     ///
-    /// **Call this last** in your scene (after all normal content) so it
-    /// layers on top. For stacked modals, render them back-to-front.
-    /// Always safe to call every frame: when closed it's skipped by the
-    /// opacity-visibility gate.
+    /// Render it after the normal content, as a sibling of the other
+    /// overlays (see the module docs on stacking). Always safe to call
+    /// every frame: when closed it's skipped by the opacity-visibility
+    /// gate.
     pub fn render<F: FnOnce(&mut Scene)>(&self, s: &mut Scene, scrim_color: [f32; 4], content: F) {
-        let opacity = self.opacity.clone();
-        let key = self.tween_key;
-        let fade = self.fade;
-        let curve = self.curve;
-        // Scrim dismiss shrinks the height back too (if morphing) — captured
-        // so the click handler is self-contained (no app callback needed).
-        let morph = self.morph.clone();
+        self.render_scrim(s, scrim_color, None, content);
+    }
+
+    /// [`Self::render`] with the panel pinned at `at` (logical px, its
+    /// top-left corner) instead of the anchored placement — for popups that
+    /// open at a point, like a context menu at the cursor. Near an edge the
+    /// panel flips to the other side of `at` so it stays on screen.
+    pub fn render_at<F: FnOnce(&mut Scene)>(
+        &self,
+        s: &mut Scene,
+        scrim_color: [f32; 4],
+        at: [f32; 2],
+        content: F,
+    ) {
+        self.render_scrim(s, scrim_color, Some(at), content);
+    }
+
+    fn render_scrim<F: FnOnce(&mut Scene)>(
+        &self,
+        s: &mut Scene,
+        scrim_color: [f32; 4],
+        at: Option<[f32; 2]>,
+        content: F,
+    ) {
+        // Outside-click dismiss closes exactly like `morph_close` (fade +
+        // inverse height morph) — self-contained, no app callback needed.
+        let dismiss = self.clone();
+        let dismiss_r = self.clone();
         s.col(())
             .abs(0.0, 0.0)
             .w(Len::Fill)
@@ -278,28 +328,16 @@ impl Overlay {
             )
             // Fades the whole subtree; at ~0 it also drops the scrim from
             // flatten, so a closed modal neither draws nor eats input.
-            .opacity_bind(opacity.clone())
+            .opacity_bind(self.opacity.clone())
+            // Stack by open order among the sibling overlays.
+            .z_index_bind(self.z.clone())
             .align(Align::Center)
             .justify(self.anchor)
-            // Click outside the panel dismisses. (Topmost-wins hit-testing
-            // means this only fires when the cursor isn't over the panel.)
-            .on_click(move |ctx| {
-                ctx.timeline
-                    .start(key, opacity.clone(), 0.0, curve, fade, ctx.now);
-                // Inverse-morph the height back to collapsed alongside the
-                // fade — self-contained, so a click-outside close animates
-                // with no app-side plumbing.
-                if let Some(m) = &morph {
-                    ctx.timeline.start(
-                        m.key,
-                        m.height.clone(),
-                        m.collapsed,
-                        m.curve,
-                        m.duration,
-                        ctx.now,
-                    );
-                }
-            })
+            // A press outside the panel dismisses. (Topmost-wins
+            // hit-testing means this only fires when the cursor isn't over
+            // the panel.)
+            .on_click(move |ctx| dismiss.morph_close(ctx.timeline, ctx.now))
+            .on_right_click(move |ctx| dismiss_r.morph_close(ctx.timeline, ctx.now))
             // The dim area is click-to-dismiss but shouldn't read as a
             // button — keep the normal arrow over it (overrides the
             // auto-pointer the `on_click` would otherwise trigger).
@@ -310,9 +348,14 @@ impl Overlay {
                 // lands here instead of falling through to the scrim's
                 // dismiss handler. Same arrow-cursor reasoning as the
                 // scrim — only the real buttons inside should show pointer.
-                scrim
-                    .col(())
-                    .on_click(|_| {})
+                let mut host = scrim.col(());
+                // A point-anchored panel flips/clamps to stay on screen
+                // (a menu opened near an edge opens back toward the middle).
+                if let Some([x, y]) = at {
+                    host.abs(x, y).flip_to_fit();
+                }
+                host.on_click(|_| {})
+                    .on_right_click(|_| {})
                     .cursor(CursorIcon::Default)
                     .child(content);
             });

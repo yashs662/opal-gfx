@@ -2161,6 +2161,7 @@ impl<S> App<S> {
             now,
         );
         process_blur_binds(&mut self.ctx.binds.blur, &mut self.ctx.tree);
+        process_z_binds(&mut self.ctx.binds.z, &mut self.ctx.tree);
     }
 
     /// For animated binds, copy the current `displayed` signal value
@@ -4383,6 +4384,22 @@ fn process_opacity_binds(
     }
 }
 
+/// Paint-order binds snap: on a version bump, re-sort the node among its
+/// siblings (`set_z` — re-flatten only, no relayout).
+fn process_z_binds(
+    slots: &mut [Option<crate::scene::ZBindSlot>],
+    tree: &mut crate::node::NodeTree,
+) {
+    for slot in slots.iter_mut().flatten() {
+        let v = slot.signal.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        tree.set_z(slot.node_id, slot.signal.get());
+    }
+}
+
 /// Glass-blur binds snap: on a version bump, write the new radius into
 /// the node (`set_blur` — repaint only, the mip chain is radius-agnostic).
 fn process_blur_binds(
@@ -4762,6 +4779,7 @@ impl<'a> HeadlessHelper<'a> {
         process_font_size_binds(&mut self.ctx.binds.font_size, &mut self.ctx.tree);
         process_effect_binds(&mut self.ctx.binds.effect, &mut self.ctx.tree);
         process_blur_binds(&mut self.ctx.binds.blur, &mut self.ctx.tree);
+        process_z_binds(&mut self.ctx.binds.z, &mut self.ctx.tree);
         for slot in self.ctx.binds.color.iter().flatten() {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_color(slot.node_id, disp.get());
@@ -5698,6 +5716,12 @@ impl<S> ApplicationHandler for App<S> {
         // submit) — route through the same path as a click.
         if let Some(id) = self.ctx.tree.take_focus_request() {
             self.set_focus(Some(id));
+        }
+        // Window action a handler requested (e.g. a menu item that closes
+        // the app after recording a choice) — same dispatch as a press on a
+        // `window_action` node.
+        if let Some(action) = self.ctx.tree.take_window_action() {
+            self.dispatch_window_action(action, event_loop);
         }
         // Deferred autocapture: once the deadline elapses, render a
         // settled frame, snap, and exit. Loop has been running normally
