@@ -1505,6 +1505,7 @@ impl<S> App<S> {
         // promoted nodes (`.layer_opacity(sig)`). Rebuilt each flush so it
         // tracks the current tree (promotions can come + go); the per-frame
         // pump then drives each layer's composite opacity from its signal.
+        place_layer_hits(&self.layer_tree, &mut self.hits, &mut self.scroll_hits);
         self.layer_opacity_binds.clear();
         self.layer_offset_binds.clear();
         for p in &promoted {
@@ -1569,7 +1570,16 @@ impl<S> App<S> {
     /// Requests a redraw when the value actually changed.
     pub fn set_layer_offset(&mut self, node: crate::node::NodeId, offset: [f32; 2]) {
         let phys = [offset[0] * self.scale_factor, offset[1] * self.scale_factor];
+        let before = self.layer_tree.offset(node);
         if self.layer_tree.set_offset(node, phys) {
+            // Input follows the pixels: shift the layer's hit rects by the
+            // same move, then re-derive hover under a still cursor.
+            let delta = [phys[0] - before[0], phys[1] - before[1]];
+            if crate::node::translate_layer_hits(&mut self.hits, &mut self.scroll_hits, |root| {
+                (root == node).then_some(delta)
+            }) {
+                self.arm_hover_recheck();
+            }
             self.push_layer_draws();
             self.request_redraw();
         }
@@ -1737,6 +1747,7 @@ impl<S> App<S> {
         self.process_binds(now);
         self.pump_animated_displays();
         self.pump_layer_opacity_binds();
+        self.pump_layer_offset_binds();
         let dt = match self.last_scroll_tick {
             Some(prev) => (now - prev).as_secs_f32().min(0.05),
             None => 0.0,
@@ -3958,6 +3969,18 @@ fn expand_events_into(
     glass_count
 }
 
+/// Flatten writes hit rects at layout positions; carry the ones riding a
+/// composite offset to where their layer currently sits (see
+/// [`crate::node::HitLayer`]). Run after every flatten, once the layer
+/// tree knows its surviving promotions.
+fn place_layer_hits(
+    layers: &crate::layer::LayerTree,
+    hits: &mut [crate::node::HitEntry],
+    scroll_hits: &mut [crate::node::ScrollHit],
+) {
+    crate::node::translate_layer_hits(hits, scroll_hits, |root| Some(layers.offset(root)));
+}
+
 /// Convert a CPU `Layer` into a GPU `LayerDraw`. A scroll layer (`window`
 /// = `Some`) maps to a [`crate::gpu::ScrollWindow`] (quad at the viewport,
 /// sampling the tall texture at the scroll offset, scissor-clipped to the
@@ -4720,6 +4743,7 @@ impl<'a> HeadlessHelper<'a> {
             crate::layer::Damage::classify(mask),
         );
         self.layer_tree.take_composite_dirty();
+        place_layer_hits(self.layer_tree, self.hits, self.scroll_hits);
         let draws: Vec<crate::gpu::LayerDraw> =
             self.layer_tree.layers().iter().map(layer_to_draw).collect();
         self.gpu.set_layers(&draws);
@@ -5812,7 +5836,8 @@ impl<S> ApplicationHandler for App<S> {
         // timeline / scroll work is pending so the channel gets drained
         // — without this the worker's wake would land but the loop
         // would still park since `timeline_active == false`.
-        if self.wake.take()
+        // `|` not `||`: both latches must be consumed this pass.
+        if (self.wake.take() | self.ctx.take_due_wake(now))
             && let Some(mut hook) = self.on_frame.take()
         {
             log::debug!(
@@ -6020,8 +6045,15 @@ impl<S> ApplicationHandler for App<S> {
             && caret_deadline.is_none()
         {
             self.last_scroll_tick = None;
-            event_loop.set_control_flow(ControlFlow::Wait);
-            log::debug!("[loop] parking on Wait (idle)");
+            // Idle — but a hook-requested timed wake still gets its tick.
+            match self.ctx.wake_deadline {
+                Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+                None => event_loop.set_control_flow(ControlFlow::Wait),
+            }
+            log::debug!(
+                "[loop] parking (idle, timed wake {:?})",
+                self.ctx.wake_deadline
+            );
             return;
         }
         log::debug!(
@@ -6097,17 +6129,15 @@ impl<S> ApplicationHandler for App<S> {
         if res.updated || hook_active {
             self.process_binds(now);
         }
-        // Push layer-opacity bindings (e.g. a crossfade tween driving a
-        // promoted layer's composite opacity) every frame the timeline
-        // advanced. Composite-only — recomposites without re-rastering the
-        // layer; `set_layer_opacity` requests its own redraw on change.
+        // Push layer composite bindings every frame the timeline advanced
+        // (a crossfade's opacity, a slide's offset) — and offsets also on
+        // coalesced hover-move / drag, for cursor-following overlays (the
+        // seek tooltip). Composite-only: recomposites without re-rastering;
+        // the setters request their own redraw on an actual change.
         if res.updated {
             self.pump_layer_opacity_binds();
         }
-        // Push coalesced hover-move / drag offsets into cursor-following
-        // overlay layers (e.g. the seek tooltip) — composite-only, so the
-        // overlay tracks the cursor with no re-flatten of the scene.
-        if hover_moved || drag_moved {
+        if res.updated || hover_moved || drag_moved {
             self.pump_layer_offset_binds();
         }
         if res.updated
@@ -6184,6 +6214,7 @@ impl<S> ApplicationHandler for App<S> {
             effect_deadline,
             swipe_deadline,
             render_deadline,
+            self.ctx.wake_deadline,
         ]
         .into_iter()
         .flatten()

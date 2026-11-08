@@ -96,6 +96,10 @@ pub struct Overlay {
     /// root (cascades to the whole subtree). Private: the only way to move
     /// it is open/close/toggle/reset.
     opacity: Signal<f32>,
+    /// Logically open: set by `open`, cleared by `close`/`reset`. Unlike
+    /// the opacity it flips the instant the intent does — see
+    /// [`Overlay::is_shown`].
+    shown: Signal<bool>,
     /// Stable, process-unique timeline key for this overlay's fade. Auto-
     /// allocated in [`Overlay::new`] so callers never pick magic numbers
     /// or risk collisions.
@@ -106,6 +110,14 @@ pub struct Overlay {
     /// is the classic dialog; `Start` top-anchors it (e.g. a search modal
     /// that drops from the top bar). Horizontal is always centred.
     anchor: Justify,
+    /// Horizontal placement of the panel within the scrim (default
+    /// `Center`); `End` right-aligns it — e.g. a dropdown hanging under a
+    /// top-bar button at the window's right edge.
+    align: Align,
+    /// Scrim padding `[left, top, right, bottom]` (logical px) that insets
+    /// the anchored panel from the window edges — clear of a top bar, off
+    /// the edge. The padding still dims and dismisses.
+    inset: [f32; 4],
     /// Height-morph state, if [`Self::with_morph`] enabled it. The overlay
     /// springs this on open/close/dismiss so the panel grows/shrinks; `None`
     /// = a plain fade modal.
@@ -126,10 +138,13 @@ impl Overlay {
     pub fn new() -> Self {
         Self {
             opacity: Signal::new(0.0),
+            shown: Signal::new(false),
             tween_key: NEXT_WIDGET_KEY.fetch_add(1, Ordering::Relaxed),
             fade: Duration::from_millis(160),
             curve: Curve::EaseInOut,
             anchor: Justify::Center,
+            align: Align::Center,
+            inset: [0.0; 4],
             morph: None,
             z: Signal::new(0),
         }
@@ -145,6 +160,22 @@ impl Overlay {
     /// (default is `Center`). Horizontal centring is unchanged.
     pub fn with_anchor(mut self, anchor: Justify) -> Self {
         self.anchor = anchor;
+        self
+    }
+
+    /// Place the panel horizontally — `Align::End` right-aligns it
+    /// (default is `Center`). Pairs with [`Self::with_anchor`] for the
+    /// vertical axis.
+    pub fn with_align(mut self, align: Align) -> Self {
+        self.align = align;
+        self
+    }
+
+    /// Inset the anchored panel from the window edges by `[left, top,
+    /// right, bottom]` logical px. Ignored by [`Self::render_at`], whose
+    /// point is already absolute.
+    pub fn with_inset(mut self, inset: [f32; 4]) -> Self {
+        self.inset = inset;
         self
     }
 
@@ -216,6 +247,14 @@ impl Overlay {
         self.opacity.get() > 0.5
     }
 
+    /// Whether any of the overlay can be on screen: from the moment it's
+    /// opened (before the fade has moved a pixel) until it has fully faded
+    /// out. Gate costly panel content on this so a closed overlay builds
+    /// nothing — a rebuild in the same frame as the open still sees `true`.
+    pub fn is_shown(&self) -> bool {
+        self.shown.get() || self.opacity.get() > 0.001
+    }
+
     /// Bring this overlay above every other one (see the module docs on
     /// stacking). [`Self::open`] does this itself; call it directly only to
     /// re-front an overlay that's already open.
@@ -228,6 +267,7 @@ impl Overlay {
     /// from wherever it is.
     pub fn open(&self, timeline: &mut Timeline, now: Instant) {
         self.raise();
+        self.shown.set(true);
         timeline.start(
             self.tween_key,
             self.opacity.clone(),
@@ -240,6 +280,7 @@ impl Overlay {
 
     /// Fade out. Same interruptible semantics as [`Self::open`].
     pub fn close(&self, timeline: &mut Timeline, now: Instant) {
+        self.shown.set(false);
         timeline.start(
             self.tween_key,
             self.opacity.clone(),
@@ -263,6 +304,7 @@ impl Overlay {
     /// being torn down anyway (e.g. signing out / changing views) and a
     /// fade would be pointless or run against an unmounted tree.
     pub fn reset(&self) {
+        self.shown.set(false);
         self.opacity.set(0.0);
     }
 
@@ -271,6 +313,7 @@ impl Overlay {
     /// a glitch on launch.
     pub fn open_instant(&self) {
         self.raise();
+        self.shown.set(true);
         self.opacity.set(1.0);
     }
 
@@ -316,8 +359,12 @@ impl Overlay {
         // inverse height morph) — self-contained, no app callback needed.
         let dismiss = self.clone();
         let dismiss_r = self.clone();
+        // A point-anchored panel is absolute in the scrim's content box, so
+        // the inset (which would shift that box) only applies to anchored.
+        let [l, t, r, b] = if at.is_some() { [0.0; 4] } else { self.inset };
         s.col(())
             .abs(0.0, 0.0)
+            .pad_ltrb(l, t, r, b)
             .w(Len::Fill)
             .h(Len::Fill)
             .rgba(
@@ -331,7 +378,7 @@ impl Overlay {
             .opacity_bind(self.opacity.clone())
             // Stack by open order among the sibling overlays.
             .z_index_bind(self.z.clone())
-            .align(Align::Center)
+            .align(self.align)
             .justify(self.anchor)
             // A press outside the panel dismisses. (Topmost-wins
             // hit-testing means this only fires when the cursor isn't over

@@ -115,18 +115,77 @@ pub struct HitEntry {
     /// Cursor outside this rect must miss this entry even if `bounds`
     /// would contain it. `crate::gpu::NO_CLIP` when no ancestor clips.
     pub clip_rect: [f32; 4],
+    /// The composite-offset layer this entry rides, if any. See
+    /// [`HitLayer`].
+    pub layer: Option<HitLayer>,
 }
 
 impl HitEntry {
     pub fn contains(&self, x: f32, y: f32) -> bool {
-        if x < self.bounds[0] || x >= self.bounds[2] || y < self.bounds[1] || y >= self.bounds[3] {
-            return false;
-        }
-        x >= self.clip_rect[0]
-            && x < self.clip_rect[2]
-            && y >= self.clip_rect[1]
-            && y < self.clip_rect[3]
+        rect_hit(self.bounds, self.clip_rect, x, y)
     }
+}
+
+fn rect_hit(bounds: [f32; 4], clip: [f32; 4], x: f32, y: f32) -> bool {
+    if x < bounds[0] || x >= bounds[2] || y < bounds[1] || y >= bounds[3] {
+        return false;
+    }
+    x >= clip[0] && x < clip[2] && y >= clip[1] && y < clip[3]
+}
+
+/// Ties a hit rect to the promoted layer whose **composite offset**
+/// (`.layer_offset_x/_y`, [`crate::app::App::set_layer_offset`]) moves it.
+///
+/// Flatten writes hit rects at the layout position, but a composite
+/// offset moves the pixels without a re-flatten — so without this a
+/// slid / dragged overlay would be clicked and hovered where it *used to
+/// be*. The app translates every entry tagged with `root` whenever that
+/// layer's offset changes (and once after each flatten, for the offset
+/// already in force), keeping input where the pixels are.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HitLayer {
+    /// The offset-driven promoted node.
+    pub root: NodeId,
+    /// The entry's `clip_rect` was set *inside* the layer, so it travels
+    /// with it. A clip inherited from outside stays put — the window a
+    /// layer slides through doesn't slide with it.
+    pub clip_moves: bool,
+}
+
+/// Translate every hit / scroll-hit rect riding a composite-offset layer
+/// by `delta(root)` (physical px; `None` = leave it). Returns whether any
+/// rect moved, so the caller can re-derive hover under a still cursor.
+pub fn translate_layer_hits(
+    hits: &mut [HitEntry],
+    scroll_hits: &mut [ScrollHit],
+    delta: impl Fn(NodeId) -> Option<[f32; 2]>,
+) -> bool {
+    let mut moved = false;
+    let mut shift = |layer: Option<HitLayer>, bounds: &mut [f32; 4], clip: &mut [f32; 4]| {
+        let Some(l) = layer else { return };
+        let Some([dx, dy]) = delta(l.root).filter(|d| *d != [0.0; 2]) else {
+            return;
+        };
+        translate_rect(bounds, dx, dy);
+        if l.clip_moves {
+            translate_rect(clip, dx, dy);
+        }
+        moved = true;
+    };
+    for h in hits.iter_mut() {
+        shift(h.layer, &mut h.bounds, &mut h.clip_rect);
+    }
+    for h in scroll_hits.iter_mut() {
+        shift(h.layer, &mut h.bounds, &mut h.clip_rect);
+    }
+    moved
+}
+
+fn translate_rect(r: &mut [f32; 4], dx: f32, dy: f32) {
+    r[0] += dx;
+    r[1] += dy;
+    r[2] += dx;
+    r[3] += dy;
 }
 
 /// A force-promoted subtree (`.layer()`) discovered during flatten,
@@ -210,17 +269,13 @@ pub struct ScrollHit {
     /// walks this on edge consumption: self first, then each scroll
     /// ancestor outward.
     pub ancestor_chain: Vec<NodeId>,
+    /// Composite-offset layer this rect rides — see [`HitLayer`].
+    pub layer: Option<HitLayer>,
 }
 
 impl ScrollHit {
     pub fn contains(&self, x: f32, y: f32) -> bool {
-        if x < self.bounds[0] || x >= self.bounds[2] || y < self.bounds[1] || y >= self.bounds[3] {
-            return false;
-        }
-        x >= self.clip_rect[0]
-            && x < self.clip_rect[2]
-            && y >= self.clip_rect[1]
-            && y < self.clip_rect[3]
+        rect_hit(self.bounds, self.clip_rect, x, y)
     }
 }
 
@@ -1010,6 +1065,12 @@ impl Node {
         self.layer || (self.stack && self.style.border_radius.iter().any(|&r| r > 0.0))
     }
 
+    /// Whether a composite offset drives this node's layer (see
+    /// [`HitLayer`]).
+    pub fn has_composite_offset(&self) -> bool {
+        self.layer_offset_x.is_some() || self.layer_offset_y.is_some()
+    }
+
     pub fn rect() -> NodeBuilder {
         NodeBuilder {
             node: Node {
@@ -1695,6 +1756,28 @@ impl Default for NodeTree {
 /// The buffers one flatten fills. Grouped into a single out-parameter so
 /// the recursive walk carries one reference instead of six — and so a new
 /// output (the effect-param arena) doesn't widen every call site.
+/// Where a subtree's hit rects live in screen space, threaded down the
+/// flatten walk beside the visual clip/offset. Equal to the visual pair
+/// everywhere EXCEPT inside a scroll layer: there the *visual* offset /
+/// clip go content-local (into the layer texture) while hits stay
+/// screen-space (scroll baked + viewport-clipped), so the children's hit
+/// boxes still land where they're drawn on screen.
+#[derive(Copy, Clone)]
+struct HitSpace {
+    clip: [f32; 4],
+    offset: [f32; 2],
+    /// The enclosing composite-offset layer, if any.
+    layer: Option<HitLayer>,
+}
+
+impl HitSpace {
+    const SCREEN: HitSpace = HitSpace {
+        clip: NO_CLIP,
+        offset: [0.0; 2],
+        layer: None,
+    };
+}
+
 pub struct FlattenOut<'a> {
     pub events: &'a mut Vec<FlatEvent>,
     pub hits: &'a mut Vec<HitEntry>,
@@ -3159,8 +3242,7 @@ impl NodeTree {
                 NO_CLIP,
                 [0.0; 4],
                 [0.0; 2],
-                NO_CLIP,
-                [0.0; 2],
+                HitSpace::SCREEN,
                 skip,
                 &mut scroll_stack,
                 out,
@@ -3185,8 +3267,10 @@ impl NodeTree {
                 NO_CLIP,
                 [0.0; 4],
                 [-dx, -dy],
-                NO_CLIP,
-                [-dx, -dy],
+                HitSpace {
+                    offset: [-dx, -dy],
+                    ..HitSpace::SCREEN
+                },
                 None,
                 &mut scroll_stack,
                 &mut FlattenOut {
@@ -3224,15 +3308,9 @@ impl NodeTree {
         // scissor). All-0 = square clip.
         clip_radius: [f32; 4],
         offset: [f32; 2],
-        // Hit-space clip + offset, used for `HitEntry`/`ScrollHit` bounds
-        // (input lives in screen space). Equal to `clip`/`offset`
-        // everywhere EXCEPT inside a scroll layer: there the *visual*
-        // offset/clip go content-local (into the layer texture) while
-        // hits stay screen-space (scroll baked + viewport-clipped), so the
-        // two diverge at the scroll-layer boundary and the children's hit
-        // boxes still land where they're drawn on screen.
-        hit_clip: [f32; 4],
-        hit_offset: [f32; 2],
+        // Screen-space clip/offset/layer for `HitEntry`/`ScrollHit` bounds
+        // (input lives in screen space) — see [`HitSpace`].
+        hit: HitSpace,
         skip: Option<NodeId>,
         scroll_stack: &mut Vec<NodeId>,
         out: &mut FlattenOut<'_>,
@@ -3269,7 +3347,18 @@ impl NodeTree {
         let abs = [rect[0] - offset[0], rect[1] - offset[1]];
         // Screen-space position (→ hit-test). Always the real on-screen
         // rect, so clicks/hover land where the pixels actually are.
-        let hit_abs = [rect[0] - hit_offset[0], rect[1] - hit_offset[1]];
+        let hit_abs = [rect[0] - hit.offset[0], rect[1] - hit.offset[1]];
+        // A promoted node driven by a composite offset starts a new hit
+        // layer: it and everything under it move with that offset (see
+        // `HitLayer`). Its own clip came from outside, so it stays put.
+        let hit_layer = if promote && node.has_composite_offset() {
+            Some(HitLayer {
+                root: id,
+                clip_moves: false,
+            })
+        } else {
+            hit.layer
+        };
         let size = [rect[2], rect[3]];
         let opacity = parent_opacity * node.style.opacity;
         match node.style.kind {
@@ -3496,7 +3585,8 @@ impl NodeTree {
                     hit_abs[0] + size[0],
                     hit_abs[1] + size[1],
                 ],
-                clip_rect: hit_clip,
+                clip_rect: hit.clip,
+                layer: hit_layer,
             });
         }
         // Emit a ScrollHit for any container whose layout scrolls. The
@@ -3515,8 +3605,9 @@ impl NodeTree {
                     hit_abs[0] + size[0],
                     hit_abs[1] + size[1],
                 ],
-                clip_rect: hit_clip,
+                clip_rect: hit.clip,
                 ancestor_chain: chain,
+                layer: hit_layer,
             });
             scroll_stack.push(id);
             true
@@ -3631,14 +3722,21 @@ impl NodeTree {
                     1.0e30
                 },
             ];
-            intersect_clip(hit_clip, self_clip)
+            intersect_clip(hit.clip, self_clip)
         } else {
-            hit_clip
+            hit.clip
         };
-        let child_hit_offset = if let Some(s) = node.scroll.as_ref() {
-            [hit_offset[0] + s.current[0], hit_offset[1] + s.current[1]]
-        } else {
-            hit_offset
+        let child_hit = HitSpace {
+            clip: child_hit_clip,
+            offset: match node.scroll.as_ref() {
+                Some(s) => [hit.offset[0] + s.current[0], hit.offset[1] + s.current[1]],
+                None => hit.offset,
+            },
+            // A clip set from here down is inside the layer: it moves too.
+            layer: hit_layer.map(|l| HitLayer {
+                clip_moves: l.clip_moves || node.layout.clips(),
+                ..l
+            }),
         };
         // Corner radii of the clip rect handed to children: when *this*
         // node clips its overflow AND has rounded corners, children clip to
@@ -3671,8 +3769,7 @@ impl NodeTree {
                 child_clip,
                 child_clip_radius,
                 child_offset,
-                child_hit_clip,
-                child_hit_offset,
+                child_hit,
                 skip,
                 scroll_stack,
                 out,
@@ -4759,6 +4856,57 @@ mod tests {
         // Only the animated one carries the re-raster flag.
         assert_ne!(insts[0].shape_kind & SHAPE_FLAG_ANIMATED, 0);
         assert_eq!(insts[1].shape_kind & SHAPE_FLAG_ANIMATED, 0);
+    }
+
+    /// A composite-offset layer's hit rects follow the offset: they're
+    /// tagged at flatten, translated by `translate_layer_hits`, and a clip
+    /// set inside the layer travels with it while an outer one stays put.
+    #[test]
+    fn composite_offset_layer_hits_follow_the_offset() {
+        let mut t = NodeTree::new();
+        let root = t.add_root(Node::rect().build());
+        let layer = t.add_child(
+            root,
+            Node::rect().layer_offset_y(Signal::new(0.0)).clip().build(),
+        );
+        let leaf = t.add_child(layer, Node::rect().build());
+        let outside = t.add_child(root, Node::rect().build());
+        for (id, r) in [
+            (root, [0.0, 0.0, 400.0, 400.0]),
+            (layer, [10.0, 10.0, 100.0, 50.0]),
+            (leaf, [20.0, 20.0, 40.0, 20.0]),
+            (outside, [200.0, 200.0, 40.0, 40.0]),
+        ] {
+            let n = t.get_mut_raw(id).unwrap();
+            n.rect = r;
+            n.cursor = Some(winit::window::CursorIcon::Pointer);
+        }
+        let (_, mut hits, mut sh, _) = t.flatten(1.0);
+        let find = |hits: &[HitEntry], id| hits.iter().find(|h| h.node_id == id).cloned().unwrap();
+        assert_eq!(
+            find(&hits, layer).layer.map(|l| (l.root, l.clip_moves)),
+            Some((layer, false))
+        );
+        assert_eq!(
+            find(&hits, leaf).layer.map(|l| (l.root, l.clip_moves)),
+            Some((layer, true))
+        );
+        assert!(find(&hits, outside).layer.is_none());
+
+        let moved =
+            translate_layer_hits(&mut hits, &mut sh, |r| (r == layer).then_some([0.0, 100.0]));
+        assert!(moved);
+        let leaf_hit = find(&hits, leaf);
+        assert!(
+            leaf_hit.contains(30.0, 125.0),
+            "leaf hit at its slid position"
+        );
+        assert!(
+            !leaf_hit.contains(30.0, 25.0),
+            "and no longer at the old one"
+        );
+        assert!(find(&hits, layer).contains(50.0, 130.0));
+        assert_eq!(find(&hits, outside).bounds, [200.0, 200.0, 240.0, 240.0]);
     }
 
     #[test]

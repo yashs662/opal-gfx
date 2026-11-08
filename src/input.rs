@@ -160,7 +160,7 @@ impl InputState {
                 .map(|h| h.contains(x, y))
                 .unwrap_or(false);
             if over {
-                change.click_target = Some(cap);
+                change.click_target = Some(handler_owner(tree, cap, |n| n.on_click.is_some()));
             }
         }
         change.pressed_changed = sync_bool_signals(hits, tree, None, |n| &n.interact.pressed);
@@ -205,7 +205,7 @@ impl InputState {
     /// Right-button release: if the cursor is still inside the captured
     /// node's hit AABB, sets [`InputChange::right_click_target`]. App
     /// shell fires the node's `on_right_click` handler.
-    pub fn on_right_released(&mut self, hits: &[HitEntry], _tree: &NodeTree) -> InputChange {
+    pub fn on_right_released(&mut self, hits: &[HitEntry], tree: &NodeTree) -> InputChange {
         let captured = self.captured_right.take();
         let mut change = InputChange::default();
         if let (Some(cap), Some([x, y])) = (captured, self.cursor) {
@@ -215,11 +215,33 @@ impl InputState {
                 .map(|h| h.contains(x, y))
                 .unwrap_or(false);
             if over {
-                change.right_click_target = Some(cap);
+                change.right_click_target =
+                    Some(handler_owner(tree, cap, |n| n.on_right_click.is_some()));
             }
         }
         change
     }
+}
+
+/// The node a click on `hit` belongs to: `hit` itself when it handles that
+/// kind of click, else its nearest ancestor that does — the way a click on
+/// a button's label reaches the button. Without it, a child that is a hit
+/// target for its *own* reasons (a hover tint on a label, a hover hint)
+/// would swallow clicks meant for the clickable container around it. No
+/// handler anywhere up the chain → `hit` (nothing fires, as before).
+fn handler_owner(
+    tree: &NodeTree,
+    hit: NodeId,
+    handles: impl Fn(&crate::node::Node) -> bool,
+) -> NodeId {
+    let mut cur = Some(hit);
+    while let Some(id) = cur {
+        if tree.get(id).is_some_and(&handles) {
+            return id;
+        }
+        cur = tree.parent(id);
+    }
+    hit
 }
 
 /// Outcome of a left-press against the scrollbar layer. Built to be
@@ -766,12 +788,14 @@ mod tests {
                 bounds: [0.0, 0.0, 200.0, 200.0],
                 clip_rect: crate::gpu::NO_CLIP,
                 ancestor_chain: vec![outer],
+                layer: None,
             },
             ScrollHit {
                 node_id: inner,
                 bounds: [10.0, 10.0, 190.0, 110.0],
                 clip_rect: crate::gpu::NO_CLIP,
                 ancestor_chain: vec![inner, outer],
+                layer: None,
             },
         ];
         let out = on_wheel([100.0, 60.0], [0.0, 100.0], &scroll_hits, &mut t, false);
@@ -793,6 +817,7 @@ mod tests {
             bounds: [0.0, 0.0, 200.0, 100.0],
             clip_rect: crate::gpu::NO_CLIP,
             ancestor_chain: vec![id],
+            layer: None,
         }];
         // Vertical wheel + shift → horizontal scroll.
         let out = on_wheel([100.0, 50.0], [0.0, 80.0], &scroll_hits, &mut t, true);
@@ -811,6 +836,7 @@ mod tests {
             bounds: [0.0, 0.0, 100.0, 100.0],
             clip_rect: crate::gpu::NO_CLIP,
             ancestor_chain: vec![id],
+            layer: None,
         }];
         let out = on_wheel([500.0, 500.0], [0.0, 50.0], &scroll_hits, &mut t, false);
         assert!(!out.moved);
@@ -828,6 +854,7 @@ mod tests {
             bounds: [0.0, 0.0, 100.0, 100.0],
             clip_rect: crate::gpu::NO_CLIP,
             ancestor_chain: vec![id],
+            layer: None,
         }];
         let out = on_wheel([50.0, 50.0], [-30.0, 80.0], &scroll_hits, &mut t, false);
         assert!(out.moved);
@@ -845,6 +872,7 @@ mod tests {
             bounds: [0.0, 0.0, 200.0, 100.0],
             clip_rect: crate::gpu::NO_CLIP,
             ancestor_chain: vec![id],
+            layer: None,
         }];
         // Already at the left edge: nothing moves, but the cursor is still
         // over a sideways scroller — the swipe must not take the remainder.
@@ -975,6 +1003,7 @@ mod tests {
             bounds: [0.0, 0.0, 200.0, 200.0],
             clip_rect: crate::gpu::NO_CLIP,
             ancestor_chain: vec![id],
+            layer: None,
         }];
         let moved = on_scroll_key(
             KeyCode::ArrowDown,
@@ -1012,6 +1041,7 @@ mod tests {
             bounds: [0.0, 0.0, 200.0, 200.0],
             clip_rect: crate::gpu::NO_CLIP,
             ancestor_chain: vec![id],
+            layer: None,
         }];
         on_scroll_key(
             KeyCode::PageDown,
@@ -1034,6 +1064,7 @@ mod tests {
             bounds: [0.0, 0.0, 200.0, 200.0],
             clip_rect: crate::gpu::NO_CLIP,
             ancestor_chain: vec![id],
+            layer: None,
         }];
         on_scroll_key(
             KeyCode::End,
@@ -1057,6 +1088,7 @@ mod tests {
             bounds: [0.0, 0.0, 200.0, 200.0],
             clip_rect: crate::gpu::NO_CLIP,
             ancestor_chain: vec![id],
+            layer: None,
         }];
         on_scroll_key(
             KeyCode::Home,
@@ -1107,7 +1139,38 @@ mod tests {
             node_id: id,
             bounds: [r[0], r[1], r[0] + r[2], r[1] + r[3]],
             clip_rect: crate::gpu::NO_CLIP,
+            layer: None,
         }
+    }
+
+    /// A click on a hover-styled label (a hit target with no click handler
+    /// of its own) belongs to the clickable pill around it.
+    #[test]
+    fn click_on_handlerless_child_bubbles_to_clickable_ancestor() {
+        let mut t = NodeTree::new();
+        let pill = t.add_root(Node::rect().build());
+        let label = t.add_child(pill, Node::rect().build());
+        for (id, r) in [
+            (pill, [0.0, 0.0, 100.0, 40.0]),
+            (label, [10.0, 10.0, 60.0, 20.0]),
+        ] {
+            let n = t.get_mut_raw(id).unwrap();
+            n.rect = r;
+            n.interact.hover = Some(crate::Signal::new(false));
+        }
+        t.get_mut_raw(pill).unwrap().on_click = Some(crate::event::handler(|_| {}));
+        t.get_mut_raw(pill).unwrap().on_right_click = Some(crate::event::handler(|_| {}));
+        // Front-to-back, as flatten leaves them.
+        let hits = vec![hit_entry(&t, label), hit_entry(&t, pill)];
+        let mut input = InputState::new();
+        input.on_cursor_moved(20.0, 15.0, &hits, &t);
+        input.on_left_pressed(&hits, &t);
+        assert_eq!(input.on_left_released(&hits, &t).click_target, Some(pill));
+        input.on_right_pressed(&hits, &t);
+        assert_eq!(
+            input.on_right_released(&hits, &t).right_click_target,
+            Some(pill)
+        );
     }
 
     #[test]

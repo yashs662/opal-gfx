@@ -112,6 +112,9 @@ pub struct SceneCtx {
     /// field's `on_change` does **not** fire (this is a programmatic set,
     /// not user input). Drained each frame.
     pub(crate) field_set_request: Option<(String, String)>,
+    /// Earliest instant a per-frame hook asked to run again at (see
+    /// [`Self::wake_at`]). Survives frames until it comes due.
+    pub(crate) wake_deadline: Option<std::time::Instant>,
 }
 
 impl Default for SceneCtx {
@@ -133,6 +136,7 @@ impl SceneCtx {
             marquees: Vec::new(),
             focus_request: None,
             field_set_request: None,
+            wake_deadline: None,
         }
     }
 
@@ -151,6 +155,25 @@ impl SceneCtx {
     /// fire. No-op if the name doesn't resolve to an editable node.
     pub fn set_field_value(&mut self, name: impl Into<String>, value: impl Into<String>) {
         self.field_set_request = Some((name.into(), value.into()));
+    }
+
+    /// Run the `on_frame` hook again at `at`, even if nothing else wakes
+    /// the loop before then — a timed wake for state that changes at a
+    /// known moment (a toast expiring, a clock boundary). The loop parks
+    /// on `WaitUntil` meanwhile: no frames, no polling. Requests keep the
+    /// **earliest** pending instant; once it fires the hook re-arms
+    /// whatever it still needs.
+    pub fn wake_at(&mut self, at: std::time::Instant) {
+        self.wake_deadline = Some(self.wake_deadline.map_or(at, |d| d.min(at)));
+    }
+
+    /// Consume the timed wake if it has come due by `now`.
+    pub(crate) fn take_due_wake(&mut self, now: std::time::Instant) -> bool {
+        let due = self.wake_deadline.is_some_and(|d| d <= now);
+        if due {
+            self.wake_deadline = None;
+        }
+        due
     }
 
     /// Look up a previously-named node.
@@ -2490,6 +2513,20 @@ mod tests {
     use super::*;
     use crate::Curve;
     use crate::reactive::{Computed, animated};
+
+    #[test]
+    fn wake_at_keeps_the_earliest_and_fires_once_due() {
+        let mut ctx = SceneCtx::new();
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        ctx.wake_at(t0 + ms(500));
+        ctx.wake_at(t0 + ms(200));
+        ctx.wake_at(t0 + ms(900));
+        assert_eq!(ctx.wake_deadline, Some(t0 + ms(200)));
+        assert!(!ctx.take_due_wake(t0 + ms(100)), "not due yet");
+        assert!(ctx.take_due_wake(t0 + ms(200)));
+        assert_eq!(ctx.wake_deadline, None, "consumed — the hook re-arms");
+    }
     use std::time::Duration;
 
     #[test]

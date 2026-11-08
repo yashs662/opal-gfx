@@ -205,7 +205,20 @@ impl LayerDraw {
                 src_extent: surface_size,
                 tex_size: surface_size,
                 surface_size,
-                clip_rect: self.round_rect.unwrap_or(NO_CLIP),
+                // The rounding mask is the node's *layout* rect; carry it
+                // through the same transform as the quad (`offset + p *
+                // scale`), or a slid / scaled card is masked where it used
+                // to be — clipped to nothing once it moves clear of it.
+                clip_rect: self.round_rect.map_or(NO_CLIP, |r| {
+                    let [ox, oy] = self.offset;
+                    let [sx, sy] = self.scale;
+                    [
+                        ox + r[0] * sx,
+                        oy + r[1] * sy,
+                        ox + r[2] * sx,
+                        oy + r[3] * sy,
+                    ]
+                }),
                 corner_radius: if self.round_rect.is_some() {
                     self.corner_radius
                 } else {
@@ -934,6 +947,24 @@ mod tests {
         );
         // Band scrolled out of the clip → nothing on screen.
         assert_eq!(scroll.screen_damage(surface, Some([0, 3000, 10, 10])), None);
+    }
+
+    #[test]
+    fn rounded_layer_mask_follows_its_offset() {
+        let surface = [800.0, 600.0];
+        let card = LayerDraw {
+            offset: [0.0, 144.0],
+            round_rect: Some([100.0, 50.0, 400.0, 178.0]),
+            corner_radius: [16.0; 4],
+            ..Default::default()
+        };
+        let u = card.composite_uniform(surface);
+        assert_eq!(u.clip_rect, [100.0, 194.0, 400.0, 322.0]);
+        assert_eq!(
+            card.screen_damage(surface, None),
+            Some([100.0, 194.0, 400.0, 322.0]),
+            "damage lands where the moved card is drawn"
+        );
     }
 
     #[test]

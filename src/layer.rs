@@ -232,6 +232,12 @@ impl LayerTree {
         &self.layers[0]
     }
 
+    /// A promoted layer's current composite offset (physical px; identity
+    /// for a node that never had one set).
+    pub fn offset(&self, node: NodeId) -> [f32; 2] {
+        self.state.get(&node).map_or([0.0; 2], |st| st.offset)
+    }
+
     /// Set a promoted layer's composite offset (physical px). Patches the
     /// live layer in place too, so a composite-only redraw picks it up
     /// without a rebuild. Returns true if it changed (→ composite-dirty).
