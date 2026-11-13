@@ -99,3 +99,8 @@ path = "examples/drag_drop.rs"
 [[example]]
 name = "splash_preview"
 path = "examples/splash_preview.rs"
+
+[[example]]
+name = "hidden_upload"
+path = "examples/hidden_upload.rs"
+required-features = ["automation"]

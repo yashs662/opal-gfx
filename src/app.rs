@@ -635,6 +635,10 @@ pub struct App<S = ()> {
     /// `render_deferred` and drawn when the hold lifts.
     render_hold_until: Option<Instant>,
     render_deferred: bool,
+    /// A frame was wanted while the window was hidden. Nothing presents
+    /// it, so the loop flushes the GPU's queued uploads in its place —
+    /// see [`Self::flush_unpresented`].
+    unpresented: bool,
     /// One refresh of the monitor the window is on — the present pacing
     /// interval. Re-read when the window moves (it may change monitor).
     frame_interval: Duration,
@@ -942,6 +946,7 @@ impl<S> App<S> {
             swipe_progress: Signal::new(0.0),
             render_hold_until: None,
             render_deferred: false,
+            unpresented: false,
             frame_interval: DEFAULT_FRAME_INTERVAL,
             last_tick_clocks: None,
             axis_lock: WheelAxisLock::default(),
@@ -1701,9 +1706,35 @@ impl<S> App<S> {
 
     /// Ask the window for a frame, bypassing the pacing — for the OS modal
     /// loop's paint chain, which paces itself (see `RedrawRequested`).
-    fn request_redraw_now(&self) {
+    fn request_redraw_now(&mut self) {
+        // Hidden: no frame comes of this, so the loop owes a flush instead.
+        self.unpresented |= self.occluded;
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+
+    /// The compositor started or stopped drawing the window.
+    fn set_occluded(&mut self, occluded: bool) {
+        self.occluded = occluded;
+        if occluded {
+            // A frame requested just before the window hid may never be
+            // delivered — its uploads still need a submit.
+            self.unpresented = true;
+        } else {
+            self.request_redraw();
+        }
+    }
+
+    /// Settle a frame wanted while hidden: every upload it would have
+    /// carried still reaches the GPU, so nothing piles up behind a window
+    /// that isn't presenting. Once per loop pass, and only when owed — a
+    /// hidden idle window costs nothing.
+    fn flush_unpresented(&mut self) {
+        if std::mem::take(&mut self.unpresented)
+            && let Some(gpu) = self.gpu.as_mut()
+        {
+            gpu.flush_unpresented();
         }
     }
 
@@ -1762,8 +1793,10 @@ impl<S> App<S> {
         // Nothing to show a frame to: on macOS a present into a window the
         // compositor isn't drawing (other Space, fully covered) blocks in
         // `nextDrawable` for up to a second per frame, stalling the loop.
-        // `Occluded(false)` requests the catch-up redraw.
+        // `Occluded(false)` requests the catch-up redraw; until then the
+        // loop flushes what this frame would have submitted.
         if self.occluded {
+            self.unpresented = true;
             return;
         }
         let now = Instant::now();
@@ -2146,9 +2179,7 @@ impl<S> App<S> {
         if outcome.layout_changed {
             self.ctx.tree.mark_all_dirty();
         }
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_redraw_now();
         Some(outcome.handle)
     }
 
@@ -5255,12 +5286,7 @@ impl<S> ApplicationHandler for App<S> {
                     self.request_redraw_now();
                 }
             }
-            WindowEvent::Occluded(occluded) => {
-                self.occluded = occluded;
-                if !occluded {
-                    self.request_redraw();
-                }
-            }
+            WindowEvent::Occluded(occluded) => self.set_occluded(occluded),
             WindowEvent::CursorMoved { position, .. } => {
                 let x = position.x as f32;
                 let y = position.y as f32;
@@ -6054,6 +6080,7 @@ impl<S> ApplicationHandler for App<S> {
                 "[loop] parking (idle, timed wake {:?})",
                 self.ctx.wake_deadline
             );
+            self.flush_unpresented();
             return;
         }
         log::debug!(
@@ -6230,6 +6257,7 @@ impl<S> ApplicationHandler for App<S> {
                 event_loop.set_control_flow(ControlFlow::Wait)
             }
         }
+        self.flush_unpresented();
     }
 }
 
@@ -6335,6 +6363,10 @@ impl<S> App<S> {
                 }
                 Step::MemReport => {
                     self.log_memory_report();
+                    state.advance_now(now);
+                }
+                Step::Occlude(occluded) => {
+                    self.set_occluded(occluded);
                     state.advance_now(now);
                 }
             }

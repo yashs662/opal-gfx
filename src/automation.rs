@@ -56,6 +56,10 @@ pub enum Step {
     /// same report the F1 HUD toggle prints. Scripted perf runs read it
     /// after covers/canvas land, not just the empty-scene boot baseline.
     MemReport,
+    /// Tell the engine the window became hidden (`true`) or visible again
+    /// (`false`), as the compositor would for another Space or a covered
+    /// window — reproduces hidden-window behaviour on any platform.
+    Occlude(bool),
 }
 
 /// An ordered list of [`Step`]s. Built by the consumer (e.g. from a TOML

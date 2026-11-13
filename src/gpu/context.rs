@@ -2131,18 +2131,25 @@ impl GpuContext {
 
     /// Acquire, render, present.
     pub fn render_frame(&mut self) -> FrameOutcome {
-        let frame = match self.surface.get_current_texture() {
+        let acquired = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(tex)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
+            | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => Ok(tex),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
-                return FrameOutcome::Skipped;
+                Err(FrameOutcome::Skipped)
             }
-            wgpu::CurrentSurfaceTexture::Timeout => return FrameOutcome::Timeout,
-            wgpu::CurrentSurfaceTexture::Occluded => return FrameOutcome::Skipped,
+            wgpu::CurrentSurfaceTexture::Timeout => Err(FrameOutcome::Timeout),
+            wgpu::CurrentSurfaceTexture::Occluded => Err(FrameOutcome::Skipped),
             wgpu::CurrentSurfaceTexture::Validation => {
                 log::error!("surface validation error");
-                return FrameOutcome::Skipped;
+                Err(FrameOutcome::Skipped)
+            }
+        };
+        let frame = match acquired {
+            Ok(frame) => frame,
+            Err(outcome) => {
+                self.flush_unpresented();
+                return outcome;
             }
         };
 
@@ -2162,6 +2169,26 @@ impl GpuContext {
         self.window.pre_present_notify();
         frame.present();
         FrameOutcome::Presented
+    }
+
+    /// Stand in for a frame that can't be presented (window on another
+    /// Space, minimised, no drawable): hand everything queued since the
+    /// last submit to the GPU, and collapse the damage gathered meanwhile
+    /// into "repaint everything" for the next real frame.
+    ///
+    /// `queue.write_*` only *stages* its bytes — each call parks a staging
+    /// buffer and pins its destination until the next submit, and a
+    /// dropped texture or buffer is only freed by the submit after that.
+    /// With no present there is no submit, so a hidden window that keeps
+    /// receiving uploads (a video loop per track, covers, instance
+    /// updates) holds every one of them — wired GPU memory, on a
+    /// unified-memory Mac enough to starve the whole machine within hours.
+    pub fn flush_unpresented(&mut self) {
+        self.queue.submit(std::iter::empty());
+        self.external_damage.clear();
+        self.content_damage.clear();
+        self.instances_reshaped = true;
+        self.frame_valid = false;
     }
 
     /// Kick async map for the slot the most recent `encode_frame` wrote
